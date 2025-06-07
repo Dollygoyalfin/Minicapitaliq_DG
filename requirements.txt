@@ -2,5 +2,5 @@ fastapi
 uvicorn[standard]
 pydantic
 requests
-
+yfinance
 
