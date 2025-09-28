@@ -1,5 +1,4 @@
-# main.py (FastAPI backend)
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 
@@ -12,46 +11,98 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 @app.get("/")
-def read_root():
+def home():
     return {"message": "Mini Capital IQ backend is running 🚀"}
 
-@app.get("/valuation/{ticker}")
-def get_valuation(ticker: str, growth: float = 0.08, discount: float = 0.10):
+@app.get("/valuation")
+def get_valuation(
+    ticker: str = Query(..., description="Stock ticker symbol, e.g., AAPL or VBL"),
+    market: str = Query("us", description="Market: 'us' or 'india'")
+):
     try:
+        # Adjust ticker for Indian stocks
+        if market.lower() == "india":
+            if not (ticker.endswith(".NS") or ticker.endswith(".BO")):
+                ticker = ticker.upper() + ".NS"
+
         stock = yf.Ticker(ticker)
         info = stock.info
 
+        # Basic fields
         current_price = info.get("currentPrice")
-        eps = info.get("trailingEps")
-        pe_ratio = info.get("trailingPE")
-        forward_pe = info.get("forwardPE")
-        beta = info.get("beta")
-        pb_ratio = info.get("priceToBook")
-        market_cap = info.get("marketCap")
-        roe = info.get("returnOnEquity")
-        de_ratio = info.get("debtToEquity")
+        eps = info.get("trailingEps", 0.0)
+        pe_ratio = info.get("trailingPE", None)
+        forward_pe = info.get("forwardPE", None)
+        beta = info.get("beta", 1.0)
+        pb_ratio = info.get("priceToBook", None)
+        market_cap = info.get("marketCap", None)
+        roe = info.get("returnOnEquity", None)
+        de_ratio = info.get("debtToEquity", None)
+        book_value = info.get("bookValue", None)
 
-        # Simple DCF model assuming constant growth
-        if eps is not None and discount > growth:
-            intrinsic_value = eps * (1 + growth) / (discount - growth)
+        # Ownership placeholders
+        promoters_holding = None
+        fii_holding = None
+        dii_holding = None
+        retail_holding = None
+
+        # Assumptions
+        growth_rate = 0.08
+        risk_free_rate = 0.04
+        market_return = 0.10
+
+        # Cost of equity (CAPM)
+        cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
+
+        # Approximate WACC
+        cost_of_debt = 0.06
+        equity_value = market_cap if market_cap else 1
+        debt_value = equity_value * 0.2
+        wacc = (equity_value / (equity_value + debt_value)) * cost_of_equity + \
+               (debt_value / (equity_value + debt_value)) * cost_of_debt
+
+        # Intrinsic value (Gordon growth)
+        if eps and wacc > growth_rate:
+            intrinsic_value = (eps * (1 + growth_rate)) / (wacc - growth_rate)
         else:
             intrinsic_value = None
 
+        # Sensitivity range
+        valuation_low, valuation_high = None, None
+        if eps:
+            low_growth, high_growth = growth_rate - 0.02, growth_rate + 0.02
+            low_disc, high_disc = wacc + 0.02, wacc - 0.02
+
+            if low_disc > low_growth:
+                valuation_low = (eps * (1 + low_growth)) / (low_disc - low_growth)
+            if high_disc > high_growth:
+                valuation_high = (eps * (1 + high_growth)) / (high_disc - high_growth)
+
         return {
             "ticker": ticker.upper(),
+            "market": market,
             "current_price": current_price,
             "eps": eps,
             "pe_ratio": pe_ratio,
             "forward_pe": forward_pe,
             "beta": beta,
             "pb_ratio": pb_ratio,
+            "book_value": book_value,
             "market_cap": market_cap,
-            "roe": roe * 100 if roe is not None else None,
+            "roe": roe,
             "de_ratio": de_ratio,
             "intrinsic_value": intrinsic_value,
-            "growth_rate_used": growth,
-            "discount_rate_used": discount
+            "valuation_low": valuation_low,
+            "valuation_high": valuation_high,
+            "growth_rate_used": growth_rate,
+            "discount_rate_used": wacc,
+            "wacc": wacc,
+            "promoters_holding": promoters_holding,
+            "fii_holding": fii_holding,
+            "dii_holding": dii_holding,
+            "retail_holding": retail_holding
         }
 
     except Exception as e:
