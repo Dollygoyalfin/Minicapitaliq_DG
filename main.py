@@ -12,20 +12,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Example static ownership data for demo purposes (replace with real API later)
-indian_stock_ownership = {
-    "VBL.NS": {
-        "promoters_holding": 55.3,
-        "fii_holding": 10.2,
-        "dii_holding": 25.5,
-        "retail_holding": 9.0
-    },
-    # add more NSE tickers here
-}
 @app.get("/")
 def home():
     return {"message": "Mini Capital IQ backend is running 🚀"}
 
+@app.get("/valuation")
+def get_valuation(
+    ticker: str = Query(...),
+    market: str = Query("us"),
+    risk_free_rate: float = Query(0.04, description="Risk free rate in decimal"),
+    market_return: float = Query(0.10, description="Expected market return in decimal"),
+    growth_rate: float = Query(0.08, description="Growth rate for intrinsic value calculation")
 @app.get("/valuation")
 def get_valuation(
     ticker: str = Query(..., description="Stock ticker symbol, e.g., AAPL or VBL"),
