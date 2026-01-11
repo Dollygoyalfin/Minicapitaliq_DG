@@ -114,6 +114,37 @@ def get_valuation(
             "dii_holding": dii_holding,
             "retail_holding": retail_holding
         }
+@app.get("/financials")
+def get_financials(ticker: str = Query(...), market: str = Query("us")):
+    ticker = ticker.upper()
+    if market.lower() == "india" and not ticker.endswith(".NS"):
+        ticker += ".NS"
+    stock = yf.Ticker(ticker)
+
+    # Extract last 5 years of data
+    income = stock.financials.T.head(5).to_dict()
+    cashflow = stock.cashflow.T.head(5).to_dict()
+    balance_sheet = stock.balance_sheet.T.head(5).to_dict()
+
+    # Example: DuPont ROE calculation
+    roe_dupont = {}
+    for year, data in income.items():
+        net_income = data.get("Net Income") or 1
+        revenue = data.get("Total Revenue") or 1
+        total_assets = balance_sheet.get(year, {}).get("Total Assets") or 1
+        equity = balance_sheet.get(year, {}).get("Total Stockholder Equity") or 1
+
+        profit_margin = net_income / revenue
+        asset_turnover = revenue / total_assets
+        equity_multiplier = total_assets / equity
+        roe_dupont[year] = profit_margin * asset_turnover * equity_multiplier
+
+    return {
+        "income_statement": income,
+        "cash_flow": cashflow,
+        "balance_sheet": balance_sheet,
+        "dupont_roe": roe_dupont
+    }
 
     except Exception as e:
         return {"error": str(e)}
