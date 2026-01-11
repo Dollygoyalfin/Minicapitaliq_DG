@@ -12,6 +12,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Example static ownership data for demo purposes (replace with real API later)
+indian_stock_ownership = {
+    "VBL.NS": {
+        "promoters_holding": 55.3,
+        "fii_holding": 10.2,
+        "dii_holding": 25.5,
+        "retail_holding": 9.0
+    },
+    # add more NSE tickers here
+}
 @app.get("/")
 def home():
     return {"message": "Mini Capital IQ backend is running 🚀"}
