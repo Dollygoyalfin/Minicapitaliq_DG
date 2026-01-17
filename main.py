@@ -108,7 +108,7 @@ def get_valuation(
             "retail_holding": retail_holding
         }
 
- except Exception as e:
+    except Exception as e:
         return {"error": str(e)}
 @app.get("/financials")
 def get_financials(ticker: str = Query(...), market: str = Query("us")):
