@@ -107,6 +107,9 @@ def get_valuation(
             "dii_holding": dii_holding,
             "retail_holding": retail_holding
         }
+
+ except Exception as e:
+        return {"error": str(e)}
 @app.get("/financials")
 def get_financials(ticker: str = Query(...), market: str = Query("us")):
     ticker = ticker.upper()
