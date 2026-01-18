@@ -111,11 +111,14 @@ def get_valuation(
     except Exception as e:
         return {"error": str(e)}
 @app.get("/financials")
-def get_financials(ticker: str = Query(...), market: str = Query("us")):
+def get_financials(
+    ticker: str = Query(...),
+    market: str = Query("us")
+):
     try:
         ticker = ticker.upper()
         if market.lower() == "india" and not ticker.endswith(".NS"):
-        ticker += ".NS"
+            ticker += ".NS"
         stock = yf.Ticker(ticker)
         
         #fin data
