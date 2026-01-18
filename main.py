@@ -123,24 +123,26 @@ def get_financials(
         balance_sheet = stock.balance_sheet.T.head(5).to_dict()
 
     # Example: DuPont ROE calculation
-            roe_dupont = {}
-            for year, data in income.items():
-                net_income = data.get("Net Income") or 1
-                revenue = data.get("Total Revenue") or 1
-                total_assets = balance_sheet.get(year, {}).get("Total Assets") or 1
-                equity = balance_sheet.get(year, {}).get("Total Stockholder Equity") or 1
+        roe_dupont = {}
 
-                profit_margin = net_income / revenue
-                asset_turnover = revenue / total_assets
-                equity_multiplier = total_assets / equity
-                roe_dupont[year] = profit_margin * asset_turnover * equity_multiplier
+        for year in income:
+            net_income = income[year].get("Net Income", 1)
+            revenue = income[year].get("Total Revenue", 1)
+            assets = balance_sheet.get(year, {}).get("Total Assets", 1)
+            equity = balance_sheet.get(year, {}).get("Total Stockholder Equity", 1)
 
-            return {
-                "income_statement": income,
-                "cash_flow": cashflow,
-                "balance_sheet": balance_sheet,
-                "dupont_roe": roe_dupont
-            }
+            roe_dupont[year] = (
+                (net_income / revenue) *
+                (revenue / assets) *
+                (assets / equity)
+            )
+
+        return {
+            "income_statement": income,
+            "cash_flow": cashflow,
+            "balance_sheet": balance_sheet,
+            "dupont_roe": roe_dupont
+        }
 
     except Exception as e:
         return {"error": str(e)}
