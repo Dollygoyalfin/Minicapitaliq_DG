@@ -26,9 +26,8 @@ def get_valuation(
 ):
     try:
         # Adjust ticker for Indian stocks
-        if market.lower() == "india":
-            if not (ticker.endswith(".NS") or ticker.endswith(".BO")):
-                ticker = ticker.upper() + ".NS"
+        if market.lower() == "india" and not ticker.endswith(".NS"):
+            ticker = ticker.upper() + ".NS"
 
         stock = yf.Ticker(ticker)
         info = stock.info
@@ -51,11 +50,6 @@ def get_valuation(
         dii_holding = None
         retail_holding = None
 
-        # Assumptions
-        growth_rate = 0.08
-        risk_free_rate = 0.04
-        market_return = 0.10
-
         # Cost of equity (CAPM)
         cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
 
@@ -63,8 +57,10 @@ def get_valuation(
         cost_of_debt = 0.06
         equity_value = market_cap if market_cap else 1
         debt_value = equity_value * 0.2
-        wacc = (equity_value / (equity_value + debt_value)) * cost_of_equity + \
+        wacc = (
+            (equity_value / (equity_value + debt_value)) * cost_of_equity +
                (debt_value / (equity_value + debt_value)) * cost_of_debt
+        )
 
         # Intrinsic value (Gordon growth)
         if eps and wacc > growth_rate:
