@@ -106,6 +106,7 @@ def get_valuation(
 
     except Exception as e:
         return {"error": str(e)}
+
 @app.get("/financials")
 def get_financials(
     ticker: str = Query(...),
@@ -146,3 +147,54 @@ def get_financials(
 
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/ipos")
+def get_ipos():
+    results = []
+
+    IPOS = [
+        {"name": "ZOMATO", "ticker": "ZOMATO.NS", "ipo_price": 76, "ipo_date": "2021-07-23"},
+        {"name": "PAYTM", "ticker": "PAYTM.NS", "ipo_price": 2150, "ipo_date": "2021-11-18"}
+    ]
+
+    for ipo in IPOS:
+        stock = yf.Ticker(ipo["ticker"])
+        info = stock.info
+        current_price = info.get("currentPrice")
+
+        gain_pct = None
+        if current_price:
+            gain_pct = ((current_price - ipo["ipo_price"]) / ipo["ipo_price"]) * 100
+
+        results.append({
+            "name": ipo["name"],
+            "ipo_date": ipo["ipo_date"],
+            "ipo_price": ipo["ipo_price"],
+            "current_price": current_price,
+            "gain_pct": gain_pct
+        })
+
+    return results
+
+@app.get("/commodities")
+def get_commodities():
+    commodities = {
+        "Gold": "GC=F",
+        "Silver": "SI=F",
+        "Crude Oil": "CL=F",
+        "Natural Gas": "NG=F"
+    }
+
+    data = []
+
+    for name, ticker in commodities.items():
+        stock = yf.Ticker(ticker)
+        info = stock.info
+
+        data.append({
+            "name": name,
+            "price": info.get("regularMarketPrice"),
+            "change": info.get("regularMarketChangePercent")
+        })
+
+    return data
