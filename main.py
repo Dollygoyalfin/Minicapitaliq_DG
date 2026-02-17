@@ -119,9 +119,22 @@ def get_financials(
         stock = yf.Ticker(ticker)
         
         #fin data
-        income = stock.financials.T.head(5).to_dict()
-        cashflow = stock.cashflow.T.head(5).to_dict()
-        balance_sheet = stock.balance_sheet.T.head(5).to_dict()
+        income_df = stock.financials
+        cashflow_df = stock.cashflow
+        balance_df = stock.balance_sheet
+        if income_df is None or income_df.empty:
+            income = {}
+        else:
+            income = income_df.T.head(5).to_dict()
+        if cashflow_df is None or cashflow_df.empty:
+            cashflow = {}
+        else:
+            cashflow = cashflow_df.T.head(5).to_dict()
+        if balance_df is None or balance_df.empty:
+            balance_sheet = {}
+        else:
+            balance_sheet = balance_df.T.head(5).to_dict()
+        
 
     # Example: DuPont ROE calculation
         roe_dupont = {}
