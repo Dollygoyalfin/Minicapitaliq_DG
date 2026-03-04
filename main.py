@@ -259,7 +259,7 @@ def get_dcf(
 
         # ── Identify rows ─────────────────────────────────────────────────────
         revenue_row  = find_row(income_df, "total revenue") or find_row(income_df, "revenue")
-        opex_row     = find_row(income_df, "total operating expenses") or find_row(income_df, "operating expense")
+        opex_row     = (find_row(income_df, "total expenses") or find_row(income_df, "total operating expenses") or find_row(income_df, "operating expense") or find_row(income_df, "cost of revenue"))
         pretax_row   = find_row(income_df, "pretax") or find_row(income_df, "income before tax")
         tax_row      = find_row(income_df, "tax", "provision") or find_row(income_df, "income tax")
         interest_row = find_row(income_df, "interest", "expense")
