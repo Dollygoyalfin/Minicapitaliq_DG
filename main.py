@@ -559,7 +559,155 @@ def get_dcf(
 
     except Exception as e:
         return {"error": str(e)}
+@app.get("/screener")
+def get_screener(
+    tickers: str = Query(..., description="Comma-separated list of tickers e.g. AAPL,MSFT,TSLA"),
+    market: str = Query("us", description="'us' or 'india'"),
 
+    # Filter params — all optional, None means no filter applied
+    min_pe: float = Query(None, description="Minimum P/E ratio"),
+    max_pe: float = Query(None, description="Maximum P/E ratio"),
+
+    min_pb: float = Query(None, description="Minimum P/B ratio"),
+    max_pb: float = Query(None, description="Maximum P/B ratio"),
+
+    min_roe: float = Query(None, description="Minimum ROE (decimal, e.g. 0.15 = 15%)"),
+    max_roe: float = Query(None, description="Maximum ROE (decimal)"),
+
+    min_market_cap: float = Query(None, description="Minimum market cap in USD/INR"),
+    max_market_cap: float = Query(None, description="Maximum market cap"),
+
+    min_de: float = Query(None, description="Minimum D/E ratio"),
+    max_de: float = Query(None, description="Maximum D/E ratio"),
+
+    min_dividend_yield: float = Query(None, description="Minimum dividend yield (decimal, e.g. 0.02 = 2%)"),
+    max_dividend_yield: float = Query(None, description="Maximum dividend yield"),
+
+    min_eps: float = Query(None, description="Minimum EPS"),
+    max_eps: float = Query(None, description="Maximum EPS"),
+
+    min_week_change: float = Query(None, description="Minimum 1-week price change % (e.g. -5 = -5%)"),
+    max_week_change: float = Query(None, description="Maximum 1-week price change %"),
+):
+    """
+    Screen a user-supplied list of tickers against optional filters.
+
+    Metrics fetched per ticker:
+      - Current Price
+      - P/E Ratio (trailing)
+      - P/B Ratio
+      - ROE
+      - Market Cap
+      - D/E Ratio
+      - Dividend Yield
+      - EPS (trailing)
+      - 1-Week Price Change %
+
+    Returns all tickers with their metrics plus a 'passed' flag indicating
+    whether they passed all active filters.
+    """
+    import datetime
+
+    # ── Parse and clean tickers ───────────────────────────────────────────────
+    raw_tickers = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if not raw_tickers:
+        return {"error": "No valid tickers provided."}
+    if len(raw_tickers) > 50:
+        return {"error": "Maximum 50 tickers per request."}
+
+    results = []
+
+    for raw in raw_tickers:
+        ticker_sym = raw
+        if market.lower() == "india" and not ticker_sym.endswith(".NS"):
+            ticker_sym += ".NS"
+
+        try:
+            stock = yf.Ticker(ticker_sym)
+            info  = stock.info
+
+            current_price  = info.get("currentPrice") or info.get("regularMarketPrice")
+            pe_ratio       = info.get("trailingPE")
+            pb_ratio       = info.get("priceToBook")
+            roe            = info.get("returnOnEquity")
+            market_cap     = info.get("marketCap")
+            de_ratio       = info.get("debtToEquity")
+            dividend_yield = info.get("dividendYield")
+            eps            = info.get("trailingEps")
+            week_change    = None
+
+            # 1-week price change
+            try:
+                hist = stock.history(period="5d")
+                if hist is not None and len(hist) >= 2:
+                    price_now  = float(hist["Close"].iloc[-1])
+                    price_prev = float(hist["Close"].iloc[0])
+                    if price_prev and price_prev != 0:
+                        week_change = ((price_now - price_prev) / price_prev) * 100
+            except Exception:
+                week_change = None
+
+            # ── Apply filters ─────────────────────────────────────────────────
+            def in_range(val, mn, mx):
+                """Return False only if val exists AND violates the range."""
+                if val is None:
+                    return True   # can't filter what we don't have
+                if mn is not None and val < mn:
+                    return False
+                if mx is not None and val > mx:
+                    return False
+                return True
+
+            passed = all([
+                in_range(pe_ratio,       min_pe,             max_pe),
+                in_range(pb_ratio,       min_pb,             max_pb),
+                in_range(roe,            min_roe,            max_roe),
+                in_range(market_cap,     min_market_cap,     max_market_cap),
+                in_range(de_ratio,       min_de,             max_de),
+                in_range(dividend_yield, min_dividend_yield, max_dividend_yield),
+                in_range(eps,            min_eps,            max_eps),
+                in_range(week_change,    min_week_change,    max_week_change),
+            ])
+
+            results.append({
+                "ticker":         ticker_sym,
+                "current_price":  current_price,
+                "pe_ratio":       round(pe_ratio, 2)       if pe_ratio       is not None else None,
+                "pb_ratio":       round(pb_ratio, 2)       if pb_ratio       is not None else None,
+                "roe":            round(roe, 4)             if roe            is not None else None,
+                "market_cap":     market_cap,
+                "de_ratio":       round(de_ratio, 2)       if de_ratio       is not None else None,
+                "dividend_yield": round(dividend_yield, 4) if dividend_yield is not None else None,
+                "eps":            round(eps, 2)             if eps            is not None else None,
+                "week_change_pct":round(week_change, 2)    if week_change    is not None else None,
+                "passed_filters": passed,
+            })
+
+        except Exception as e:
+            results.append({
+                "ticker":          ticker_sym,
+                "error":           str(e),
+                "passed_filters":  False,
+            })
+
+    passed_count = sum(1 for r in results if r.get("passed_filters"))
+
+    return {
+        "market":        market,
+        "tickers_scanned": len(results),
+        "passed_count":  passed_count,
+        "filters_applied": {
+            "pe":             [min_pe, max_pe],
+            "pb":             [min_pb, max_pb],
+            "roe":            [min_roe, max_roe],
+            "market_cap":     [min_market_cap, max_market_cap],
+            "de":             [min_de, max_de],
+            "dividend_yield": [min_dividend_yield, max_dividend_yield],
+            "eps":            [min_eps, max_eps],
+            "week_change_pct":[min_week_change, max_week_change],
+        },
+        "results": results,
+    }
 @app.get("/ipos")
 def get_ipos():
     results = []
