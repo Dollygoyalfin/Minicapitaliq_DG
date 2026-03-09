@@ -356,6 +356,10 @@ def get_dcf(
             nwc_series.append(nwc_t0)
             tax_rates.append(yr_tax)
 
+        # ── Guard: ensure we have valid data after skipping zero years ──────────
+        if not revenue_series:
+            return {"error": "No valid historical revenue data found for this ticker."}
+
         # ── Average growth rates (fully data-derived, no user input) ──────────
         revenue_growth = avg_yoy_growth(revenue_series)
         opex_growth    = avg_yoy_growth(opex_series)
@@ -366,11 +370,12 @@ def get_dcf(
         # Cap NWC growth at revenue growth — NWC cannot grow faster than the business
         nwc_growth = min(nwc_growth, revenue_growth)
 
-        avg_tax_rate = sum(tax_rates) / len(tax_rates)
+        avg_tax_rate = sum(tax_rates) / len(tax_rates) if tax_rates else 0.25
 
         # ── Build historical table ────────────────────────────────────────────
+        n_valid = len(revenue_series)  # actual count after skipping zero-revenue years
         historical_table = []
-        for i in range(n_years):
+        for i in range(n_valid):
             rev   = revenue_series[i]
             opex  = opex_series[i]
             capex = capex_series[i]
@@ -439,7 +444,7 @@ def get_dcf(
             proj_rev   = base_rev   * ((1 + revenue_growth) ** year)
             proj_opex  = base_opex  * ((1 + opex_growth)    ** year)
             proj_capex = base_capex * ((1 + capex_growth)   ** year)
-            proj_nwc   = base_nwc   * ((1 + nwc_growth)     ** year) if base_nwc > 0 else base_nwc
+            proj_nwc   = base_nwc   * ((1 + nwc_growth)     ** year)
 
             proj_delta_nwc = proj_nwc - prev_nwc   # increase in NWC = cash outflow
             prev_nwc       = proj_nwc
@@ -481,7 +486,7 @@ def get_dcf(
         yr_term_rev   = yr_last_rev   * (1 + terminal_growth_rate)
         yr_term_opex  = yr_last_opex  * (1 + terminal_growth_rate)
         yr_term_capex = yr_last_capex * (1 + terminal_growth_rate)
-        yr_term_nwc   = yr_last_nwc   * (1 + terminal_growth_rate) if yr_last_nwc > 0 else yr_last_nwc
+        yr_term_nwc   = yr_last_nwc   * (1 + terminal_growth_rate)
 
         # ΔNWC = NWC(terminal) - NWC(last projected year)
         yr_term_delta_nwc = yr_term_nwc - yr_last_nwc
@@ -557,7 +562,7 @@ def get_dcf(
             },
 
             # Model assumptions
-            "historical_years_used": n_years,
+            "historical_years_used": n_valid,
             "avg_tax_rate_used":     round(avg_tax_rate, 4),
             "wacc":                  round(wacc, 4),
             "cost_of_equity":        round(cost_of_equity, 4),
