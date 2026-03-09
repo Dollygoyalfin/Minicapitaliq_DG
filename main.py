@@ -266,9 +266,16 @@ def get_dcf(
         pretax_row   = find_row(income_df, "pretax") or find_row(income_df, "income before tax")
         tax_row      = find_row(income_df, "tax", "provision") or find_row(income_df, "income tax")
         interest_row = find_row(income_df, "interest", "expense")
-        capex_row    = (find_row(cashflow_df, "capital", "expenditure")
-                        or find_row(cashflow_df, "purchase", "property")
-                        or find_row(cashflow_df, "capex"))
+        # CapEx derived as: Net PPE(t) - Net PPE(t-1) + Depreciation(t)
+        # More reliable than cashflow capex row for Indian stocks
+        net_ppe_row  = (find_row(balance_df, "net ppe")
+                        or find_row(balance_df, "net property plant")
+                        or find_row(balance_df, "property plant equipment"))
+        depr_row_inc = (find_row(income_df, "reconciled depreciation")
+                        or find_row(income_df, "depreciation amortization")
+                        or find_row(income_df, "depreciation"))
+        depr_row_cf  = (find_row(cashflow_df, "depreciation amortization")
+                        or find_row(cashflow_df, "depreciation"))
         ca_row       = find_row(balance_df, "current assets")
         cl_row       = find_row(balance_df, "current liabilities")
         # For correct NWC: exclude cash from current assets, exclude short-term debt from current liabilities
@@ -303,7 +310,12 @@ def get_dcf(
             revenue   = safe_float(income_df, revenue_row, col) or 0.0
             pretax    = safe_float(income_df, pretax_row,  col)
             tax_prov  = safe_float(income_df, tax_row,     col)
-            capex_raw = safe_float(cashflow_df, capex_row, col) or 0.0
+            # CapEx = Net PPE(t) - Net PPE(t-1) + Depreciation(t)
+            net_ppe_t  = safe_float(balance_df, net_ppe_row, col)     or 0.0
+            net_ppe_t1 = safe_float(balance_df, net_ppe_row, col + 1) or 0.0
+            depr_t     = abs(safe_float(income_df,   depr_row_inc, col) or
+                             safe_float(cashflow_df, depr_row_cf,  col) or 0.0)
+            capex_raw  = net_ppe_t - net_ppe_t1 + depr_t   # always positive for growing firms
 
             # Working Capital = Current Assets
             #                - Current Liabilities       (STD stays inside — operating liability)
@@ -328,6 +340,10 @@ def get_dcf(
                 yr_tax = max(0.05, min(abs(tax_prov / pretax), 0.40))
             else:
                 yr_tax = 0.25
+
+            # Skip years with zero/missing revenue — bad yfinance data corrupts growth rates
+            if revenue == 0.0:
+                continue
 
             try:
                 year_labels.append(str(income_df.columns[col].year))
@@ -454,39 +470,41 @@ def get_dcf(
 
         total_pv_fcff = sum(pv_fcffs)
 
-        # ── Year 6 — Terminal Year ─────────────────────────────────────────────
-        # Each item grows at terminal_growth_rate from Year 5 values
-        yr5_rev   = base_rev   * ((1 + revenue_growth) ** projection_years)
-        yr5_opex  = base_opex  * ((1 + opex_growth)    ** projection_years)
-        yr5_capex = base_capex * ((1 + capex_growth)   ** projection_years)
-        yr5_nwc   = base_nwc   * ((1 + nwc_growth)     ** projection_years) if base_nwc > 0 else base_nwc
+        # ── Terminal Year — grows at terminal_growth_rate from last projected year ──
+        # Use the last row of projection_table as the base (Year N values)
+        last = projection_table[-1]
+        yr_last_rev   = last["revenue"]
+        yr_last_opex  = abs(last["operating_expenses"])
+        yr_last_capex = abs(last["capex"])
+        yr_last_nwc   = prev_nwc   # prev_nwc holds NWC at end of last projection year
 
-        yr6_rev   = yr5_rev   * (1 + terminal_growth_rate)
-        yr6_opex  = yr5_opex  * (1 + terminal_growth_rate)
-        yr6_capex = yr5_capex * (1 + terminal_growth_rate)
-        yr6_nwc   = yr5_nwc   * (1 + terminal_growth_rate) if yr5_nwc > 0 else yr5_nwc
+        yr_term_rev   = yr_last_rev   * (1 + terminal_growth_rate)
+        yr_term_opex  = yr_last_opex  * (1 + terminal_growth_rate)
+        yr_term_capex = yr_last_capex * (1 + terminal_growth_rate)
+        yr_term_nwc   = yr_last_nwc   * (1 + terminal_growth_rate) if yr_last_nwc > 0 else yr_last_nwc
 
-        yr6_delta_nwc = yr6_nwc - yr5_nwc
-        yr6_nop       = yr6_rev - yr6_opex
-        yr6_nop_at    = yr6_nop * (1 - avg_tax_rate)
+        # ΔNWC = NWC(terminal) - NWC(last projected year)
+        yr_term_delta_nwc = yr_term_nwc - yr_last_nwc
+        yr_term_nop       = yr_term_rev - yr_term_opex
+        yr_term_nop_at    = yr_term_nop * (1 - avg_tax_rate)
 
         # FCFF = NOP*(1-t) - ΔNWC - CapEx
-        yr6_fcff = yr6_nop_at - yr6_delta_nwc - yr6_capex
+        yr_term_fcff = yr_term_nop_at - yr_term_delta_nwc - yr_term_capex
 
         terminal_year = {
-            "year":               "Year 6 (Terminal)",
-            "revenue":            round(yr6_rev, 2),
-            "operating_expenses": round(-yr6_opex, 2),
-            "nop":                round(yr6_nop, 2),
+            "year":               f"Year {projection_years + 1} (Terminal)",
+            "revenue":            round(yr_term_rev, 2),
+            "operating_expenses": round(-yr_term_opex, 2),
+            "nop":                round(yr_term_nop, 2),
             "tax_rate":           round(avg_tax_rate, 4),
-            "nop_after_tax":      round(yr6_nop_at, 2),
-            "delta_nwc":          round(-yr6_delta_nwc, 2),
-            "capex":              round(-yr6_capex, 2),
-            "fcff":               round(yr6_fcff, 2),
+            "nop_after_tax":      round(yr_term_nop_at, 2),
+            "delta_nwc":          round(-yr_term_delta_nwc, 2),
+            "capex":              round(-yr_term_capex, 2),
+            "fcff":               round(yr_term_fcff, 2),
         }
 
-        # Terminal Value = FCFF_Year6 / (WACC - g)
-        terminal_value    = yr6_fcff / (wacc - terminal_growth_rate)
+        # Terminal Value = FCFF_Terminal / (WACC - g)
+        terminal_value    = yr_term_fcff / (wacc - terminal_growth_rate)
         pv_terminal_value = terminal_value / ((1 + wacc) ** projection_years)
 
         # ── Enterprise Value ──────────────────────────────────────────────────
