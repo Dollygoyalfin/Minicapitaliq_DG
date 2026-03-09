@@ -259,7 +259,10 @@ def get_dcf(
 
         # ── Identify rows ─────────────────────────────────────────────────────
         revenue_row  = find_row(income_df, "total revenue") or find_row(income_df, "revenue")
-        opex_row     = (find_row(income_df, "total expenses") or find_row(income_df, "total operating expenses") or find_row(income_df, "operating expense") or find_row(income_df, "cost of revenue"))
+        opex_row     = (find_row(income_df, "total expenses")
+                        or find_row(income_df, "total operating expenses")
+                        or find_row(income_df, "operating expense")
+                        or find_row(income_df, "cost of revenue"))
         pretax_row   = find_row(income_df, "pretax") or find_row(income_df, "income before tax")
         tax_row      = find_row(income_df, "tax", "provision") or find_row(income_df, "income tax")
         interest_row = find_row(income_df, "interest", "expense")
@@ -268,15 +271,22 @@ def get_dcf(
                         or find_row(cashflow_df, "capex"))
         ca_row       = find_row(balance_df, "current assets")
         cl_row       = find_row(balance_df, "current liabilities")
+        # For correct NWC: exclude cash from current assets, exclude short-term debt from current liabilities
+        cash_row  = (find_row(balance_df, "cash and cash equivalents")
+                      or find_row(balance_df, "cash"))
+        cpltd_row = (find_row(balance_df, "current portion", "long term")
+                      or find_row(balance_df, "current", "long term debt")
+                      or find_row(balance_df, "current portion"))
 
         if not revenue_row:
             return {"error": "Could not find Revenue in income statement."}
 
         # ── Determine usable years (max 5) ────────────────────────────────────
+        # Decouple NWC from year count — use all 5 years of income/cashflow data
+        # For years where next balance sheet col is missing, ΔNWC defaults to 0
         n_inc   = min(len(income_df.columns), 5)
         n_cf    = min(len(cashflow_df.columns), 5)
-        n_bal   = len(balance_df.columns)
-        n_years = min(n_inc, n_cf, n_bal - 1) if n_bal > 1 else min(n_inc, n_cf)
+        n_years = min(n_inc, n_cf)   # no longer limited by balance sheet cols
 
         if n_years == 0:
             return {"error": "Not enough historical data to compute FCFF."}
@@ -294,10 +304,16 @@ def get_dcf(
             pretax    = safe_float(income_df, pretax_row,  col)
             tax_prov  = safe_float(income_df, tax_row,     col)
             capex_raw = safe_float(cashflow_df, capex_row, col) or 0.0
-            ca_t0     = safe_float(balance_df, ca_row, col)     or 0.0
-            ca_t1     = safe_float(balance_df, ca_row, col + 1) or 0.0
-            cl_t0     = safe_float(balance_df, cl_row, col)     or 0.0
-            cl_t1     = safe_float(balance_df, cl_row, col + 1) or 0.0
+
+            # Working Capital = Current Assets
+            #                - Current Liabilities       (STD stays inside — operating liability)
+            #                - Cash & Cash Equivalents   (financing — handled in equity bridge)
+            #                - Current Portion of LTD    (financing — not an operating item)
+            ca_t0    = safe_float(balance_df, ca_row,    col) or 0.0
+            cl_t0    = safe_float(balance_df, cl_row,    col) or 0.0
+            csh_t0   = safe_float(balance_df, cash_row,  col) or 0.0
+            cpltd_t0 = safe_float(balance_df, cpltd_row, col) or 0.0
+            nwc_t0   = ca_t0 - cl_t0 - csh_t0 - cpltd_t0
 
             # Operating Expenses: use directly if found, else derive from EBIT
             if opex_row:
@@ -313,8 +329,6 @@ def get_dcf(
             else:
                 yr_tax = 0.25
 
-            nwc = ca_t0 - cl_t0
-
             try:
                 year_labels.append(str(income_df.columns[col].year))
             except Exception:
@@ -323,7 +337,7 @@ def get_dcf(
             revenue_series.append(revenue)
             opex_series.append(opex)
             capex_series.append(abs(capex_raw))
-            nwc_series.append(nwc)
+            nwc_series.append(nwc_t0)
             tax_rates.append(yr_tax)
 
         # ── Average growth rates (fully data-derived, no user input) ──────────
@@ -333,6 +347,8 @@ def get_dcf(
 
         nwc_pos    = [v for v in nwc_series if v is not None and v > 0]
         nwc_growth = avg_yoy_growth(nwc_series) if len(nwc_pos) >= 2 else 0.03
+        # Cap NWC growth at revenue growth — NWC cannot grow faster than the business
+        nwc_growth = min(nwc_growth, revenue_growth)
 
         avg_tax_rate = sum(tax_rates) / len(tax_rates)
 
@@ -345,10 +361,12 @@ def get_dcf(
             nwc   = nwc_series[i]
             t     = tax_rates[i]
 
-            nop       = rev - opex                    # Net Operating Profit (pre-tax, no D&A)
-            nop_at    = nop * (1 - t)                 # NOP after tax
+            nop    = rev - opex       # Net Operating Profit (pre-tax, no D&A)
+            nop_at = nop * (1 - t)   # NOP after tax
 
-            # ΔNWC: increase in NWC is a cash outflow
+            # ΔNWC = NWC(this year) - NWC(prior year)
+            # index 0 = most recent, so prior year = index i+1
+            # If prior year balance sheet not available, ΔNWC = 0
             if i < len(nwc_series) - 1:
                 delta_nwc = nwc_series[i] - nwc_series[i + 1]
             else:
