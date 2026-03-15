@@ -425,19 +425,30 @@ def get_dcf(
         # ── Average growth rates ───────────────────────────────────────────────
         revenue_growth = avg_yoy_growth(revenue_series)
         opex_growth    = avg_yoy_growth(opex_series)
+        # Soft cap on opex: can grow faster than revenue short term but not 2x+
+        opex_growth    = min(opex_growth, revenue_growth * 1.5)
         ca_growth      = avg_yoy_growth(ca_series)
         cl_growth      = avg_yoy_growth(cl_series)
         cash_growth    = avg_yoy_growth(cash_series)
-        # Cap cash growth at revenue growth — cash can't sustainably outgrow the business
-        cash_growth    = min(cash_growth, revenue_growth)
         cpltd_growth   = avg_yoy_growth(cpltd_series)
         net_ppe_growth = avg_yoy_growth(net_ppe_series)
         depr_growth    = avg_yoy_growth(depr_series)
+
         # If depreciation data is missing (all zeros), estimate as % of Net PPE
+        # Must run BEFORE caps so depr_growth gets capped correctly
         if all(d == 0.0 for d in depr_series) and any(p > 0 for p in net_ppe_series):
             avg_depr_rate = 0.05  # assume 5% depreciation rate on Net PPE
             depr_series   = [n * avg_depr_rate for n in net_ppe_series]
             depr_growth   = net_ppe_growth  # depr grows with PPE
+
+        # Cap all BS line growth rates at revenue growth
+        # No balance sheet line can sustainably outgrow the business itself
+        ca_growth      = min(ca_growth,      revenue_growth)
+        cl_growth      = min(cl_growth,      revenue_growth)
+        cash_growth    = min(cash_growth,    revenue_growth)
+        cpltd_growth   = min(cpltd_growth,   revenue_growth)
+        net_ppe_growth = min(net_ppe_growth, revenue_growth)
+        depr_growth    = min(depr_growth,    revenue_growth)
 
         avg_tax_rate = sum(tax_rates) / len(tax_rates) if tax_rates else 0.25
 
@@ -542,7 +553,7 @@ def get_dcf(
 
             # CapEx = Net PPE(this year) - Net PPE(prior year) + Depreciation(this year)
             prior_net_ppe  = proj_net_ppe_list[idx - 1] if idx > 0 else base_net_ppe
-            proj_capex     = max(proj_net_ppe - prior_net_ppe + proj_depr, 0.0)
+            proj_capex     = max(proj_net_ppe - prior_net_ppe + proj_depr, proj_depr)
 
             proj_nop    = proj_rev - proj_opex
             proj_nop_at = proj_nop * (1 - avg_tax_rate)
@@ -672,7 +683,7 @@ def get_dcf(
             },
 
             # Model assumptions
-            "historical_years_used": n_valid,
+            "historical_years_used": display_years,
             "avg_tax_rate_used":     round(avg_tax_rate,    4),
             "wacc":                  round(wacc,            4),
             "cost_of_equity":        round(cost_of_equity,  4),
