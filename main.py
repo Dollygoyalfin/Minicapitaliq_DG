@@ -316,10 +316,12 @@ def get_dcf(
         if not revenue_row:
             return {"error": "Could not find Revenue in income statement."}
 
-        # ── Determine usable years (max 5) ────────────────────────────────────
-        n_inc   = min(len(income_df.columns), 5)
-        n_cf    = min(len(cashflow_df.columns), 5)
-        n_bal   = min(len(balance_df.columns), 6)  # need col+1 for CapEx so allow 6
+        # ── Determine usable years ───────────────────────────────────────────────
+        # Collect up to 6 years of data for richer growth rate calculation
+        # Balance sheet needs col+1 for CapEx derivation, so allow 7 cols
+        n_inc   = min(len(income_df.columns), 6)
+        n_cf    = min(len(cashflow_df.columns), 6)
+        n_bal   = min(len(balance_df.columns), 7)
         n_years = min(n_inc, n_cf, n_bal)
 
         if n_years == 0:
@@ -426,6 +428,8 @@ def get_dcf(
         ca_growth      = avg_yoy_growth(ca_series)
         cl_growth      = avg_yoy_growth(cl_series)
         cash_growth    = avg_yoy_growth(cash_series)
+        # Cap cash growth at revenue growth — cash can't sustainably outgrow the business
+        cash_growth    = min(cash_growth, revenue_growth)
         cpltd_growth   = avg_yoy_growth(cpltd_series)
         net_ppe_growth = avg_yoy_growth(net_ppe_series)
         depr_growth    = avg_yoy_growth(depr_series)
@@ -437,9 +441,11 @@ def get_dcf(
 
         avg_tax_rate = sum(tax_rates) / len(tax_rates) if tax_rates else 0.25
 
-        # ── Build historical table ────────────────────────────────────────────
+        # ── Build historical table — show only 5 most recent valid years ────────
+        # Year 6 data used for growth rates only, not displayed
+        display_years = min(n_valid, 5)
         historical_table = []
-        for i in range(n_valid):
+        for i in range(display_years):
             rev    = revenue_series[i]
             opex   = opex_series[i]
             capex  = capex_series[i]
@@ -569,20 +575,23 @@ def get_dcf(
 
         total_pv_fcff = sum(pv_fcffs)
 
-        # ── Terminal Year — rolling avg of last 5 projected years ─────────────
+        # ── Terminal Year ─────────────────────────────────────────────────────────
+        # Revenue & OpEx: grow at terminal_growth_rate from last projected year
+        # BS lines: rolling avg of last 5 projected years (mean-reverting)
+        term_rev     = proj_rev_list[-1]  * (1 + terminal_growth_rate)
+        term_opex    = proj_opex_list[-1] * (1 + terminal_growth_rate)
         term_ca      = rolling_avg_terminal(proj_ca_list)
         term_cl      = rolling_avg_terminal(proj_cl_list)
         term_cash    = rolling_avg_terminal(proj_cash_list)
         term_cpltd   = rolling_avg_terminal(proj_cpltd_list)
         term_net_ppe = rolling_avg_terminal(proj_net_ppe_list)
         term_depr    = rolling_avg_terminal(proj_depr_list)
-        term_rev     = rolling_avg_terminal(proj_rev_list)
-        term_opex    = rolling_avg_terminal(proj_opex_list)
 
         # WC and CapEx from terminal BS
         term_wc        = term_ca - term_cl - term_cash - term_cpltd
         term_delta_nwc = term_wc - prev_wc   # prev_wc = WC at end of last projected year
-        term_capex     = max(term_net_ppe - proj_net_ppe_list[-1] + term_depr, 0.0)
+        # CapEx floor = depreciation (minimum maintenance CapEx)
+        term_capex     = max(term_net_ppe - proj_net_ppe_list[-1] + term_depr, term_depr)
 
         term_nop    = term_rev - term_opex
         term_nop_at = term_nop * (1 - avg_tax_rate)
