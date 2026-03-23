@@ -1080,32 +1080,34 @@ Respond ONLY with a valid JSON object. No preamble, no explanation, no markdown 
 }}"""
 
         # ── Step 5: Call Claude API ───────────────────────────────────────────
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        api_key = os.environ.get("GROQ_API_KEY", "")
         if not api_key:
-            return {"error": "ANTHROPIC_API_KEY environment variable not set on server."}
+            return {"error": "GROQ_API_KEY environment variable not set on server."}
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
-                "https://api.anthropic.com/v1/messages",
+                "https://api.groq.com/openai/v1/chat/completions",
                 headers={
-                    "Content-Type":      "application/json",
-                    "anthropic-version": "2023-06-01",
-                    "x-api-key":         api_key,
+                    "Content-Type":  "application/json",
+                    "Authorization": f"Bearer {api_key}",
                 },
                 json={
-                    "model":      "claude-sonnet-4-6",
+                    "model":      "llama-3.3-70b-versatile",
                     "max_tokens": 1500,
                     "messages": [
-                        {"role": "user", "content": prompt}
+                        {"role": "system", "content": "You are a senior equity research analyst. Always respond with valid JSON only. No preamble, no markdown, no explanation outside the JSON object."},
+                        {"role": "user",   "content": prompt}
                     ],
+                    "temperature": 0.3,
+                    "response_format": {"type": "json_object"},
                 },
             )
 
         if response.status_code != 200:
-            return {"error": f"Claude API error {response.status_code}: {response.text[:300]}"}
+            return {"error": f"Groq API error {response.status_code}: {response.text[:300]}"}
 
         raw     = response.json()
-        ai_text = raw.get("content", [{}])[0].get("text", "").strip()
+        ai_text = raw.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
         # ── Step 6: Parse Claude JSON response ────────────────────────────────
         try:
