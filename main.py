@@ -1,6 +1,11 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
 import yfinance as yf
+import os
+import httpx
+import json
 
 app = FastAPI()
 
@@ -920,3 +925,225 @@ def get_commodities():
         })
 
     return data
+import os
+import httpx
+import json
+from pydantic import BaseModel
+from typing import Optional
+
+class VerdictRequest(BaseModel):
+    ticker:     str
+    market:     str = "us"
+    dcf_result: dict
+
+@app.post("/ai-verdict")
+async def get_ai_verdict(request: VerdictRequest):
+    """
+    AI-powered investment verdict.
+    Accepts full DCF result from frontend (user sets their own assumptions).
+    1. Extracts key metrics from DCF result
+    2. Fetches recent news via yfinance
+    3. Feeds both into Claude API
+    4. Returns structured verdict
+    """
+    try:
+        ticker     = request.ticker.upper()
+        market     = request.market.lower()
+        dcf_result = request.dcf_result
+
+        if market == "india" and not ticker.endswith(".NS"):
+            ticker += ".NS"
+
+        # ── Step 1: Validate DCF result ───────────────────────────────────────
+        if not dcf_result:
+            return {"error": "DCF result is empty. Please run the DCF model first."}
+
+        if dcf_result.get("error"):
+            return {"error": f"DCF result has an error: {dcf_result['error']}. Please fix and rerun."}
+
+        # ── Step 2: Fetch company info + news ─────────────────────────────────
+        stock = yf.Ticker(ticker)
+
+        company_name = stock.info.get("longName") or ticker
+        sector       = stock.info.get("sector", "Unknown")
+        industry     = stock.info.get("industry", "Unknown")
+
+        news_items = []
+        try:
+            news = stock.news or []
+            for item in news[:8]:
+                title   = item.get("title", "")
+                summary = (item.get("summary", "") or item.get("content", ""))[:250]
+                source  = item.get("publisher", "")
+                if title:
+                    news_items.append(f"- [{source}] {title}: {summary}")
+        except Exception:
+            news_items = ["No recent news available."]
+
+        news_text = "\n".join(news_items) if news_items else "No recent news available."
+
+        # ── Step 3: Extract key DCF metrics for Claude ────────────────────────
+        current_price = dcf_result.get("current_price", "N/A")
+        intrinsic     = dcf_result.get("intrinsic_value_per_share", "N/A")
+        intrinsic_mos = dcf_result.get("intrinsic_value_with_margin_of_safety", "N/A")
+        upside        = dcf_result.get("upside_downside_pct", "N/A")
+        wacc          = dcf_result.get("wacc", "N/A")
+        verdict_dcf   = dcf_result.get("verdict", "N/A")
+        ev            = dcf_result.get("enterprise_value", "N/A")
+        avg_tax       = dcf_result.get("avg_tax_rate_used", "N/A")
+        hist_years    = dcf_result.get("historical_years_used", "N/A")
+        mos_used      = dcf_result.get("margin_of_safety_used", "N/A")
+
+        gr          = dcf_result.get("derived_growth_rates", {})
+        rev_growth  = gr.get("revenue_growth", 0)
+        opex_growth = gr.get("opex_growth", 0)
+        term_growth = gr.get("terminal_growth", 0)
+
+        # Build historical FCFF summary
+        hist = dcf_result.get("historical_table", [])
+        hist_lines = []
+        for row in hist[:4]:
+            hist_lines.append(
+                f"  {row.get('year')}: Revenue={row.get('revenue')}, "
+                f"NOP After Tax={row.get('nop_after_tax')}, "
+                f"CapEx={row.get('capex')}, ΔNWC={row.get('delta_nwc')}, "
+                f"FCFF={row.get('fcff')}"
+            )
+        hist_summary = "\n".join(hist_lines) if hist_lines else "  Not available"
+
+        # Build projection summary
+        proj = dcf_result.get("projection_table", [])
+        proj_lines = []
+        for row in proj[:3]:
+            proj_lines.append(
+                f"  {row.get('year')}: Revenue={row.get('revenue')}, "
+                f"FCFF={row.get('fcff')}, PV={row.get('pv_fcff')}"
+            )
+        proj_summary = "\n".join(proj_lines) if proj_lines else "  Not available"
+
+        term = dcf_result.get("terminal_year", {})
+        term_summary = (
+            f"  {term.get('year')}: Revenue={term.get('revenue')}, "
+            f"FCFF={term.get('fcff')}"
+        ) if term else "  Not available"
+
+        # ── Step 4: Build Claude prompt ───────────────────────────────────────
+        prompt = f"""You are a senior equity research analyst at a top investment bank. Provide a rigorous investment analysis for {company_name} ({ticker}) in the {sector} sector ({industry}).
+
+═══ DCF VALUATION OUTPUT ═══
+Current Market Price:     {current_price}
+Intrinsic Value (DCF):    {intrinsic}
+Intrinsic Value (w/ MOS): {intrinsic_mos}  [MOS used: {mos_used}]
+Upside / Downside:        {upside}%
+WACC:                     {wacc}
+Enterprise Value:         {ev}
+DCF Model Signal:         {verdict_dcf}
+Historical Years Used:    {hist_years}
+Avg Effective Tax Rate:   {avg_tax}
+
+Growth Rates (data-derived):
+  Revenue Growth:    {round(float(rev_growth or 0) * 100, 1)}%
+  OpEx Growth:       {round(float(opex_growth or 0) * 100, 1)}%
+  Terminal Growth:   {round(float(term_growth or 0) * 100, 1)}%
+
+Historical FCFF (actuals):
+{hist_summary}
+
+Projected FCFF (Years 1-3):
+{proj_summary}
+
+Terminal Year:
+{term_summary}
+
+═══ RECENT NEWS ═══
+{news_text}
+
+═══ INSTRUCTIONS ═══
+Respond ONLY with a valid JSON object. No preamble, no explanation, no markdown fences. Pure JSON only.
+
+{{
+  "verdict": "one of: Strong Buy / Buy / Hold / Sell / Strong Sell",
+  "confidence": "one of: High / Medium / Low",
+  "summary": "3-4 sentence plain English investment thesis — mention valuation, growth, and key risk",
+  "bull_case": "3 specific bullish arguments referencing actual numbers from the data above",
+  "bear_case": "3 specific bearish arguments referencing actual numbers from the data above",
+  "management_guidance": {{
+    "capex": "CapEx guidance from news, or N/A if not found",
+    "revenue": "Revenue or volume growth guidance from news, or N/A if not found",
+    "expansion": "Any expansion, M&A, or strategic plans from news, or N/A if not found"
+  }},
+  "model_vs_reality": "2 sentences: how do the DCF assumptions (revenue growth, WACC, terminal rate) compare to what management is guiding and what the market expects?",
+  "news_sentiment": "one of: Positive / Neutral / Negative",
+  "recent_headlines": ["top headline 1", "top headline 2", "top headline 3"],
+  "key_risks": ["specific risk 1", "specific risk 2", "specific risk 3"],
+  "analyst_note": "One actionable sentence: what specific metric or event should investors watch in the next quarter?"
+}}"""
+
+        # ── Step 5: Call Claude API ───────────────────────────────────────────
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return {"error": "ANTHROPIC_API_KEY environment variable not set on server."}
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type":      "application/json",
+                    "anthropic-version": "2023-06-01",
+                    "x-api-key":         api_key,
+                },
+                json={
+                    "model":      "claude-sonnet-4-6",
+                    "max_tokens": 1500,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ],
+                },
+            )
+
+        if response.status_code != 200:
+            return {"error": f"Claude API error {response.status_code}: {response.text[:300]}"}
+
+        raw     = response.json()
+        ai_text = raw.get("content", [{}])[0].get("text", "").strip()
+
+        # ── Step 6: Parse Claude JSON response ────────────────────────────────
+        try:
+            # Find the JSON object — handle any accidental wrapping
+            clean = ai_text
+            if "```" in clean:
+                for part in clean.split("```"):
+                    stripped = part.strip()
+                    if stripped.startswith("json"):
+                        stripped = stripped[4:].strip()
+                    if stripped.startswith("{"):
+                        clean = stripped
+                        break
+            # Find first { and last } to extract JSON cleanly
+            start = clean.find("{")
+            end   = clean.rfind("}") + 1
+            if start != -1 and end > start:
+                clean = clean[start:end]
+            ai_verdict = json.loads(clean)
+        except Exception as parse_err:
+            ai_verdict = {
+                "verdict":     "Analysis Complete",
+                "confidence":  "Medium",
+                "summary":     ai_text[:500],
+                "parse_error": True,
+                "raw_response": ai_text,
+            }
+
+        # ── Step 7: Return response ───────────────────────────────────────────
+        return {
+            "ticker":       ticker,
+            "company_name": company_name,
+            "sector":       sector,
+            "industry":     industry,
+            "current_price": current_price,
+            "ai_verdict":   ai_verdict,
+            "news_fed":     news_items[:5],
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
