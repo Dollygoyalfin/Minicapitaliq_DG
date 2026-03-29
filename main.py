@@ -992,9 +992,13 @@ async def get_ai_verdict(request: VerdictRequest):
                 async with httpx.AsyncClient(timeout=10.0) as nc:
                     rss_resp = await nc.get(rss_url)
                 if rss_resp.status_code == 200:
+                    # Try CDATA format first, then plain <title> format
                     titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", rss_resp.text)
-                    for t in titles[1:6]:
-                        news_items.append(f"- {t}")
+                    if not titles:
+                        titles = re.findall(r"<title>(.*?)</title>", rss_resp.text)
+                    for t in titles[1:6]:  # skip first (feed title)
+                        if t and len(t) > 10:  # filter out empty/short titles
+                            news_items.append(f"- {t}")
             except Exception:
                 pass
 
@@ -1020,11 +1024,11 @@ async def get_ai_verdict(request: VerdictRequest):
         intrinsic_mos = dcf_result.get("intrinsic_value_with_margin_of_safety", "N/A")
         upside        = dcf_result.get("upside_downside_pct", "N/A")
         wacc_raw      = dcf_result.get("wacc", "N/A")
-        wacc          = f"{float(wacc_raw)*100:.2f}%" if wacc_raw != "N/A" else "N/A"
+        wacc          = f"{float(wacc_raw)*100:.2f}%" if wacc_raw is not None and wacc_raw != "N/A" else "N/A"
         verdict_dcf   = dcf_result.get("verdict", "N/A")
         ev_raw        = dcf_result.get("enterprise_value", "N/A")
         ev            = fmt_num(ev_raw) if ev_raw != "N/A" else "N/A"
-        avg_tax       = f"{float(dcf_result.get('avg_tax_rate_used', 0))*100:.2f}%" if dcf_result.get('avg_tax_rate_used') else "N/A"
+        avg_tax       = f"{float(dcf_result.get('avg_tax_rate_used', 0))*100:.2f}%" if dcf_result.get('avg_tax_rate_used') is not None else "N/A"
         hist_years    = dcf_result.get("historical_years_used", "N/A")
         mos_used      = dcf_result.get("margin_of_safety_used", "N/A")
 
