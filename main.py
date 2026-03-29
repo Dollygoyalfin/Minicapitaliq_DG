@@ -7,6 +7,9 @@ import os
 import httpx
 import json
 
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
 app = FastAPI()
 
 app.add_middleware(
@@ -18,9 +21,9 @@ app.add_middleware(
 )
 
 @app.get("/")
-def home():
-    return {"message": "Mini Capital IQ backend is running 🚀"}
-
+def serve_frontend():
+    return FileResponse("index.html")
+    
 @app.get("/valuation")
 def get_valuation(
     ticker: str = Query(...),
