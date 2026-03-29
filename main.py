@@ -925,11 +925,6 @@ def get_commodities():
         })
 
     return data
-import os
-import httpx
-import json
-from pydantic import BaseModel
-from typing import Optional
 
 class VerdictRequest(BaseModel):
     ticker:     str
@@ -972,25 +967,64 @@ async def get_ai_verdict(request: VerdictRequest):
         try:
             news = stock.news or []
             for item in news[:8]:
-                title   = item.get("title", "")
-                summary = (item.get("summary", "") or item.get("content", ""))[:250]
-                source  = item.get("publisher", "")
+                # yfinance v0.2+ nests content in a dict
+                if "content" in item and isinstance(item["content"], dict):
+                    inner   = item["content"]
+                    title   = inner.get("title", "")
+                    summary = (inner.get("summary", "") or inner.get("description", ""))[:250]
+                    provider = inner.get("provider", {})
+                    source  = provider.get("displayName", "") if isinstance(provider, dict) else str(provider)
+                else:
+                    title   = item.get("title", "")
+                    summary = (item.get("summary", "") or item.get("description", ""))[:250]
+                    source  = item.get("publisher", "") or item.get("source", "")
                 if title:
                     news_items.append(f"- [{source}] {title}: {summary}")
         except Exception:
-            news_items = ["No recent news available."]
+            pass
 
-        news_text = "\n".join(news_items) if news_items else "No recent news available."
+        # Fallback: Google News RSS if yfinance returned nothing
+        if not news_items:
+            try:
+                import re
+                company_query = (company_name or ticker).replace(" ", "+")
+                rss_url  = f"https://news.google.com/rss/search?q={company_query}+stock&hl=en&gl=IN&ceid=IN:en"
+                async with httpx.AsyncClient(timeout=10.0) as nc:
+                    rss_resp = await nc.get(rss_url)
+                if rss_resp.status_code == 200:
+                    titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", rss_resp.text)
+                    for t in titles[1:6]:
+                        news_items.append(f"- {t}")
+            except Exception:
+                pass
+
+        if not news_items:
+            news_items = ["No recent news available — analysis based on DCF data only."]
+
+        news_text = "\n".join(news_items)
 
         # ── Step 3: Extract key DCF metrics for Claude ────────────────────────
+        def fmt_num(n):
+            """Format large numbers to readable form for Claude prompt."""
+            if n is None: return "N/A"
+            try:
+                n = float(n)
+                if abs(n) >= 1e12: return f"{n/1e12:.2f}T"
+                if abs(n) >= 1e9:  return f"{n/1e9:.2f}B"
+                if abs(n) >= 1e6:  return f"{n/1e6:.2f}M"
+                return f"{n:.2f}"
+            except: return str(n)
+
         current_price = dcf_result.get("current_price", "N/A")
         intrinsic     = dcf_result.get("intrinsic_value_per_share", "N/A")
         intrinsic_mos = dcf_result.get("intrinsic_value_with_margin_of_safety", "N/A")
         upside        = dcf_result.get("upside_downside_pct", "N/A")
-        wacc          = dcf_result.get("wacc", "N/A")
+        wacc_raw      = dcf_result.get("wacc", "N/A")
+        wacc          = f"{float(wacc_raw)*100:.2f}%" if wacc_raw != "N/A" else "N/A"
         verdict_dcf   = dcf_result.get("verdict", "N/A")
-        ev            = dcf_result.get("enterprise_value", "N/A")
-        avg_tax       = dcf_result.get("avg_tax_rate_used", "N/A")
+        ev_raw        = dcf_result.get("enterprise_value", "N/A")
+        ev            = fmt_num(ev_raw) if ev_raw != "N/A" else "N/A"
+        avg_tax       = f"{float(dcf_result.get('avg_tax_rate_used', 0))*100:.2f}%" if dcf_result.get('avg_tax_rate_used') else "N/A"
         hist_years    = dcf_result.get("historical_years_used", "N/A")
         mos_used      = dcf_result.get("margin_of_safety_used", "N/A")
 
@@ -1004,10 +1038,10 @@ async def get_ai_verdict(request: VerdictRequest):
         hist_lines = []
         for row in hist[:4]:
             hist_lines.append(
-                f"  {row.get('year')}: Revenue={row.get('revenue')}, "
-                f"NOP After Tax={row.get('nop_after_tax')}, "
-                f"CapEx={row.get('capex')}, ΔNWC={row.get('delta_nwc')}, "
-                f"FCFF={row.get('fcff')}"
+                f"  {row.get('year')}: Revenue={fmt_num(row.get('revenue'))}, "
+                f"NOP After Tax={fmt_num(row.get('nop_after_tax'))}, "
+                f"CapEx={fmt_num(row.get('capex'))}, ΔNWC={fmt_num(row.get('delta_nwc'))}, "
+                f"FCFF={fmt_num(row.get('fcff'))}"
             )
         hist_summary = "\n".join(hist_lines) if hist_lines else "  Not available"
 
@@ -1016,15 +1050,15 @@ async def get_ai_verdict(request: VerdictRequest):
         proj_lines = []
         for row in proj[:3]:
             proj_lines.append(
-                f"  {row.get('year')}: Revenue={row.get('revenue')}, "
-                f"FCFF={row.get('fcff')}, PV={row.get('pv_fcff')}"
+                f"  {row.get('year')}: Revenue={fmt_num(row.get('revenue'))}, "
+                f"FCFF={fmt_num(row.get('fcff'))}, PV={fmt_num(row.get('pv_fcff'))}"
             )
         proj_summary = "\n".join(proj_lines) if proj_lines else "  Not available"
 
         term = dcf_result.get("terminal_year", {})
         term_summary = (
-            f"  {term.get('year')}: Revenue={term.get('revenue')}, "
-            f"FCFF={term.get('fcff')}"
+            f"  {term.get('year')}: Revenue={fmt_num(term.get('revenue'))}, "
+            f"FCFF={fmt_num(term.get('fcff'))}"
         ) if term else "  Not available"
 
         # ── Step 4: Build Claude prompt ───────────────────────────────────────
