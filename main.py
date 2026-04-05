@@ -32,45 +32,64 @@ FMP_BASE = "https://financialmodelingprep.com/api/v3"
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fmp_get(path: str, params: dict = None) -> dict | list:
-    """Generic FMP GET. Returns parsed JSON or empty dict on error."""
+    """Generic FMP GET. Returns parsed JSON or empty list/dict on error."""
     try:
         url = f"{FMP_BASE}{path}"
-        p = dict(params) if params else {}   # never mutate caller's dict
+        p = dict(params) if params else {}
         p["apikey"] = FMP_API_KEY
         resp = httpx.get(url, params=p, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        # FMP returns {"Error Message": "..."} on bad key / unknown ticker
+        if isinstance(data, dict) and ("Error Message" in data or "error" in data):
+            return []
+        return data
     except Exception:
-        return {}
+        return []
 
 
 def get_fmp_profile(ticker: str) -> dict:
-    """Fetch stock profile from FMP and map to yfinance-style keys."""
+    """Fetch stock profile + latest balance sheet from FMP, map to yfinance-style keys.
+    FMP /profile does NOT include totalDebt/totalCash — pulled from balance sheet instead.
+    """
     data = fmp_get(f"/profile/{ticker}")
-    if not data or not isinstance(data, list):
+    if not data or not isinstance(data, list) or not data[0]:
         return {}
     d = data[0]
+
+    # Pull totalDebt and totalCash from latest balance sheet
+    bal = fmp_get(f"/balance-sheet-statement/{ticker}", {"limit": 1})
+    bal0 = bal[0] if isinstance(bal, list) and bal else {}
+    total_debt = float(bal0.get("totalDebt") or bal0.get("longTermDebt") or 0)
+    total_cash = float(bal0.get("cashAndShortTermInvestments") or bal0.get("cashAndCashEquivalents") or 0)
+
+    # sharesOutstanding: use profile value, fall back to mktCap/price derivation
+    shares = d.get("sharesOutstanding")
+    if not shares:
+        mktcap = d.get("mktCap") or 0
+        price  = d.get("price") or 1
+        shares = mktcap / price if price else None
+
     return {
-        "currentPrice":      d.get("price"),
-        "marketCap":         d.get("mktCap"),
-        "trailingEps":       d.get("eps"),
-        "trailingPE":        d.get("pe"),
-        "forwardPE":         None,
-        "priceToBook":       d.get("priceToBookRatio"),
-        "beta":              d.get("beta") or 1.0,
-        "returnOnEquity":    d.get("roe"),
-        "debtToEquity":      d.get("debtToEquityRatio"),
-        "bookValue":         d.get("bookValuePerShare"),
-        "longName":          d.get("companyName"),
-        "sector":            d.get("sector"),
-        "industry":          d.get("industry"),
-        "sharesOutstanding": d.get("sharesOutstanding"),
-        "totalDebt":         d.get("totalDebt") or 0,
-        "totalCash":         d.get("totalCash") or 0,
-        "dividendYield":     d.get("lastDiv"),
+        "currentPrice":       d.get("price"),
+        "marketCap":          d.get("mktCap"),
+        "trailingEps":        d.get("eps"),
+        "trailingPE":         d.get("pe"),
+        "forwardPE":          None,
+        "priceToBook":        d.get("priceToBookRatio"),
+        "beta":               d.get("beta") or 1.0,
+        "returnOnEquity":     d.get("roe"),
+        "debtToEquity":       d.get("debtToEquityRatio"),
+        "bookValue":          d.get("bookValuePerShare"),
+        "longName":           d.get("companyName"),
+        "sector":             d.get("sector"),
+        "industry":           d.get("industry"),
+        "sharesOutstanding":  shares,
+        "totalDebt":          total_debt,
+        "totalCash":          total_cash,
+        "dividendYield":      d.get("lastDiv"),
         "regularMarketPrice": d.get("price"),
-        "description":       d.get("description", ""),
-        "exchange":          d.get("exchangeShortName", ""),
+        "description":        d.get("description", ""),
+        "exchange":           d.get("exchangeShortName", ""),
     }
 
 
@@ -96,14 +115,18 @@ def resolve_ticker(ticker: str, market: str, advanced: bool = False) -> tuple[st
     """
     Returns (resolved_ticker, use_fmp).
     - India + default  → yfinance (.NS suffix)
-    - India + advanced → FMP (.NS suffix)
+    - India + advanced → FMP (NO .NS — FMP uses bare ticker e.g. RELIANCE)
     - US               → FMP always
     """
     t = ticker.upper()
     if market.lower() == "india":
-        if not t.endswith(".NS"):
-            t += ".NS"
-        return t, advanced  # advanced=True → use FMP
+        if advanced:
+            # FMP does not support .NS suffix — strip it
+            return t.replace(".NS", ""), True
+        else:
+            if not t.endswith(".NS"):
+                t += ".NS"
+            return t, False
     else:
         return t, True  # US always uses FMP
 
@@ -154,8 +177,8 @@ def get_valuation(
 
         cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
         cost_of_debt   = 0.06
-        equity_value   = market_cap if market_cap else 1
-        debt_value     = equity_value * 0.2
+        equity_value   = market_cap if (market_cap and market_cap > 0) else 1
+        debt_value     = equity_value * 0.2  # assumed 20% debt ratio when no real debt data
         wacc = (
             (equity_value / (equity_value + debt_value)) * cost_of_equity +
             (debt_value   / (equity_value + debt_value)) * cost_of_debt
@@ -225,22 +248,26 @@ def get_financials(
             def list_to_dict(records: list, key_field: str = "calendarYear") -> dict:
                 out = {}
                 for r in records:
-                    yr = r.get(key_field, r.get("date", "N/A"))
-                    out[yr] = r
+                    yr = r.get(key_field) or r.get("date", "N/A")
+                    out[str(yr)] = r   # always string key
                 return out
 
-            income       = list_to_dict(inc_list)
-            cashflow     = list_to_dict(cf_list)
+            income        = list_to_dict(inc_list)
+            cashflow      = list_to_dict(cf_list)
             balance_sheet = list_to_dict(bal_list)
 
             roe_dupont = {}
             for yr, r in income.items():
-                net_income = r.get("netIncome", 1) or 1
-                revenue    = r.get("revenue", 1) or 1
-                bal        = balance_sheet.get(yr, {})
-                assets     = bal.get("totalAssets", 1) or 1
-                equity     = bal.get("totalStockholdersEquity", 1) or 1
-                roe_dupont[yr] = (net_income / revenue) * (revenue / assets) * (assets / equity)
+                net_income = r.get("netIncome") or 1
+                revenue    = r.get("revenue") or 1
+                # Balance sheet key may use date string instead of calendarYear — try both
+                bal = balance_sheet.get(yr) or balance_sheet.get(r.get("date", "")[:4]) or {}
+                assets = bal.get("totalAssets") or 1
+                equity = bal.get("totalStockholdersEquity") or bal.get("totalEquity") or 1
+                try:
+                    roe_dupont[yr] = (net_income / revenue) * (revenue / assets) * (assets / equity)
+                except ZeroDivisionError:
+                    roe_dupont[yr] = 0.0
 
         else:
             stock       = yf.Ticker(resolved)
@@ -299,8 +326,12 @@ def get_dcf(
             cf_list  = get_fmp_cashflow(resolved, 7)
             bal_list = get_fmp_balance(resolved, 8)
 
-            if not info or not inc_list or not bal_list:
-                return {"error": f"FMP returned insufficient data for {resolved}"}
+            if not info:
+                return {"error": f"FMP profile returned no data for {resolved}. Check ticker symbol."}
+            if not inc_list:
+                return {"error": f"FMP income statement empty for {resolved}. Ticker may not be supported on your FMP plan."}
+            if not bal_list:
+                return {"error": f"FMP balance sheet empty for {resolved}."}
 
             current_price      = info.get("currentPrice")
             shares_outstanding = info.get("sharesOutstanding")
@@ -336,17 +367,17 @@ def get_dcf(
                 if revenue == 0.0:
                     continue
 
-                # OpEx: FMP's operatingExpenses already INCLUDES costOfRevenue for most companies,
-                # so use it directly. Fall back to costAndExpenses, then COGS-only.
-                op_exp = fi(inc, "operatingExpenses")
+                # FMP: operatingExpenses = SG&A only (NOT total cost).
+                # Total operating cost = costOfRevenue + operatingExpenses.
+                # Fall back to costAndExpenses if both are zero.
                 cogs   = fi(inc, "costOfRevenue")
-                total_op = fi(inc, "totalOperatingExpenses") or fi(inc, "costAndExpenses")
-                if total_op:
-                    opex = total_op
-                elif op_exp:
-                    opex = op_exp
-                else:
-                    opex = cogs
+                sgna   = fi(inc, "operatingExpenses")
+                opex   = (cogs + sgna) if (cogs + sgna) > 0 else fi(inc, "costAndExpenses")
+                # Last resort: derive from grossProfit
+                if opex == 0:
+                    gross = fi(inc, "grossProfit")
+                    ebit  = fi(inc, "operatingIncome") or fi(inc, "ebitda")
+                    opex  = revenue - gross + (gross - ebit) if gross and ebit else revenue * 0.7
 
                 # Tax rate
                 pretax   = fi(inc, "incomeBeforeTax")
@@ -359,7 +390,7 @@ def get_dcf(
                 ca      = fi(bal, "totalCurrentAssets")
                 cl      = fi(bal, "totalCurrentLiabilities")
                 csh     = fi(bal, "cashAndCashEquivalents")
-                cpltd   = fi(bal, "shortTermDebt") or fi(bal, "currentPortionOfLongTermDebt")
+                cpltd   = fi(bal, "shortTermDebt") or fi(bal, "capitalLeaseObligations") or 0.0
                 net_ppe = fi(bal, "propertyPlantEquipmentNet")
                 depr    = abs(fi(cf, "depreciationAndAmortization"))
 
@@ -567,7 +598,8 @@ def get_dcf(
 
         revenue_growth = avg_yoy_growth(revenue_series)
         opex_growth    = avg_yoy_growth(opex_series)
-        opex_growth    = min(opex_growth, revenue_growth * 1.5)
+        # Cap opex growth: use 1.5x revenue growth when positive, else cap at 30%
+        opex_growth    = min(opex_growth, max(revenue_growth * 1.5, 0.30))
         ca_growth      = avg_yoy_growth(ca_series)
         cl_growth      = avg_yoy_growth(cl_series)
         cash_growth    = avg_yoy_growth(cash_series)
@@ -828,10 +860,7 @@ def get_reverse_dcf(
         resolved, use_fmp = resolve_ticker(ticker, market, advanced)
 
         if use_fmp:
-            info     = get_fmp_profile(resolved)
-            inc_list = get_fmp_cashflow(resolved, 5)
-            bal_list = get_fmp_balance(resolved, 5)
-
+            info = get_fmp_profile(resolved)
             if not info:
                 return {"error": f"FMP returned no data for {resolved}"}
 
@@ -842,21 +871,26 @@ def get_reverse_dcf(
             total_debt         = info.get("totalDebt") or 0
             total_cash         = info.get("totalCash") or 0
 
-            inc_list_is = get_fmp_income(resolved, 5)
-            base_revenue = float(inc_list_is[0].get("revenue", 0)) if inc_list_is else None
-            base_opex    = (float(inc_list_is[0].get("costOfRevenue", 0)) +
-                            float(inc_list_is[0].get("operatingExpenses", 0))) if inc_list_is else None
-            avg_tax_rate = 0.25
-            if inc_list_is:
-                pretax   = float(inc_list_is[0].get("incomeBeforeTax", 0) or 0)
-                tax_prov = float(inc_list_is[0].get("incomeTaxExpense", 0) or 0)
-                if pretax != 0:
-                    avg_tax_rate = max(0.05, min(abs(tax_prov / pretax), 0.40))
+            # Pull latest income + cashflow statements
+            inc_list = get_fmp_income(resolved, 3)
+            cf_list  = get_fmp_cashflow(resolved, 1)
 
-            cf0 = (get_fmp_cashflow(resolved, 1) or [{}])[0]
-            base_depr = abs(float(cf0.get("depreciationAndAmortization", 0) or 0))
-            bal0 = (get_fmp_balance(resolved, 1) or [{}])[0]
-            base_capex_proxy = base_depr  # simplified
+            if not inc_list:
+                return {"error": f"FMP income data unavailable for {resolved}"}
+
+            inc0 = inc_list[0]
+            base_revenue = float(inc0.get("revenue") or 0)
+            cogs         = float(inc0.get("costOfRevenue") or 0)
+            sgna         = float(inc0.get("operatingExpenses") or 0)
+            base_opex    = (cogs + sgna) if (cogs + sgna) > 0 else float(inc0.get("costAndExpenses") or 0)
+
+            pretax   = float(inc0.get("incomeBeforeTax") or 0)
+            tax_prov = float(inc0.get("incomeTaxExpense") or 0)
+            avg_tax_rate = max(0.05, min(abs(tax_prov / pretax), 0.40)) if pretax != 0 else 0.25
+
+            cf0 = cf_list[0] if cf_list else {}
+            base_depr        = abs(float(cf0.get("depreciationAndAmortization") or 0))
+            base_capex_proxy = abs(float(cf0.get("capitalExpenditure") or 0)) or base_depr
 
         else:
             stock = yf.Ticker(resolved)
@@ -901,10 +935,11 @@ def get_reverse_dcf(
         if not current_price or not shares_outstanding or not base_revenue:
             return {"error": "Insufficient data for Reverse DCF."}
 
-        # Guard: target_equity must be positive for binary search to work
-        target_equity = current_price * shares_outstanding
-        if target_equity <= 0:
-            return {"error": "Invalid target equity (price * shares <= 0)."}
+        # Use market_cap as the equity target (avoids shares_outstanding precision issues)
+        # Add back debt, subtract cash to get implied EV, then solve for growth
+        target_equity = market_cap if market_cap else (current_price * shares_outstanding if (current_price and shares_outstanding) else None)
+        if not target_equity or target_equity <= 0:
+            return {"error": "Cannot determine market cap — check ticker."}
 
         # Guard: base_opex=0 causes div/zero in terminal formula
         if base_revenue == 0:
@@ -923,38 +958,44 @@ def get_reverse_dcf(
         if wacc <= terminal_growth_rate:
             return {"error": "WACC must be greater than terminal growth rate."}
 
-        target_equity = current_price * shares_outstanding
-
-        def compute_equity(growth_rate: float) -> float:
+        # target_equity already set above from market_cap — do NOT recompute here
+        def compute_equity_value(growth_rate: float) -> float:
+            """Returns equity value = EV + cash - debt"""
             g = max(min(growth_rate, 1.0), -0.5)
-            pv_total = 0.0
+            pv_total  = 0.0
             prev_rev  = base_revenue
-            prev_opex = base_opex
+            prev_opex = safe_base_opex
 
             for yr in range(1, projection_years + 1):
-                rev  = prev_rev  * (1 + g)
-                opex = prev_opex * (1 + g * 0.9)  # opex grows slightly slower
+                rev    = prev_rev  * (1 + g)
+                opex   = prev_opex * (1 + g * 0.9)  # opex grows slightly slower than revenue
                 nop_at = (rev - opex) * (1 - avg_tax_rate)
-                fcff   = nop_at - base_capex_proxy
+                capex  = base_capex_proxy * (1 + g * 0.5)   # capex scales with growth
+                fcff   = nop_at - capex
                 pv_total += fcff / ((1 + wacc) ** yr)
                 prev_rev  = rev
                 prev_opex = opex
 
-            # Terminal — use safe_base_opex to avoid division by zero
-            term_fcff = prev_rev * (1 + terminal_growth_rate) * (1 - safe_base_opex / base_revenue) * (1 - avg_tax_rate) - base_capex_proxy
-            tv = term_fcff / (wacc - terminal_growth_rate)
+            # Terminal value
+            term_rev   = prev_rev  * (1 + terminal_growth_rate)
+            term_opex  = prev_opex * (1 + terminal_growth_rate)
+            term_fcff  = (term_rev - term_opex) * (1 - avg_tax_rate) - base_capex_proxy
+            if wacc <= terminal_growth_rate:
+                tv = 0
+            else:
+                tv = term_fcff / (wacc - terminal_growth_rate)
             pv_total += tv / ((1 + wacc) ** projection_years)
 
-            eq = pv_total + total_cash - total_debt
-            return eq
+            return pv_total + total_cash - total_debt
 
-        # Binary search for implied growth rate
-        lo, hi = -0.10, 1.00
+        # Binary search: find growth_rate where compute_equity_value ≈ market_cap
+        lo, hi = -0.10, 1.50
         implied_growth = None
-        for _ in range(60):
+        for _ in range(80):
             mid = (lo + hi) / 2
-            eq  = compute_equity(mid)
-            if abs(eq - target_equity) < target_equity * 0.001:
+            eq  = compute_equity_value(mid)
+            diff = eq - target_equity
+            if abs(diff) < target_equity * 0.0005:
                 implied_growth = mid
                 break
             if eq < target_equity:
@@ -966,18 +1007,19 @@ def get_reverse_dcf(
 
         # Scenarios
         scenarios = []
-        for label, g in [("Bear (-2%)", implied_growth - 0.02),
-                          ("Base (implied)", implied_growth),
+        for label, g in [("Bear (-5%)", implied_growth - 0.05),
+                          ("Bear (-2%)", implied_growth - 0.02),
+                          ("Base (Implied)", implied_growth),
                           ("Bull (+2%)", implied_growth + 0.02),
                           ("Bull (+5%)", implied_growth + 0.05)]:
-            eq  = compute_equity(g)
-            ivps = eq / shares_outstanding
+            eq   = compute_equity_value(g)
+            ivps = eq / shares_outstanding if shares_outstanding else None
             scenarios.append({
-                "scenario":            label,
-                "growth_rate":         round(g * 100, 2),
+                "scenario":             label,
+                "growth_rate":          round(g * 100, 2),
                 "implied_equity_value": round(eq, 0),
-                "intrinsic_per_share":  round(ivps, 2),
-                "vs_current_price":     round(((ivps - current_price) / current_price) * 100, 1),
+                "intrinsic_per_share":  round(ivps, 2) if ivps else None,
+                "vs_current_price":     round(((ivps - current_price) / current_price) * 100, 1) if ivps and current_price else None,
             })
 
         interpretation = (
@@ -1031,20 +1073,23 @@ def get_insider_transactions(
 
         transactions = []
         for t in data:
+            ttype = t.get("transactionType") or t.get("acquistionOrDisposition") or ""
             transactions.append({
-                "date":            t.get("transactionDate"),
-                "insider_name":    t.get("reportingName"),
-                "title":           t.get("typeOfOwner"),
-                "transaction_type": t.get("transactionType"),
-                "shares":          t.get("securitiesTransacted"),
-                "price":           t.get("price"),
-                "value":           t.get("value"),
+                "date":               t.get("transactionDate") or t.get("filingDate"),
+                "insider_name":       t.get("reportingName") or t.get("reporterName"),
+                "title":              t.get("typeOfOwner") or t.get("reporterTitle"),
+                "transaction_type":   ttype,
+                "shares":             t.get("securitiesTransacted") or t.get("sharesTransacted"),
+                "price":              t.get("price"),
+                "value":              t.get("value") or (
+                    (t.get("securitiesTransacted") or 0) * (t.get("price") or 0)
+                ),
                 "shares_owned_after": t.get("securitiesOwned"),
             })
 
         # Summary stats
-        buys  = [t for t in transactions if "purchase" in (t.get("transaction_type") or "").lower() or "buy" in (t.get("transaction_type") or "").lower()]
-        sells = [t for t in transactions if "sale" in (t.get("transaction_type") or "").lower() or "sell" in (t.get("transaction_type") or "").lower()]
+        buys  = [t for t in transactions if "purchase" in (t.get("transaction_type") or "").lower() or "acquisition" in (t.get("transaction_type") or "").lower()]
+        sells = [t for t in transactions if "sale" in (t.get("transaction_type") or "").lower() or "disposition" in (t.get("transaction_type") or "").lower()]
         buy_value  = sum(t.get("value") or 0 for t in buys)
         sell_value = sum(t.get("value") or 0 for t in sells)
 
@@ -1150,11 +1195,11 @@ def get_analyst_targets(
             for r in consensus_data[:8]:
                 recommendations.append({
                     "date":         r.get("date"),
-                    "strong_buy":   r.get("analystRatingsbuy"),
-                    "buy":          r.get("analystRatingsOverweight"),
-                    "hold":         r.get("analystRatingsHold"),
-                    "sell":         r.get("analystRatingsUnderweight"),
-                    "strong_sell":  r.get("analystRatingsSell"),
+                    "strong_buy":   r.get("analystRatingsStrongBuy") or r.get("analystRatingsbuy") or 0,
+                    "buy":          r.get("analystRatingsBuy") or r.get("analystRatingsOverweight") or 0,
+                    "hold":         r.get("analystRatingsHold") or 0,
+                    "sell":         r.get("analystRatingsSell") or r.get("analystRatingsUnderweight") or 0,
+                    "strong_sell":  r.get("analystRatingsStrongSell") or 0,
                 })
 
         # Latest recommendation tally
@@ -1223,8 +1268,14 @@ def get_earnings_calendar(
 
         # Historical earnings surprises
         hist_data = fmp_get(f"/historical/earning_calendar/{resolved}", {"limit": limit})
-        # Upcoming earnings
-        upcoming_data = fmp_get(f"/earning_calendar/{resolved}")
+        # Upcoming earnings — use from/to so we only get future dates
+        from datetime import date, timedelta
+        today = date.today().isoformat()
+        future = (date.today() + timedelta(days=90)).isoformat()
+        upcoming_data = fmp_get(f"/earning_calendar", {"from": today, "to": future, "symbol": resolved})
+        # Fallback: if parameterized call returns nothing, try the ticker-based endpoint
+        if not upcoming_data:
+            upcoming_data = fmp_get(f"/earning_calendar/{resolved}")
 
         history = []
         if isinstance(hist_data, list):
@@ -1244,10 +1295,10 @@ def get_earnings_calendar(
                     "eps_estimated":     est,
                     "surprise_pct":      surprise_pct,
                     "beat":              beat,
-                    "revenue_actual":    e.get("revenue"),
-                    "revenue_estimated": e.get("revenueEstimated"),
-                    "fiscal_quarter":    e.get("period"),
-                    "time":              e.get("time"),  # BMO / AMC
+                    "revenue_actual":    e.get("revenue") or e.get("actualRevenue"),
+                    "revenue_estimated": e.get("revenueEstimated") or e.get("estimatedRevenue"),
+                    "fiscal_quarter":    e.get("period") or e.get("fiscalQuarter"),
+                    "time":              e.get("time"),
                 })
 
         # Compute beat rate
@@ -1310,15 +1361,17 @@ def get_screener(
         resolved, use_fmp = resolve_ticker(raw, market, False)
         try:
             if use_fmp:
-                info = get_fmp_profile(resolved)
-                current_price  = info.get("currentPrice") or info.get("regularMarketPrice")
-                pe_ratio       = info.get("trailingPE")
-                pb_ratio       = info.get("priceToBook")
-                roe            = info.get("returnOnEquity")
-                market_cap     = info.get("marketCap")
-                de_ratio       = info.get("debtToEquity")
-                dividend_yield = info.get("dividendYield")
-                eps            = info.get("trailingEps")
+                # Use raw FMP profile (no balance sheet call) to avoid 100 API calls for 50 tickers
+                raw = fmp_get(f"/profile/{resolved}")
+                raw0 = raw[0] if isinstance(raw, list) and raw else {}
+                current_price  = raw0.get("price")
+                pe_ratio       = raw0.get("pe")
+                pb_ratio       = raw0.get("priceToBookRatio")
+                roe            = raw0.get("roe")
+                market_cap     = raw0.get("mktCap")
+                de_ratio       = raw0.get("debtToEquityRatio")
+                dividend_yield = raw0.get("lastDiv")
+                eps            = raw0.get("eps")
                 week_change    = None  # FMP profile doesn't include 1-week change directly
             else:
                 stock = yf.Ticker(resolved)
@@ -1479,19 +1532,27 @@ async def get_ai_verdict(request: VerdictRequest):
 
         # ── Step 2: Fetch competitor data via FMP ─────────────────────────────
         peers_data = fmp_get(f"/stock_peers/{resolved}")
-        peer_list  = peers_data.get("peersList", []) if isinstance(peers_data, dict) else []
+        # FMP /stock_peers returns a LIST: [{"symbol":"X","peersList":[...]}]
+        if isinstance(peers_data, list) and peers_data:
+            peer_list = peers_data[0].get("peersList", [])
+        elif isinstance(peers_data, dict):
+            peer_list = peers_data.get("peersList", [])
+        else:
+            peer_list = []
         peer_list  = peer_list[:4]  # top 4 competitors
 
         competitor_summaries = []
         for peer in peer_list:
             try:
-                p_profile = get_fmp_profile(peer)
-                if p_profile:
+                # Lightweight: only fetch /profile, skip balance sheet for speed
+                p_data = fmp_get(f"/profile/{peer}")
+                if isinstance(p_data, list) and p_data:
+                    p = p_data[0]
                     competitor_summaries.append(
-                        f"  {peer}: Price={p_profile.get('currentPrice')}, "
-                        f"PE={p_profile.get('trailingPE')}, "
-                        f"MCap={p_profile.get('marketCap')}, "
-                        f"ROE={p_profile.get('returnOnEquity')}"
+                        f"  {peer}: Price={p.get('price')}, "
+                        f"PE={p.get('pe')}, "
+                        f"MCap={p.get('mktCap')}, "
+                        f"ROE={p.get('roe')}"
                     )
             except Exception:
                 pass
@@ -1510,8 +1571,8 @@ async def get_ai_verdict(request: VerdictRequest):
 
         # ── Step 4: Insider sentiment ─────────────────────────────────────────
         insider_data   = fmp_get(f"/insider-trading/{resolved}", {"limit": 10})
-        insider_buys   = sum(1 for t in (insider_data or []) if "purchase" in (t.get("transactionType") or "").lower())
-        insider_sells  = sum(1 for t in (insider_data or []) if "sale" in (t.get("transactionType") or "").lower())
+        insider_buys   = sum(1 for t in (insider_data or []) if any(x in (t.get("transactionType") or "").lower() for x in ["purchase","acquisition","buy"]))
+        insider_sells  = sum(1 for t in (insider_data or []) if any(x in (t.get("transactionType") or "").lower() for x in ["sale","disposition","sell"]))
         insider_signal = "Bullish" if insider_buys > insider_sells else "Bearish" if insider_sells > insider_buys else "Neutral"
 
         # ── Step 5: Earnings surprise history ────────────────────────────────
