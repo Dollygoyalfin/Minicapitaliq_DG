@@ -1,13 +1,13 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional  # kept for forward compatibility
 import yfinance as yf
 import os
 import httpx
 import json
+import re
 
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 app = FastAPI()
@@ -20,241 +20,504 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── API Keys ──────────────────────────────────────────────────────────────────
+FMP_API_KEY = os.getenv("FMP_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
+# ── FMP Base URL ──────────────────────────────────────────────────────────────
+FMP_BASE = "https://financialmodelingprep.com/api/v3"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FMP HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fmp_get(path: str, params: dict = None) -> dict | list:
+    """Generic FMP GET. Returns parsed JSON or empty dict on error."""
+    try:
+        url = f"{FMP_BASE}{path}"
+        p = dict(params) if params else {}   # never mutate caller's dict
+        p["apikey"] = FMP_API_KEY
+        resp = httpx.get(url, params=p, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def get_fmp_profile(ticker: str) -> dict:
+    """Fetch stock profile from FMP and map to yfinance-style keys."""
+    data = fmp_get(f"/profile/{ticker}")
+    if not data or not isinstance(data, list):
+        return {}
+    d = data[0]
+    return {
+        "currentPrice":      d.get("price"),
+        "marketCap":         d.get("mktCap"),
+        "trailingEps":       d.get("eps"),
+        "trailingPE":        d.get("pe"),
+        "forwardPE":         None,
+        "priceToBook":       d.get("priceToBookRatio"),
+        "beta":              d.get("beta") or 1.0,
+        "returnOnEquity":    d.get("roe"),
+        "debtToEquity":      d.get("debtToEquityRatio"),
+        "bookValue":         d.get("bookValuePerShare"),
+        "longName":          d.get("companyName"),
+        "sector":            d.get("sector"),
+        "industry":          d.get("industry"),
+        "sharesOutstanding": d.get("sharesOutstanding"),
+        "totalDebt":         d.get("totalDebt") or 0,
+        "totalCash":         d.get("totalCash") or 0,
+        "dividendYield":     d.get("lastDiv"),
+        "regularMarketPrice": d.get("price"),
+        "description":       d.get("description", ""),
+        "exchange":          d.get("exchangeShortName", ""),
+    }
+
+
+def get_fmp_income(ticker: str, limit: int = 6) -> list:
+    """Annual income statements from FMP."""
+    data = fmp_get(f"/income-statement/{ticker}", {"limit": limit})
+    return data if isinstance(data, list) else []
+
+
+def get_fmp_cashflow(ticker: str, limit: int = 6) -> list:
+    """Annual cash flow statements from FMP."""
+    data = fmp_get(f"/cash-flow-statement/{ticker}", {"limit": limit})
+    return data if isinstance(data, list) else []
+
+
+def get_fmp_balance(ticker: str, limit: int = 7) -> list:
+    """Annual balance sheets from FMP."""
+    data = fmp_get(f"/balance-sheet-statement/{ticker}", {"limit": limit})
+    return data if isinstance(data, list) else []
+
+
+def resolve_ticker(ticker: str, market: str, advanced: bool = False) -> tuple[str, bool]:
+    """
+    Returns (resolved_ticker, use_fmp).
+    - India + default  → yfinance (.NS suffix)
+    - India + advanced → FMP (.NS suffix)
+    - US               → FMP always
+    """
+    t = ticker.upper()
+    if market.lower() == "india":
+        if not t.endswith(".NS"):
+            t += ".NS"
+        return t, advanced  # advanced=True → use FMP
+    else:
+        return t, True  # US always uses FMP
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STATIC / ROOT
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.get("/")
 def serve_frontend():
     return FileResponse("index.html")
-    
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /valuation  — yfinance for India default, FMP for US / Advanced
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.get("/valuation")
 def get_valuation(
     ticker: str = Query(...),
     market: str = Query("us"),
-    risk_free_rate: float = Query(0.04, description="Risk free rate in decimal"),
-    market_return: float = Query(0.10, description="Expected market return in decimal"),
-    growth_rate: float = Query(0.08, description="Growth rate for intrinsic value calculation")
+    advanced: bool = Query(False, description="Use FMP for Indian stocks too"),
+    risk_free_rate: float = Query(0.04),
+    market_return: float = Query(0.10),
+    growth_rate: float = Query(0.08),
 ):
     try:
-        # Adjust ticker for Indian stocks
-        if market.lower() == "india" and not ticker.endswith(".NS"):
-            ticker = ticker.upper() + ".NS"
+        resolved, use_fmp = resolve_ticker(ticker, market, advanced)
 
-        stock = yf.Ticker(ticker)
-        info = stock.info
+        if use_fmp:
+            info = get_fmp_profile(resolved)
+            if not info:
+                return {"error": f"FMP returned no data for {resolved}"}
+        else:
+            stock = yf.Ticker(resolved)
+            info = stock.info
 
-        # Basic fields
         current_price = info.get("currentPrice")
-        eps = info.get("trailingEps", 0.0)
-        pe_ratio = info.get("trailingPE", None)
-        forward_pe = info.get("forwardPE", None)
-        beta = info.get("beta", 1.0)
-        pb_ratio = info.get("priceToBook", None)
-        market_cap = info.get("marketCap", None)
-        roe = info.get("returnOnEquity", None)
-        de_ratio = info.get("debtToEquity", None)
-        book_value = info.get("bookValue", None)
+        eps           = info.get("trailingEps") or 0.0
+        pe_ratio      = info.get("trailingPE")
+        forward_pe    = info.get("forwardPE")
+        beta          = info.get("beta") or 1.0
+        pb_ratio      = info.get("priceToBook")
+        market_cap    = info.get("marketCap")
+        roe           = info.get("returnOnEquity")
+        de_ratio      = info.get("debtToEquity")
+        book_value    = info.get("bookValue")
 
-        # Ownership placeholders
-        promoters_holding = None
-        fii_holding = None
-        dii_holding = None
-        retail_holding = None
-
-        # Cost of equity (CAPM)
         cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
-
-        # Approximate WACC
-        cost_of_debt = 0.06
-        equity_value = market_cap if market_cap else 1
-        debt_value = equity_value * 0.2
+        cost_of_debt   = 0.06
+        equity_value   = market_cap if market_cap else 1
+        debt_value     = equity_value * 0.2
         wacc = (
             (equity_value / (equity_value + debt_value)) * cost_of_equity +
-               (debt_value / (equity_value + debt_value)) * cost_of_debt
+            (debt_value   / (equity_value + debt_value)) * cost_of_debt
         )
 
-        # Intrinsic value (Gordon growth)
+        intrinsic_value = None
         if eps and wacc > growth_rate:
             intrinsic_value = (eps * (1 + growth_rate)) / (wacc - growth_rate)
-        else:
-            intrinsic_value = None
 
-        # Sensitivity range
-        valuation_low, valuation_high = None, None
+        valuation_low = valuation_high = None
         if eps:
             low_growth, high_growth = growth_rate - 0.02, growth_rate + 0.02
-            low_disc, high_disc = wacc + 0.02, wacc - 0.02
-
-            if low_disc > low_growth:
-                valuation_low = (eps * (1 + low_growth)) / (low_disc - low_growth)
+            low_disc,  high_disc    = wacc + 0.02,        wacc - 0.02
+            if low_disc  > low_growth:
+                valuation_low  = (eps * (1 + low_growth))  / (low_disc  - low_growth)
             if high_disc > high_growth:
                 valuation_high = (eps * (1 + high_growth)) / (high_disc - high_growth)
 
         return {
-            "ticker": ticker.upper(),
-            "market": market,
-            "current_price": current_price,
-            "eps": eps,
-            "pe_ratio": pe_ratio,
-            "forward_pe": forward_pe,
-            "beta": beta,
-            "pb_ratio": pb_ratio,
-            "book_value": book_value,
-            "market_cap": market_cap,
-            "roe": roe,
-            "de_ratio": de_ratio,
+            "ticker":          resolved,
+            "market":          market,
+            "data_source":     "FMP" if use_fmp else "yfinance",
+            "current_price":   current_price,
+            "eps":             eps,
+            "pe_ratio":        pe_ratio,
+            "forward_pe":      forward_pe,
+            "beta":            beta,
+            "pb_ratio":        pb_ratio,
+            "book_value":      book_value,
+            "market_cap":      market_cap,
+            "roe":             roe,
+            "de_ratio":        de_ratio,
             "intrinsic_value": intrinsic_value,
-            "valuation_low": valuation_low,
-            "valuation_high": valuation_high,
-            "growth_rate_used": growth_rate,
+            "valuation_low":   valuation_low,
+            "valuation_high":  valuation_high,
+            "growth_rate_used":   growth_rate,
             "discount_rate_used": wacc,
-            "wacc": wacc,
-            "promoters_holding": promoters_holding,
-            "fii_holding": fii_holding,
-            "dii_holding": dii_holding,
-            "retail_holding": retail_holding
+            "wacc":               wacc,
+            "promoters_holding":  None,
+            "fii_holding":        None,
+            "dii_holding":        None,
+            "retail_holding":     None,
         }
 
     except Exception as e:
         return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /financials  — yfinance for India default, FMP for US / Advanced
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/financials")
 def get_financials(
     ticker: str = Query(...),
-    market: str = Query("us")
+    market: str = Query("us"),
+    advanced: bool = Query(False),
 ):
     try:
-        ticker = ticker.upper()
-        if market.lower() == "india" and not ticker.endswith(".NS"):
-            ticker += ".NS"
-        stock = yf.Ticker(ticker)
-        
-        #fin data
-        income_df = stock.financials
-        cashflow_df = stock.cashflow
-        balance_df = stock.balance_sheet
-        if income_df is None or income_df.empty:
-            income = {}
-        else:
-            income = income_df.T.head(5).to_dict()
-        if cashflow_df is None or cashflow_df.empty:
-            cashflow = {}
-        else:
-            cashflow = cashflow_df.T.head(5).to_dict()
-        if balance_df is None or balance_df.empty:
-            balance_sheet = {}
-        else:
-            balance_sheet = balance_df.T.head(5).to_dict()
-        
+        resolved, use_fmp = resolve_ticker(ticker, market, advanced)
 
-    # Example: DuPont ROE calculation
-        roe_dupont = {}
+        if use_fmp:
+            inc_list = get_fmp_income(resolved, 5)
+            cf_list  = get_fmp_cashflow(resolved, 5)
+            bal_list = get_fmp_balance(resolved, 5)
 
-        for year in income:
-            net_income = income[year].get("Net Income", 1)
-            revenue = income[year].get("Total Revenue", 1)
-            assets = balance_sheet.get(year, {}).get("Total Assets", 1)
-            equity = balance_sheet.get(year, {}).get("Total Stockholder Equity", 1)
+            def list_to_dict(records: list, key_field: str = "calendarYear") -> dict:
+                out = {}
+                for r in records:
+                    yr = r.get(key_field, r.get("date", "N/A"))
+                    out[yr] = r
+                return out
 
-            roe_dupont[year] = (
-                (net_income / revenue) *
-                (revenue / assets) *
-                (assets / equity)
-            )
+            income       = list_to_dict(inc_list)
+            cashflow     = list_to_dict(cf_list)
+            balance_sheet = list_to_dict(bal_list)
+
+            roe_dupont = {}
+            for yr, r in income.items():
+                net_income = r.get("netIncome", 1) or 1
+                revenue    = r.get("revenue", 1) or 1
+                bal        = balance_sheet.get(yr, {})
+                assets     = bal.get("totalAssets", 1) or 1
+                equity     = bal.get("totalStockholdersEquity", 1) or 1
+                roe_dupont[yr] = (net_income / revenue) * (revenue / assets) * (assets / equity)
+
+        else:
+            stock       = yf.Ticker(resolved)
+            income_df   = stock.financials
+            cashflow_df = stock.cashflow
+            balance_df  = stock.balance_sheet
+
+            income        = {} if income_df  is None or income_df.empty  else income_df.T.head(5).to_dict()
+            cashflow      = {} if cashflow_df is None or cashflow_df.empty else cashflow_df.T.head(5).to_dict()
+            balance_sheet = {} if balance_df  is None or balance_df.empty  else balance_df.T.head(5).to_dict()
+
+            roe_dupont = {}
+            for year in income:
+                net_income = income[year].get("Net Income", 1)
+                revenue    = income[year].get("Total Revenue", 1)
+                assets     = balance_sheet.get(year, {}).get("Total Assets", 1)
+                equity     = balance_sheet.get(year, {}).get("Total Stockholder Equity", 1)
+                roe_dupont[year] = (
+                    (net_income / revenue) * (revenue / assets) * (assets / equity)
+                )
 
         return {
+            "data_source":      "FMP" if use_fmp else "yfinance",
             "income_statement": income,
-            "cash_flow": cashflow,
-            "balance_sheet": balance_sheet,
-            "dupont_roe": roe_dupont
+            "cash_flow":        cashflow,
+            "balance_sheet":    balance_sheet,
+            "dupont_roe":       roe_dupont,
         }
 
     except Exception as e:
         return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /dcf  — yfinance for India default, FMP for US / Advanced
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.get("/dcf")
 def get_dcf(
     ticker: str = Query(...),
     market: str = Query("us"),
-    projection_years: int = Query(5, description="Number of years to project FCFF"),
-    risk_free_rate: float = Query(0.04, description="Risk-free rate (decimal)"),
-    market_return: float = Query(0.10, description="Expected market return (decimal)"),
-    terminal_growth_rate: float = Query(0.03, description="Terminal growth rate for perpetuity (decimal)"),
-    margin_of_safety: float = Query(0.25, description="Margin of safety (decimal, e.g. 0.25 = 25%)")
+    advanced: bool = Query(False),
+    projection_years: int = Query(5),
+    risk_free_rate: float = Query(0.04),
+    market_return: float = Query(0.10),
+    terminal_growth_rate: float = Query(0.03),
+    margin_of_safety: float = Query(0.25),
 ):
-    """
-    Cash-based FCFF DCF Valuation.
-
-    Income Statement (Revenue, OpEx):
-      - Each line has its own avg YoY growth rate from historical data
-      - Projected by compounding that rate forward
-
-    Balance Sheet lines (CA, CL, Cash, CPLTD, Net PPE, Depreciation):
-      - Each line has its own avg YoY growth rate from historical data
-      - Projected Years 1-N by compounding
-      - Terminal Year = rolling avg of previous 5 projected years
-
-    Derived each year:
-      WC    = CA - CL - Cash - CPLTD
-      ΔNWC  = WC(year) - WC(year-1)
-      CapEx = Net PPE(year) - Net PPE(year-1) + Depreciation(year)
-
-    FCFF  = NOP*(1-t) - ΔNWC - CapEx
-    TV    = FCFF_terminal / (WACC - terminal_growth_rate)
-    EV    = Σ PV(FCFF) + PV(TV)
-    Equity = EV + Cash + Investments - Debt - Minority Interest
-    """
     try:
-        # ── Ticker setup ──────────────────────────────────────────────────────
-        raw_ticker = ticker.upper()
-        if market.lower() == "india" and not raw_ticker.endswith(".NS"):
-            raw_ticker += ".NS"
+        resolved, use_fmp = resolve_ticker(ticker, market, advanced)
 
-        stock = yf.Ticker(raw_ticker)
-        info  = stock.info
+        # ── Pull data (FMP or yfinance) ───────────────────────────────────────
+        if use_fmp:
+            info     = get_fmp_profile(resolved)
+            inc_list = get_fmp_income(resolved, 7)
+            cf_list  = get_fmp_cashflow(resolved, 7)
+            bal_list = get_fmp_balance(resolved, 8)
 
-        # ── Info fields ───────────────────────────────────────────────────────
-        current_price      = info.get("currentPrice")
-        shares_outstanding = info.get("sharesOutstanding")
-        beta               = info.get("beta", 1.0) or 1.0
-        market_cap         = info.get("marketCap")
-        total_debt         = info.get("totalDebt", 0) or 0
-        total_cash         = info.get("totalCash", 0) or 0
+            if not info or not inc_list or not bal_list:
+                return {"error": f"FMP returned insufficient data for {resolved}"}
 
-        if not shares_outstanding or shares_outstanding == 0:
-            return {"error": "Shares outstanding not available for this ticker."}
+            current_price      = info.get("currentPrice")
+            shares_outstanding = info.get("sharesOutstanding")
+            beta               = info.get("beta") or 1.0
+            market_cap         = info.get("marketCap")
+            total_debt         = info.get("totalDebt") or 0
+            total_cash         = info.get("totalCash") or 0
 
-        # ── Pull financial statements ─────────────────────────────────────────
-        income_df   = stock.financials
-        cashflow_df = stock.cashflow
-        balance_df  = stock.balance_sheet
+            if not shares_outstanding or shares_outstanding == 0:
+                return {"error": "Shares outstanding not available for this ticker."}
 
-        for label, df in [("Income statement", income_df),
-                           ("Cash flow statement", cashflow_df),
-                           ("Balance sheet", balance_df)]:
-            if df is None or df.empty:
-                return {"error": f"{label} not available for this ticker."}
+            # FMP field extractors
+            def fi(record, field, fallback=0.0):
+                v = record.get(field)
+                try:
+                    return float(v) if v is not None else fallback
+                except Exception:
+                    return fallback
 
-        # ── Helpers ───────────────────────────────────────────────────────────
-        def find_row(df, *keywords):
-            for idx in df.index:
-                if all(k.lower() in idx.lower() for k in keywords):
-                    return idx
-            return None
+            # Build series from FMP (index 0 = most recent)
+            revenue_series = []; opex_series = []; tax_rates = []; year_labels = []
+            ca_series = []; cl_series = []; cash_series = []; cpltd_series = []
+            net_ppe_series = []; depr_series = []
 
-        def safe_float(df, row_key, col):
-            if row_key is None:
+            n = min(len(inc_list), len(cf_list), len(bal_list), 7)
+
+            for i in range(n):
+                inc = inc_list[i] if i < len(inc_list) else {}
+                cf  = cf_list[i]  if i < len(cf_list)  else {}
+                bal = bal_list[i] if i < len(bal_list) else {}
+
+                revenue = fi(inc, "revenue")
+                if revenue == 0.0:
+                    continue
+
+                # OpEx: FMP's operatingExpenses already INCLUDES costOfRevenue for most companies,
+                # so use it directly. Fall back to costAndExpenses, then COGS-only.
+                op_exp = fi(inc, "operatingExpenses")
+                cogs   = fi(inc, "costOfRevenue")
+                total_op = fi(inc, "totalOperatingExpenses") or fi(inc, "costAndExpenses")
+                if total_op:
+                    opex = total_op
+                elif op_exp:
+                    opex = op_exp
+                else:
+                    opex = cogs
+
+                # Tax rate
+                pretax   = fi(inc, "incomeBeforeTax")
+                tax_prov = fi(inc, "incomeTaxExpense")
+                if pretax != 0 and tax_prov != 0:
+                    yr_tax = max(0.05, min(abs(tax_prov / pretax), 0.40))
+                else:
+                    yr_tax = 0.25
+
+                ca      = fi(bal, "totalCurrentAssets")
+                cl      = fi(bal, "totalCurrentLiabilities")
+                csh     = fi(bal, "cashAndCashEquivalents")
+                cpltd   = fi(bal, "shortTermDebt") or fi(bal, "currentPortionOfLongTermDebt")
+                net_ppe = fi(bal, "propertyPlantEquipmentNet")
+                depr    = abs(fi(cf, "depreciationAndAmortization"))
+
+                try:
+                    year_labels.append(str(inc.get("calendarYear", inc.get("date", f"Y-{i}"))))
+                except Exception:
+                    year_labels.append(f"Y-{i}")
+
+                revenue_series.append(revenue)
+                opex_series.append(opex)
+                tax_rates.append(yr_tax)
+                ca_series.append(ca)
+                cl_series.append(cl)
+                cash_series.append(csh)
+                cpltd_series.append(cpltd)
+                net_ppe_series.append(net_ppe)
+                depr_series.append(depr)
+
+            # Interest expense for WACC cost of debt
+            interest_expense = abs(fi(inc_list[0], "interestExpense")) if inc_list else 0.0
+
+        else:
+            # ── yfinance path (Indian stocks default) ─────────────────────────
+            stock = yf.Ticker(resolved)
+            info  = stock.info
+
+            current_price      = info.get("currentPrice")
+            shares_outstanding = info.get("sharesOutstanding")
+            beta               = info.get("beta", 1.0) or 1.0
+            market_cap         = info.get("marketCap")
+            total_debt         = info.get("totalDebt", 0) or 0
+            total_cash         = info.get("totalCash", 0) or 0
+
+            if not shares_outstanding or shares_outstanding == 0:
+                return {"error": "Shares outstanding not available for this ticker."}
+
+            income_df   = stock.financials
+            cashflow_df = stock.cashflow
+            balance_df  = stock.balance_sheet
+
+            for label, df in [("Income statement", income_df),
+                               ("Cash flow statement", cashflow_df),
+                               ("Balance sheet", balance_df)]:
+                if df is None or df.empty:
+                    return {"error": f"{label} not available for this ticker."}
+
+            def find_row(df, *keywords):
+                for idx in df.index:
+                    if all(k.lower() in idx.lower() for k in keywords):
+                        return idx
                 return None
-            try:
-                val = df.loc[row_key].iloc[col]
-                if val is None or str(val) == "nan":
+
+            def safe_float(df, row_key, col):
+                if row_key is None:
                     return None
-                return float(val)
-            except Exception:
-                return None
+                try:
+                    val = df.loc[row_key].iloc[col]
+                    if val is None or str(val) == "nan":
+                        return None
+                    return float(val)
+                except Exception:
+                    return None
 
-        def avg_yoy_growth(series: list) -> float:
-            """
-            series = [most_recent, ..., oldest]
-            Average YoY growth from valid consecutive pairs.
-            Falls back to CAGR. Returns 0.0 if insufficient data.
-            """
+            revenue_row  = find_row(income_df, "total revenue") or find_row(income_df, "revenue")
+            opex_row     = (find_row(income_df, "total expenses")
+                            or find_row(income_df, "total operating expenses")
+                            or find_row(income_df, "operating expense")
+                            or find_row(income_df, "cost of revenue"))
+            pretax_row   = find_row(income_df, "pretax") or find_row(income_df, "income before tax")
+            tax_row      = find_row(income_df, "tax", "provision") or find_row(income_df, "income tax")
+            interest_row = find_row(income_df, "interest", "expense")
+            ca_row       = find_row(balance_df, "current assets")
+            cl_row       = find_row(balance_df, "current liabilities")
+            cash_row     = (find_row(balance_df, "cash and cash equivalents")
+                            or find_row(balance_df, "cash"))
+            cpltd_row    = (find_row(balance_df, "current portion", "long term")
+                            or find_row(balance_df, "current", "long term debt")
+                            or find_row(balance_df, "current portion"))
+            net_ppe_row  = (find_row(balance_df, "net ppe")
+                            or find_row(balance_df, "net property plant")
+                            or find_row(balance_df, "property plant equipment"))
+            depr_row_inc = (find_row(income_df, "reconciled depreciation")
+                            or find_row(income_df, "depreciation amortization")
+                            or find_row(income_df, "depreciation"))
+            depr_row_cf  = (find_row(cashflow_df, "depreciation amortization")
+                            or find_row(cashflow_df, "depreciation"))
+
+            if not revenue_row:
+                return {"error": "Could not find Revenue in income statement."}
+
+            n_inc   = min(len(income_df.columns), 6)
+            n_cf    = min(len(cashflow_df.columns), 6)
+            n_bal   = min(len(balance_df.columns), 7)
+            n_years = min(n_inc, n_cf, n_bal)
+
+            if n_years == 0:
+                return {"error": "Not enough historical data to compute FCFF."}
+
+            revenue_series = []; opex_series = []; tax_rates = []; year_labels = []
+            ca_series = []; cl_series = []; cash_series = []; cpltd_series = []
+            net_ppe_series = []; depr_series = []
+
+            for col in range(n_years):
+                revenue = safe_float(income_df, revenue_row, col) or 0.0
+                if revenue == 0.0:
+                    continue
+                pretax   = safe_float(income_df, pretax_row, col)
+                tax_prov = safe_float(income_df, tax_row, col)
+                if pretax and pretax != 0 and tax_prov is not None and tax_prov != 0:
+                    yr_tax = max(0.05, min(abs(tax_prov / pretax), 0.40))
+                else:
+                    yr_tax = 0.25
+                if opex_row:
+                    opex = abs(safe_float(income_df, opex_row, col) or 0.0)
+                else:
+                    ebit_row_fb = find_row(income_df, "ebit") or find_row(income_df, "operating income")
+                    ebit_val    = safe_float(income_df, ebit_row_fb, col) or 0.0
+                    opex        = abs(revenue - ebit_val)
+
+                ca      = safe_float(balance_df, ca_row, col) or 0.0
+                cl      = safe_float(balance_df, cl_row, col) or 0.0
+                csh     = safe_float(balance_df, cash_row, col) or 0.0
+                cpltd   = safe_float(balance_df, cpltd_row, col) or 0.0
+                net_ppe = safe_float(balance_df, net_ppe_row, col) or 0.0
+                depr    = abs(safe_float(income_df, depr_row_inc, col) or
+                              safe_float(cashflow_df, depr_row_cf, col) or 0.0)
+
+                try:
+                    year_labels.append(str(income_df.columns[col].year))
+                except Exception:
+                    year_labels.append(f"Y-{col}")
+
+                revenue_series.append(revenue)
+                opex_series.append(opex)
+                tax_rates.append(yr_tax)
+                ca_series.append(ca)
+                cl_series.append(cl)
+                cash_series.append(csh)
+                cpltd_series.append(cpltd)
+                net_ppe_series.append(net_ppe)
+                depr_series.append(depr)
+
+            interest_expense = abs(safe_float(income_df, interest_row, 0) or 0.0)
+
+        # ── Shared DCF Math (same for both data sources) ──────────────────────
+
+        if not revenue_series:
+            return {"error": "No valid historical revenue data found for this ticker."}
+
+        # Ensure interest_expense always defined (FMP path may skip all rows)
+        try:
+            interest_expense
+        except NameError:
+            interest_expense = 0.0
+
+        n_valid = len(revenue_series)
+
+        def avg_yoy_growth(series):
             rates = []
             for i in range(len(series) - 1):
                 v_new, v_old = series[i], series[i + 1]
@@ -271,158 +534,30 @@ def get_dcf(
                 return (valid[0] / valid[-1]) ** (1 / n) - 1
             return 0.0
 
-        def project_line(base: float, growth: float, years: int) -> list:
-            """Project a single line item N years forward by compounding.
-            If base is 0, returns flat zero series (can't grow from zero).
-            Caps growth at 100% per year to prevent runaway projections.
-            """
-            g = max(min(growth, 1.0), -0.5)  # cap: -50% to +100% per year
+        def project_line(base, growth, years):
+            g = max(min(growth, 1.0), -0.5)
             if base == 0.0:
                 return [0.0] * years
             return [base * ((1 + g) ** y) for y in range(1, years + 1)]
 
-        def rolling_avg_terminal(projected: list) -> float:
-            """
-            Terminal year = rolling avg of last 5 projected values.
-            If fewer than 5 projected years exist, average all of them.
-            Returns 0.0 if list is empty.
-            """
+        def rolling_avg_terminal(projected):
             if not projected:
                 return 0.0
             window = projected[-5:] if len(projected) >= 5 else projected
             return sum(window) / len(window)
 
-        # ── Identify rows ─────────────────────────────────────────────────────
-        revenue_row  = find_row(income_df, "total revenue") or find_row(income_df, "revenue")
-        opex_row     = (find_row(income_df, "total expenses")
-                        or find_row(income_df, "total operating expenses")
-                        or find_row(income_df, "operating expense")
-                        or find_row(income_df, "cost of revenue"))
-        pretax_row   = find_row(income_df, "pretax") or find_row(income_df, "income before tax")
-        tax_row      = find_row(income_df, "tax", "provision") or find_row(income_df, "income tax")
-        interest_row = find_row(income_df, "interest", "expense")
-
-        # Balance sheet rows
-        ca_row      = find_row(balance_df, "current assets")
-        cl_row      = find_row(balance_df, "current liabilities")
-        cash_row    = (find_row(balance_df, "cash and cash equivalents")
-                       or find_row(balance_df, "cash"))
-        cpltd_row   = (find_row(balance_df, "current portion", "long term")
-                       or find_row(balance_df, "current", "long term debt")
-                       or find_row(balance_df, "current portion"))
-        net_ppe_row = (find_row(balance_df, "net ppe")
-                       or find_row(balance_df, "net property plant")
-                       or find_row(balance_df, "property plant equipment"))
-
-        # Depreciation — check income statement first, then cashflow
-        depr_row_inc = (find_row(income_df, "reconciled depreciation")
-                        or find_row(income_df, "depreciation amortization")
-                        or find_row(income_df, "depreciation"))
-        depr_row_cf  = (find_row(cashflow_df, "depreciation amortization")
-                        or find_row(cashflow_df, "depreciation"))
-
-        if not revenue_row:
-            return {"error": "Could not find Revenue in income statement."}
-
-        # ── Determine usable years ───────────────────────────────────────────────
-        # Collect up to 6 years of data for richer growth rate calculation
-        # Balance sheet needs col+1 for CapEx derivation, so allow 7 cols
-        n_inc   = min(len(income_df.columns), 6)
-        n_cf    = min(len(cashflow_df.columns), 6)
-        n_bal   = min(len(balance_df.columns), 7)
-        n_years = min(n_inc, n_cf, n_bal)
-
-        if n_years == 0:
-            return {"error": "Not enough historical data to compute FCFF."}
-
-        # ── Collect historical series (index 0 = most recent year) ────────────
-        # Income statement series
-        revenue_series = []
-        opex_series    = []
-        tax_rates      = []
-        year_labels    = []
-
-        # Balance sheet series (raw values per year)
-        ca_series      = []
-        cl_series      = []
-        cash_series    = []
-        cpltd_series   = []
-        net_ppe_series = []
-        depr_series    = []
-
-        for col in range(n_years):
-            revenue  = safe_float(income_df, revenue_row, col) or 0.0
-
-            # Skip years with zero/missing revenue
-            if revenue == 0.0:
-                continue
-
-            pretax   = safe_float(income_df, pretax_row, col)
-            tax_prov = safe_float(income_df, tax_row,    col)
-
-            # Effective tax rate
-            if pretax and pretax != 0 and tax_prov is not None and tax_prov != 0:
-                yr_tax = max(0.05, min(abs(tax_prov / pretax), 0.40))
-            else:
-                yr_tax = 0.25
-
-            # OpEx
-            if opex_row:
-                opex = abs(safe_float(income_df, opex_row, col) or 0.0)
-            else:
-                ebit_row_fb = find_row(income_df, "ebit") or find_row(income_df, "operating income")
-                ebit_val    = safe_float(income_df, ebit_row_fb, col) or 0.0
-                opex        = abs(revenue - ebit_val)
-
-            # Balance sheet values
-            ca      = safe_float(balance_df, ca_row,      col) or 0.0
-            cl      = safe_float(balance_df, cl_row,      col) or 0.0
-            csh     = safe_float(balance_df, cash_row,    col) or 0.0
-            cpltd   = safe_float(balance_df, cpltd_row,   col) or 0.0
-            net_ppe = safe_float(balance_df, net_ppe_row, col) or 0.0
-            depr    = abs(safe_float(income_df,   depr_row_inc, col) or
-                          safe_float(cashflow_df, depr_row_cf,  col) or 0.0)
-
-            try:
-                year_labels.append(str(income_df.columns[col].year))
-            except Exception:
-                year_labels.append(f"Y-{col}")
-
-            revenue_series.append(revenue)
-            opex_series.append(opex)
-            tax_rates.append(yr_tax)
-            ca_series.append(ca)
-            cl_series.append(cl)
-            cash_series.append(csh)
-            cpltd_series.append(cpltd)
-            net_ppe_series.append(net_ppe)
-            depr_series.append(depr)
-
-        if not revenue_series:
-            return {"error": "No valid historical revenue data found for this ticker."}
-
-        n_valid = len(revenue_series)
-
-        # ── Derive historical WC and CapEx ────────────────────────────────────
-        # WC = CA - CL - Cash - CPLTD
         wc_series = [
             ca_series[i] - cl_series[i] - cash_series[i] - cpltd_series[i]
             for i in range(n_valid)
         ]
-
-        # CapEx(i) = Net PPE(i) - Net PPE(i+1) + Depr(i)
-        # i=0 is most recent, i+1 is prior year
         capex_series = []
         for i in range(n_valid):
             if i + 1 < len(net_ppe_series):
                 capex_val = net_ppe_series[i] - net_ppe_series[i + 1] + depr_series[i]
             else:
-                # No prior year available — use depr as proxy (maintenance CapEx floor)
                 capex_val = depr_series[i]
-            capex_series.append(max(capex_val, 0.0))  # CapEx can't be negative
+            capex_series.append(max(capex_val, 0.0))
 
-        # ── Historical ΔNWC ───────────────────────────────────────────────────
-        # ΔNWC(i) = WC(i) - WC(i+1)  [i=0 most recent, i+1 prior year]
         delta_nwc_series = []
         for i in range(n_valid):
             if i + 1 < len(wc_series):
@@ -430,10 +565,8 @@ def get_dcf(
             else:
                 delta_nwc_series.append(0.0)
 
-        # ── Average growth rates ───────────────────────────────────────────────
         revenue_growth = avg_yoy_growth(revenue_series)
         opex_growth    = avg_yoy_growth(opex_series)
-        # Soft cap on opex: can grow faster than revenue short term but not 2x+
         opex_growth    = min(opex_growth, revenue_growth * 1.5)
         ca_growth      = avg_yoy_growth(ca_series)
         cl_growth      = avg_yoy_growth(cl_series)
@@ -442,15 +575,10 @@ def get_dcf(
         net_ppe_growth = avg_yoy_growth(net_ppe_series)
         depr_growth    = avg_yoy_growth(depr_series)
 
-        # If depreciation data is missing (all zeros), estimate as % of Net PPE
-        # Must run BEFORE caps so depr_growth gets capped correctly
         if all(d == 0.0 for d in depr_series) and any(p > 0 for p in net_ppe_series):
-            avg_depr_rate = 0.05  # assume 5% depreciation rate on Net PPE
-            depr_series   = [n * avg_depr_rate for n in net_ppe_series]
-            depr_growth   = net_ppe_growth  # depr grows with PPE
+            depr_series = [n * 0.05 for n in net_ppe_series]
+            depr_growth = net_ppe_growth
 
-        # Cap all BS line growth rates at revenue growth
-        # No balance sheet line can sustainably outgrow the business itself
         ca_growth      = min(ca_growth,      revenue_growth)
         cl_growth      = min(cl_growth,      revenue_growth)
         cash_growth    = min(cash_growth,    revenue_growth)
@@ -460,45 +588,38 @@ def get_dcf(
 
         avg_tax_rate = sum(tax_rates) / len(tax_rates) if tax_rates else 0.25
 
-        # ── Build historical table — show only 5 most recent valid years ────────
-        # Year 6 data used for growth rates only, not displayed
         display_years = min(n_valid, 5)
         historical_table = []
         for i in range(display_years):
-            rev    = revenue_series[i]
-            opex   = opex_series[i]
-            capex  = capex_series[i]
-            t      = tax_rates[i]
-            d_nwc  = delta_nwc_series[i]
-
-            nop    = rev - opex
+            rev   = revenue_series[i]
+            opex  = opex_series[i]
+            capex = capex_series[i]
+            t     = tax_rates[i]
+            d_nwc = delta_nwc_series[i]
+            nop   = rev - opex
             nop_at = nop * (1 - t)
-            fcff   = nop_at - d_nwc - capex
-
+            fcff  = nop_at - d_nwc - capex
             historical_table.append({
-                "year":               year_labels[i],
-                "revenue":            round(rev,   2),
-                "operating_expenses": round(-opex,  2),
-                "nop":                round(nop,   2),
-                "tax_rate":           round(t,     4),
-                "nop_after_tax":      round(nop_at,2),
-                "delta_nwc":          round(-d_nwc, 2),
-                "capex":              round(-capex, 2),
-                "fcff":               round(fcff,  2),
-                # Balance sheet components for transparency
-                "bs_ca":              round(ca_series[i],      2),
-                "bs_cl":              round(cl_series[i],      2),
-                "bs_cash":            round(cash_series[i],    2),
-                "bs_cpltd":           round(cpltd_series[i],   2),
-                "bs_net_ppe":         round(net_ppe_series[i], 2),
-                "bs_depreciation":    round(depr_series[i],    2),
-                "bs_wc":              round(wc_series[i],      2),
+                "year": year_labels[i],
+                "revenue": round(rev, 2),
+                "operating_expenses": round(-opex, 2),
+                "nop": round(nop, 2),
+                "tax_rate": round(t, 4),
+                "nop_after_tax": round(nop_at, 2),
+                "delta_nwc": round(-d_nwc, 2),
+                "capex": round(-capex, 2),
+                "fcff": round(fcff, 2),
+                "bs_ca": round(ca_series[i], 2),
+                "bs_cl": round(cl_series[i], 2),
+                "bs_cash": round(cash_series[i], 2),
+                "bs_cpltd": round(cpltd_series[i], 2),
+                "bs_net_ppe": round(net_ppe_series[i], 2),
+                "bs_depreciation": round(depr_series[i], 2),
+                "bs_wc": round(wc_series[i], 2),
             })
 
-        # ── WACC ──────────────────────────────────────────────────────────────
+        # WACC
         cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
-
-        interest_expense = abs(safe_float(income_df, interest_row, 0) or 0.0)
         if total_debt > 0 and interest_expense > 0:
             cost_of_debt = max(0.03, min(interest_expense / total_debt, 0.15))
         else:
@@ -507,7 +628,6 @@ def get_dcf(
         equity_val    = market_cap if market_cap else 1
         debt_val      = total_debt if total_debt else equity_val * 0.2
         total_capital = equity_val + debt_val
-
         wacc = (
             (equity_val / total_capital) * cost_of_equity +
             (debt_val   / total_capital) * cost_of_debt * (1 - avg_tax_rate)
@@ -516,15 +636,10 @@ def get_dcf(
         if wacc <= terminal_growth_rate:
             return {"error": f"WACC ({wacc:.2%}) must be greater than terminal growth rate ({terminal_growth_rate:.2%})."}
 
-        # ── Project Balance Sheet lines Years 1-N ─────────────────────────────
-        base_ca      = ca_series[0]
-        base_cl      = cl_series[0]
-        base_cash    = cash_series[0]
-        base_cpltd   = cpltd_series[0]
-        base_net_ppe = net_ppe_series[0]
-        base_depr    = depr_series[0]
-        base_rev     = revenue_series[0]
-        base_opex    = opex_series[0]
+        # Projections
+        base_ca = ca_series[0]; base_cl = cl_series[0]; base_cash = cash_series[0]
+        base_cpltd = cpltd_series[0]; base_net_ppe = net_ppe_series[0]
+        base_depr = depr_series[0]; base_rev = revenue_series[0]; base_opex = opex_series[0]
 
         proj_ca_list      = project_line(base_ca,      ca_growth,      projection_years)
         proj_cl_list      = project_line(base_cl,      cl_growth,      projection_years)
@@ -535,14 +650,12 @@ def get_dcf(
         proj_rev_list     = project_line(base_rev,     revenue_growth, projection_years)
         proj_opex_list    = project_line(base_opex,    opex_growth,    projection_years)
 
-        # ── Build projection table ────────────────────────────────────────────
         projection_table = []
-        pv_fcffs         = []
-        prev_wc          = wc_series[0]   # base WC = most recent historical year
+        pv_fcffs = []
+        prev_wc = wc_series[0]
 
         for year in range(projection_years):
-            idx = year  # 0-indexed
-
+            idx = year
             proj_ca      = proj_ca_list[idx]
             proj_cl      = proj_cl_list[idx]
             proj_csh     = proj_cash_list[idx]
@@ -552,51 +665,39 @@ def get_dcf(
             proj_rev     = proj_rev_list[idx]
             proj_opex    = proj_opex_list[idx]
 
-            # WC derived from projected BS lines
-            proj_wc = proj_ca - proj_cl - proj_csh - proj_cpltd
-
-            # ΔNWC = WC(this year) - WC(prior year)
+            proj_wc        = proj_ca - proj_cl - proj_csh - proj_cpltd
             proj_delta_nwc = proj_wc - prev_wc
             prev_wc        = proj_wc
 
-            # CapEx = Net PPE(this year) - Net PPE(prior year) + Depreciation(this year)
-            prior_net_ppe  = proj_net_ppe_list[idx - 1] if idx > 0 else base_net_ppe
-            proj_capex     = max(proj_net_ppe - prior_net_ppe + proj_depr, proj_depr)
+            prior_net_ppe = proj_net_ppe_list[idx - 1] if idx > 0 else base_net_ppe
+            proj_capex    = max(proj_net_ppe - prior_net_ppe + proj_depr, proj_depr)
 
             proj_nop    = proj_rev - proj_opex
             proj_nop_at = proj_nop * (1 - avg_tax_rate)
             proj_fcff   = proj_nop_at - proj_delta_nwc - proj_capex
-
             pv = proj_fcff / ((1 + wacc) ** (year + 1))
 
             projection_table.append({
-                "year":               f"Year {year + 1}",
-                "revenue":            round(proj_rev,         2),
-                "operating_expenses": round(-proj_opex,        2),
-                "nop":                round(proj_nop,         2),
-                "tax_rate":           round(avg_tax_rate,     4),
-                "nop_after_tax":      round(proj_nop_at,      2),
-                "delta_nwc":          round(-proj_delta_nwc,   2),
-                "capex":              round(-proj_capex,        2),
-                "fcff":               round(proj_fcff,         2),
-                "pv_fcff":            round(pv,                2),
-                # Projected BS components
-                "bs_ca":              round(proj_ca,           2),
-                "bs_cl":              round(proj_cl,           2),
-                "bs_cash":            round(proj_csh,          2),
-                "bs_cpltd":           round(proj_cpltd,        2),
-                "bs_net_ppe":         round(proj_net_ppe,      2),
-                "bs_depreciation":    round(proj_depr,         2),
-                "bs_wc":              round(proj_wc,           2),
+                "year": f"Year {year + 1}",
+                "revenue": round(proj_rev, 2),
+                "operating_expenses": round(-proj_opex, 2),
+                "nop": round(proj_nop, 2),
+                "tax_rate": round(avg_tax_rate, 4),
+                "nop_after_tax": round(proj_nop_at, 2),
+                "delta_nwc": round(-proj_delta_nwc, 2),
+                "capex": round(-proj_capex, 2),
+                "fcff": round(proj_fcff, 2),
+                "pv_fcff": round(pv, 2),
+                "bs_ca": round(proj_ca, 2), "bs_cl": round(proj_cl, 2),
+                "bs_cash": round(proj_csh, 2), "bs_cpltd": round(proj_cpltd, 2),
+                "bs_net_ppe": round(proj_net_ppe, 2),
+                "bs_depreciation": round(proj_depr, 2),
+                "bs_wc": round(proj_wc, 2),
             })
-
             pv_fcffs.append(round(pv, 2))
 
         total_pv_fcff = sum(pv_fcffs)
 
-        # ── Terminal Year ─────────────────────────────────────────────────────────
-        # Revenue & OpEx: grow at terminal_growth_rate from last projected year
-        # BS lines: rolling avg of last 5 projected years (mean-reverting)
         term_rev     = proj_rev_list[-1]  * (1 + terminal_growth_rate)
         term_opex    = proj_opex_list[-1] * (1 + terminal_growth_rate)
         term_ca      = rolling_avg_terminal(proj_ca_list)
@@ -605,58 +706,44 @@ def get_dcf(
         term_cpltd   = rolling_avg_terminal(proj_cpltd_list)
         term_net_ppe = rolling_avg_terminal(proj_net_ppe_list)
         term_depr    = rolling_avg_terminal(proj_depr_list)
-
-        # WC and CapEx from terminal BS
-        term_wc        = term_ca - term_cl - term_cash - term_cpltd
-        term_delta_nwc = term_wc - prev_wc   # prev_wc = WC at end of last projected year
-        # CapEx floor = depreciation (minimum maintenance CapEx)
-        term_capex     = max(term_net_ppe - proj_net_ppe_list[-1] + term_depr, term_depr)
-
-        term_nop    = term_rev - term_opex
-        term_nop_at = term_nop * (1 - avg_tax_rate)
-        term_fcff   = term_nop_at - term_delta_nwc - term_capex
+        term_wc      = term_ca - term_cl - term_cash - term_cpltd
+        term_delta_nwc = term_wc - prev_wc
+        term_capex   = max(term_net_ppe - proj_net_ppe_list[-1] + term_depr, term_depr)
+        term_nop     = term_rev - term_opex
+        term_nop_at  = term_nop * (1 - avg_tax_rate)
+        term_fcff    = term_nop_at - term_delta_nwc - term_capex
 
         terminal_year = {
-            "year":               f"Year {projection_years + 1} (Terminal)",
-            "revenue":            round(term_rev,         2),
-            "operating_expenses": round(-term_opex,        2),
-            "nop":                round(term_nop,         2),
-            "tax_rate":           round(avg_tax_rate,     4),
-            "nop_after_tax":      round(term_nop_at,      2),
-            "delta_nwc":          round(-term_delta_nwc,   2),
-            "capex":              round(-term_capex,        2),
-            "fcff":               round(term_fcff,         2),
-            "bs_ca":              round(term_ca,           2),
-            "bs_cl":              round(term_cl,           2),
-            "bs_cash":            round(term_cash,         2),
-            "bs_cpltd":           round(term_cpltd,        2),
-            "bs_net_ppe":         round(term_net_ppe,      2),
-            "bs_depreciation":    round(term_depr,         2),
-            "bs_wc":              round(term_wc,           2),
+            "year": f"Year {projection_years + 1} (Terminal)",
+            "revenue": round(term_rev, 2),
+            "operating_expenses": round(-term_opex, 2),
+            "nop": round(term_nop, 2),
+            "tax_rate": round(avg_tax_rate, 4),
+            "nop_after_tax": round(term_nop_at, 2),
+            "delta_nwc": round(-term_delta_nwc, 2),
+            "capex": round(-term_capex, 2),
+            "fcff": round(term_fcff, 2),
+            "bs_ca": round(term_ca, 2), "bs_cl": round(term_cl, 2),
+            "bs_cash": round(term_cash, 2), "bs_cpltd": round(term_cpltd, 2),
+            "bs_net_ppe": round(term_net_ppe, 2),
+            "bs_depreciation": round(term_depr, 2),
+            "bs_wc": round(term_wc, 2),
         }
 
-        # Terminal Value = FCFF_terminal / (WACC - g)
         terminal_value    = term_fcff / (wacc - terminal_growth_rate)
         pv_terminal_value = terminal_value / ((1 + wacc) ** projection_years)
+        enterprise_value  = total_pv_fcff + pv_terminal_value
 
-        # ── Enterprise & Equity Value ─────────────────────────────────────────
-        enterprise_value = total_pv_fcff + pv_terminal_value
+        if use_fmp:
+            investments = 0.0
+            minority_interest = 0.0
+        else:
+            investments_row   = (find_row(balance_df, "long term investments") or find_row(balance_df, "investments"))
+            minority_row      = find_row(balance_df, "minority interest")
+            investments       = safe_float(balance_df, investments_row, 0) or 0.0
+            minority_interest = safe_float(balance_df, minority_row, 0) or 0.0
 
-        investments_row   = (find_row(balance_df, "long term investments")
-                             or find_row(balance_df, "investments"))
-        minority_row      = find_row(balance_df, "minority interest")
-        investments       = safe_float(balance_df, investments_row, 0) or 0.0
-        minority_interest = safe_float(balance_df, minority_row,    0) or 0.0
-
-        equity_value_dcf = (
-            enterprise_value
-            + total_cash
-            + investments
-            - total_debt
-            - minority_interest
-        )
-
-        # ── Intrinsic Value ───────────────────────────────────────────────────
+        equity_value_dcf          = enterprise_value + total_cash + investments - total_debt - minority_interest
         intrinsic_value_per_share = equity_value_dcf / shares_outstanding
         intrinsic_value_with_mos  = intrinsic_value_per_share * (1 - margin_of_safety)
 
@@ -671,57 +758,44 @@ def get_dcf(
             else None
         )
 
-        # ── Response ──────────────────────────────────────────────────────────
         return {
-            "ticker":        raw_ticker,
-            "market":        market,
+            "ticker": resolved, "market": market,
+            "data_source": "FMP" if use_fmp else "yfinance",
             "current_price": current_price,
-
-            # Growth rates used
             "derived_growth_rates": {
-                "revenue_growth":  round(revenue_growth,  4),
-                "opex_growth":     round(opex_growth,     4),
-                "ca_growth":       round(ca_growth,       4),
-                "cl_growth":       round(cl_growth,       4),
-                "cash_growth":     round(cash_growth,     4),
-                "cpltd_growth":    round(cpltd_growth,    4),
-                "net_ppe_growth":  round(net_ppe_growth,  4),
-                "depr_growth":     round(depr_growth,     4),
+                "revenue_growth": round(revenue_growth, 4),
+                "opex_growth":    round(opex_growth, 4),
+                "ca_growth":      round(ca_growth, 4),
+                "cl_growth":      round(cl_growth, 4),
+                "cash_growth":    round(cash_growth, 4),
+                "cpltd_growth":   round(cpltd_growth, 4),
+                "net_ppe_growth": round(net_ppe_growth, 4),
+                "depr_growth":    round(depr_growth, 4),
                 "terminal_growth": terminal_growth_rate,
             },
-
-            # Model assumptions
             "historical_years_used": display_years,
-            "avg_tax_rate_used":     round(avg_tax_rate,    4),
-            "wacc":                  round(wacc,            4),
-            "cost_of_equity":        round(cost_of_equity,  4),
-            "cost_of_debt":          round(cost_of_debt,    4),
+            "avg_tax_rate_used":     round(avg_tax_rate, 4),
+            "wacc":                  round(wacc, 4),
+            "cost_of_equity":        round(cost_of_equity, 4),
+            "cost_of_debt":          round(cost_of_debt, 4),
             "beta_used":             beta,
             "projection_years":      projection_years,
-
-            # Full model tables
-            "historical_table": historical_table,
-            "projection_table": projection_table,
-            "terminal_year":    terminal_year,
-
-            # Summary
-            "pv_of_fcffs":       pv_fcffs,
-            "total_pv_fcff":     round(total_pv_fcff,     2),
-            "terminal_value":    round(terminal_value,    2),
-            "pv_terminal_value": round(pv_terminal_value, 2),
-
-            # Equity bridge
-            "total_cash":         total_cash,
-            "investments":        round(investments,       2),
-            "total_debt":         total_debt,
-            "minority_interest":  round(minority_interest, 2),
-            "shares_outstanding": shares_outstanding,
-
-            # Output
-            "enterprise_value":                     round(enterprise_value,          2),
-            "equity_value_dcf":                     round(equity_value_dcf,          2),
+            "historical_table":      historical_table,
+            "projection_table":      projection_table,
+            "terminal_year":         terminal_year,
+            "pv_of_fcffs":           pv_fcffs,
+            "total_pv_fcff":         round(total_pv_fcff, 2),
+            "terminal_value":        round(terminal_value, 2),
+            "pv_terminal_value":     round(pv_terminal_value, 2),
+            "total_cash":            total_cash,
+            "investments":           round(investments, 2),
+            "total_debt":            total_debt,
+            "minority_interest":     round(minority_interest, 2),
+            "shares_outstanding":    shares_outstanding,
+            "enterprise_value":                     round(enterprise_value, 2),
+            "equity_value_dcf":                     round(equity_value_dcf, 2),
             "intrinsic_value_per_share":             round(intrinsic_value_per_share, 2),
-            "intrinsic_value_with_margin_of_safety": round(intrinsic_value_with_mos,  2),
+            "intrinsic_value_with_margin_of_safety": round(intrinsic_value_with_mos, 2),
             "margin_of_safety_used":                 margin_of_safety,
             "upside_downside_pct":                   round(upside_pct, 2) if upside_pct is not None else None,
             "verdict":                               verdict,
@@ -729,56 +803,501 @@ def get_dcf(
 
     except Exception as e:
         return {"error": str(e)}
-@app.get("/screener")
-def get_screener(
-    tickers: str = Query(..., description="Comma-separated list of tickers e.g. AAPL,MSFT,TSLA"),
-    market: str = Query("us", description="'us' or 'india'"),
 
-    # Filter params — all optional, None means no filter applied
-    min_pe: float = Query(None, description="Minimum P/E ratio"),
-    max_pe: float = Query(None, description="Maximum P/E ratio"),
 
-    min_pb: float = Query(None, description="Minimum P/B ratio"),
-    max_pb: float = Query(None, description="Maximum P/B ratio"),
+# ─────────────────────────────────────────────────────────────────────────────
+#  /reverse-dcf  — What growth rate does the current price imply?
+# ─────────────────────────────────────────────────────────────────────────────
 
-    min_roe: float = Query(None, description="Minimum ROE (decimal, e.g. 0.15 = 15%)"),
-    max_roe: float = Query(None, description="Maximum ROE (decimal)"),
-
-    min_market_cap: float = Query(None, description="Minimum market cap in USD/INR"),
-    max_market_cap: float = Query(None, description="Maximum market cap"),
-
-    min_de: float = Query(None, description="Minimum D/E ratio"),
-    max_de: float = Query(None, description="Maximum D/E ratio"),
-
-    min_dividend_yield: float = Query(None, description="Minimum dividend yield (decimal, e.g. 0.02 = 2%)"),
-    max_dividend_yield: float = Query(None, description="Maximum dividend yield"),
-
-    min_eps: float = Query(None, description="Minimum EPS"),
-    max_eps: float = Query(None, description="Maximum EPS"),
-
-    min_week_change: float = Query(None, description="Minimum 1-week price change % (e.g. -5 = -5%)"),
-    max_week_change: float = Query(None, description="Maximum 1-week price change %"),
+@app.get("/reverse-dcf")
+def get_reverse_dcf(
+    ticker: str = Query(...),
+    market: str = Query("us"),
+    advanced: bool = Query(False),
+    risk_free_rate: float = Query(0.04),
+    market_return: float = Query(0.10),
+    terminal_growth_rate: float = Query(0.03),
+    projection_years: int = Query(5),
 ):
     """
-    Screen a user-supplied list of tickers against optional filters.
-
-    Metrics fetched per ticker:
-      - Current Price
-      - P/E Ratio (trailing)
-      - P/B Ratio
-      - ROE
-      - Market Cap
-      - D/E Ratio
-      - Dividend Yield
-      - EPS (trailing)
-      - 1-Week Price Change %
-
-    Returns all tickers with their metrics plus a 'passed' flag indicating
-    whether they passed all active filters.
+    Reverse DCF: given the current market price, solve for the implied
+    revenue growth rate that justifies it.
+    Uses binary search over growth_rate in [-10%, +100%].
     """
-    import datetime
+    try:
+        resolved, use_fmp = resolve_ticker(ticker, market, advanced)
 
-    # ── Parse and clean tickers ───────────────────────────────────────────────
+        if use_fmp:
+            info     = get_fmp_profile(resolved)
+            inc_list = get_fmp_cashflow(resolved, 5)
+            bal_list = get_fmp_balance(resolved, 5)
+
+            if not info:
+                return {"error": f"FMP returned no data for {resolved}"}
+
+            current_price      = info.get("currentPrice")
+            shares_outstanding = info.get("sharesOutstanding")
+            beta               = info.get("beta") or 1.0
+            market_cap         = info.get("marketCap")
+            total_debt         = info.get("totalDebt") or 0
+            total_cash         = info.get("totalCash") or 0
+
+            inc_list_is = get_fmp_income(resolved, 5)
+            base_revenue = float(inc_list_is[0].get("revenue", 0)) if inc_list_is else None
+            base_opex    = (float(inc_list_is[0].get("costOfRevenue", 0)) +
+                            float(inc_list_is[0].get("operatingExpenses", 0))) if inc_list_is else None
+            avg_tax_rate = 0.25
+            if inc_list_is:
+                pretax   = float(inc_list_is[0].get("incomeBeforeTax", 0) or 0)
+                tax_prov = float(inc_list_is[0].get("incomeTaxExpense", 0) or 0)
+                if pretax != 0:
+                    avg_tax_rate = max(0.05, min(abs(tax_prov / pretax), 0.40))
+
+            cf0 = (get_fmp_cashflow(resolved, 1) or [{}])[0]
+            base_depr = abs(float(cf0.get("depreciationAndAmortization", 0) or 0))
+            bal0 = (get_fmp_balance(resolved, 1) or [{}])[0]
+            base_capex_proxy = base_depr  # simplified
+
+        else:
+            stock = yf.Ticker(resolved)
+            info  = stock.info
+            current_price      = info.get("currentPrice")
+            shares_outstanding = info.get("sharesOutstanding")
+            beta               = info.get("beta", 1.0) or 1.0
+            market_cap         = info.get("marketCap")
+            total_debt         = info.get("totalDebt", 0) or 0
+            total_cash         = info.get("totalCash", 0) or 0
+
+            income_df = stock.financials
+            cashflow_df = stock.cashflow
+
+            def find_row(df, *kw):
+                for idx in df.index:
+                    if all(k.lower() in idx.lower() for k in kw):
+                        return idx
+                return None
+
+            def sf(df, row, col=0):
+                if row is None: return None
+                try:
+                    v = df.loc[row].iloc[col]
+                    return float(v) if v is not None and str(v) != "nan" else None
+                except: return None
+
+            rev_row  = find_row(income_df, "total revenue") or find_row(income_df, "revenue")
+            opex_row = find_row(income_df, "total operating expenses") or find_row(income_df, "cost of revenue")
+            tax_row  = find_row(income_df, "tax", "provision")
+            pre_row  = find_row(income_df, "pretax")
+            depr_row = find_row(cashflow_df, "depreciation")
+
+            base_revenue = sf(income_df, rev_row) or 0
+            base_opex    = abs(sf(income_df, opex_row) or 0)
+            pretax_v     = sf(income_df, pre_row) or 0
+            tax_v        = sf(income_df, tax_row) or 0
+            avg_tax_rate = max(0.05, min(abs(tax_v / pretax_v), 0.40)) if pretax_v != 0 else 0.25
+            base_depr    = abs(sf(cashflow_df, depr_row) or 0)
+            base_capex_proxy = base_depr
+
+        if not current_price or not shares_outstanding or not base_revenue:
+            return {"error": "Insufficient data for Reverse DCF."}
+
+        # Guard: target_equity must be positive for binary search to work
+        target_equity = current_price * shares_outstanding
+        if target_equity <= 0:
+            return {"error": "Invalid target equity (price * shares <= 0)."}
+
+        # Guard: base_opex=0 causes div/zero in terminal formula
+        if base_revenue == 0:
+            return {"error": "Base revenue is zero — cannot run Reverse DCF."}
+        safe_base_opex = base_opex if base_opex > 0 else base_revenue * 0.6
+
+        cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
+        equity_val     = market_cap if market_cap else 1
+        debt_val       = total_debt if total_debt else equity_val * 0.2
+        total_capital  = equity_val + debt_val
+        wacc = (
+            (equity_val / total_capital) * cost_of_equity +
+            (debt_val   / total_capital) * 0.06 * (1 - avg_tax_rate)
+        )
+
+        if wacc <= terminal_growth_rate:
+            return {"error": "WACC must be greater than terminal growth rate."}
+
+        target_equity = current_price * shares_outstanding
+
+        def compute_equity(growth_rate: float) -> float:
+            g = max(min(growth_rate, 1.0), -0.5)
+            pv_total = 0.0
+            prev_rev  = base_revenue
+            prev_opex = base_opex
+
+            for yr in range(1, projection_years + 1):
+                rev  = prev_rev  * (1 + g)
+                opex = prev_opex * (1 + g * 0.9)  # opex grows slightly slower
+                nop_at = (rev - opex) * (1 - avg_tax_rate)
+                fcff   = nop_at - base_capex_proxy
+                pv_total += fcff / ((1 + wacc) ** yr)
+                prev_rev  = rev
+                prev_opex = opex
+
+            # Terminal — use safe_base_opex to avoid division by zero
+            term_fcff = prev_rev * (1 + terminal_growth_rate) * (1 - safe_base_opex / base_revenue) * (1 - avg_tax_rate) - base_capex_proxy
+            tv = term_fcff / (wacc - terminal_growth_rate)
+            pv_total += tv / ((1 + wacc) ** projection_years)
+
+            eq = pv_total + total_cash - total_debt
+            return eq
+
+        # Binary search for implied growth rate
+        lo, hi = -0.10, 1.00
+        implied_growth = None
+        for _ in range(60):
+            mid = (lo + hi) / 2
+            eq  = compute_equity(mid)
+            if abs(eq - target_equity) < target_equity * 0.001:
+                implied_growth = mid
+                break
+            if eq < target_equity:
+                lo = mid
+            else:
+                hi = mid
+        if implied_growth is None:
+            implied_growth = (lo + hi) / 2
+
+        # Scenarios
+        scenarios = []
+        for label, g in [("Bear (-2%)", implied_growth - 0.02),
+                          ("Base (implied)", implied_growth),
+                          ("Bull (+2%)", implied_growth + 0.02),
+                          ("Bull (+5%)", implied_growth + 0.05)]:
+            eq  = compute_equity(g)
+            ivps = eq / shares_outstanding
+            scenarios.append({
+                "scenario":            label,
+                "growth_rate":         round(g * 100, 2),
+                "implied_equity_value": round(eq, 0),
+                "intrinsic_per_share":  round(ivps, 2),
+                "vs_current_price":     round(((ivps - current_price) / current_price) * 100, 1),
+            })
+
+        interpretation = (
+            "The market is pricing in HIGH growth expectations — stock may be expensive unless growth materializes."
+            if implied_growth > 0.15 else
+            "The market expects MODERATE growth — fairly valued if historical growth continues."
+            if implied_growth > 0.05 else
+            "The market expects LOW or NO growth — potential value opportunity if business improves."
+        )
+
+        return {
+            "ticker":               resolved,
+            "market":               market,
+            "data_source":          "FMP" if use_fmp else "yfinance",
+            "current_price":        current_price,
+            "implied_growth_rate":  round(implied_growth * 100, 2),
+            "wacc_used":            round(wacc * 100, 2),
+            "terminal_growth_rate": round(terminal_growth_rate * 100, 2),
+            "projection_years":     projection_years,
+            "interpretation":       interpretation,
+            "scenarios":            scenarios,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /insider-transactions  — FMP for US, yfinance fallback for India
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/insider-transactions")
+def get_insider_transactions(
+    ticker: str = Query(...),
+    market: str = Query("us"),
+    limit: int = Query(20),
+):
+    try:
+        resolved, use_fmp = resolve_ticker(ticker, market, False)
+
+        # FMP insider trades
+        data = fmp_get(f"/insider-trading/{resolved}", {"limit": limit})
+        if not data or not isinstance(data, list):
+            # yfinance fallback
+            if not use_fmp:
+                stock = yf.Ticker(resolved)
+                holders = stock.insider_transactions
+                if holders is not None and not holders.empty:
+                    return {"source": "yfinance", "transactions": holders.to_dict(orient="records")}
+            return {"error": "No insider transaction data available."}
+
+        transactions = []
+        for t in data:
+            transactions.append({
+                "date":            t.get("transactionDate"),
+                "insider_name":    t.get("reportingName"),
+                "title":           t.get("typeOfOwner"),
+                "transaction_type": t.get("transactionType"),
+                "shares":          t.get("securitiesTransacted"),
+                "price":           t.get("price"),
+                "value":           t.get("value"),
+                "shares_owned_after": t.get("securitiesOwned"),
+            })
+
+        # Summary stats
+        buys  = [t for t in transactions if "purchase" in (t.get("transaction_type") or "").lower() or "buy" in (t.get("transaction_type") or "").lower()]
+        sells = [t for t in transactions if "sale" in (t.get("transaction_type") or "").lower() or "sell" in (t.get("transaction_type") or "").lower()]
+        buy_value  = sum(t.get("value") or 0 for t in buys)
+        sell_value = sum(t.get("value") or 0 for t in sells)
+
+        sentiment = "Bullish" if buy_value > sell_value * 1.5 else "Bearish" if sell_value > buy_value * 1.5 else "Neutral"
+
+        return {
+            "ticker":       resolved,
+            "source":       "FMP",
+            "total_transactions": len(transactions),
+            "buy_count":    len(buys),
+            "sell_count":   len(sells),
+            "total_buy_value":  round(buy_value, 0),
+            "total_sell_value": round(sell_value, 0),
+            "insider_sentiment": sentiment,
+            "transactions": transactions,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /institutional-holders  — FMP for all markets
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/institutional-holders")
+def get_institutional_holders(
+    ticker: str = Query(...),
+    market: str = Query("us"),
+    limit: int = Query(15),
+):
+    try:
+        resolved, _ = resolve_ticker(ticker, market, False)
+
+        data = fmp_get(f"/institutional-holder/{resolved}", {"limit": limit})
+        if not data or not isinstance(data, list):
+            return {"error": "No institutional holder data available from FMP."}
+
+        holders = []
+        for h in data:
+            holders.append({
+                "holder":          h.get("holder"),
+                "shares":          h.get("shares"),
+                "date_reported":   h.get("dateReported"),
+                "change":          h.get("change"),
+                "change_pct":      round(h.get("change") / h.get("shares") * 100, 2) if (h.get("shares") and h.get("shares") != 0 and h.get("change") is not None) else None,
+            })
+
+        total_shares = sum(h.get("shares") or 0 for h in holders)
+        net_change   = sum(h.get("change") or 0 for h in holders)
+
+        return {
+            "ticker":              resolved,
+            "source":              "FMP",
+            "top_holders_count":   len(holders),
+            "total_shares_held":   total_shares,
+            "net_institutional_change": net_change,
+            "institutional_trend": "Accumulating" if net_change > 0 else "Distributing",
+            "holders":             holders,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /analyst-targets  — FMP analyst price targets & recommendations
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/analyst-targets")
+def get_analyst_targets(
+    ticker: str = Query(...),
+    market: str = Query("us"),
+):
+    try:
+        resolved, _ = resolve_ticker(ticker, market, False)
+
+        # Price targets
+        targets_data = fmp_get(f"/price-target/{resolved}", {"limit": 20})
+        # Consensus
+        consensus_data = fmp_get(f"/analyst-stock-recommendations/{resolved}", {"limit": 10})
+        # Estimate summary
+        estimates_data = fmp_get(f"/analyst-estimates/{resolved}", {"limit": 4})
+
+        targets = []
+        if isinstance(targets_data, list):
+            for t in targets_data[:15]:
+                targets.append({
+                    "published_date": t.get("publishedDate"),
+                    "analyst_company": t.get("analystCompany"),
+                    "analyst":         t.get("analyst"),
+                    "price_target":    t.get("priceTarget"),
+                    "adj_price_target": t.get("adjPriceTarget"),
+                    "news_title":      t.get("newsTitle"),
+                })
+
+        # Aggregate consensus
+        all_targets = [t.get("price_target") for t in targets if t.get("price_target")]
+        consensus_target = round(sum(all_targets) / len(all_targets), 2) if all_targets else None
+
+        recommendations = []
+        if isinstance(consensus_data, list):
+            for r in consensus_data[:8]:
+                recommendations.append({
+                    "date":         r.get("date"),
+                    "strong_buy":   r.get("analystRatingsbuy"),
+                    "buy":          r.get("analystRatingsOverweight"),
+                    "hold":         r.get("analystRatingsHold"),
+                    "sell":         r.get("analystRatingsUnderweight"),
+                    "strong_sell":  r.get("analystRatingsSell"),
+                })
+
+        # Latest recommendation tally
+        latest_rec = recommendations[0] if recommendations else {}
+        strong_buy  = latest_rec.get("strong_buy") or 0
+        buy         = latest_rec.get("buy") or 0
+        hold        = latest_rec.get("hold") or 0
+        sell        = latest_rec.get("sell") or 0
+        strong_sell = latest_rec.get("strong_sell") or 0
+        total_analysts = strong_buy + buy + hold + sell + strong_sell
+        bullish = strong_buy + buy
+        bearish = sell + strong_sell
+        consensus_rating = (
+            "Strong Buy" if strong_buy > total_analysts * 0.4 else
+            "Buy"        if bullish  > total_analysts * 0.5 else
+            "Hold"       if hold     > total_analysts * 0.4 else
+            "Sell"       if bearish  > total_analysts * 0.3 else
+            "N/A"
+        )
+
+        # EPS estimates
+        eps_estimates = []
+        if isinstance(estimates_data, list):
+            for e in estimates_data:
+                eps_estimates.append({
+                    "date":              e.get("date"),
+                    "estimated_eps_avg": e.get("estimatedEpsAverage"),
+                    "estimated_eps_low": e.get("estimatedEpsLow"),
+                    "estimated_eps_high": e.get("estimatedEpsHigh"),
+                    "estimated_revenue_avg": e.get("estimatedRevenueAverage"),
+                    "number_analysts_eps":   e.get("numberAnalystEstimatedEps"),
+                })
+
+        return {
+            "ticker":              resolved,
+            "source":              "FMP",
+            "consensus_price_target": consensus_target,
+            "total_price_targets": len(targets),
+            "consensus_rating":    consensus_rating,
+            "analyst_breakdown": {
+                "strong_buy": strong_buy, "buy": buy, "hold": hold,
+                "sell": sell, "strong_sell": strong_sell,
+                "total": total_analysts,
+            },
+            "price_targets":    targets,
+            "recommendations":  recommendations,
+            "eps_estimates":    eps_estimates,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /earnings-calendar  — earnings dates + surprise history via FMP
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/earnings-calendar")
+def get_earnings_calendar(
+    ticker: str = Query(...),
+    market: str = Query("us"),
+    limit: int = Query(8),
+):
+    try:
+        resolved, _ = resolve_ticker(ticker, market, False)
+
+        # Historical earnings surprises
+        hist_data = fmp_get(f"/historical/earning_calendar/{resolved}", {"limit": limit})
+        # Upcoming earnings
+        upcoming_data = fmp_get(f"/earning_calendar/{resolved}")
+
+        history = []
+        if isinstance(hist_data, list):
+            for e in hist_data:
+                actual  = e.get("eps")
+                est     = e.get("epsEstimated")
+                surprise_pct = None
+                if actual is not None and est and est != 0:
+                    surprise_pct = round(((actual - est) / abs(est)) * 100, 2)
+                beat = None
+                if actual is not None and est is not None:
+                    beat = actual >= est
+
+                history.append({
+                    "date":              e.get("date"),
+                    "eps_actual":        actual,
+                    "eps_estimated":     est,
+                    "surprise_pct":      surprise_pct,
+                    "beat":              beat,
+                    "revenue_actual":    e.get("revenue"),
+                    "revenue_estimated": e.get("revenueEstimated"),
+                    "fiscal_quarter":    e.get("period"),
+                    "time":              e.get("time"),  # BMO / AMC
+                })
+
+        # Compute beat rate
+        beats = [h for h in history if h.get("beat") is True]
+        beat_rate = round(len(beats) / len(history) * 100, 1) if history else None
+        avg_surprise = None
+        surprises = [h["surprise_pct"] for h in history if h.get("surprise_pct") is not None]
+        if surprises:
+            avg_surprise = round(sum(surprises) / len(surprises), 2)
+
+        upcoming = []
+        if isinstance(upcoming_data, list):
+            for e in upcoming_data[:3]:
+                upcoming.append({
+                    "date":          e.get("date"),
+                    "eps_estimated": e.get("epsEstimated"),
+                    "time":          e.get("time"),
+                    "fiscal_quarter": e.get("period"),
+                })
+
+        return {
+            "ticker":           resolved,
+            "source":           "FMP",
+            "beat_rate_pct":    beat_rate,
+            "avg_eps_surprise_pct": avg_surprise,
+            "upcoming_earnings": upcoming,
+            "earnings_history":  history,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /screener  — yfinance for India, FMP for US
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/screener")
+def get_screener(
+    tickers: str = Query(...),
+    market: str = Query("us"),
+    min_pe: float = Query(None), max_pe: float = Query(None),
+    min_pb: float = Query(None), max_pb: float = Query(None),
+    min_roe: float = Query(None), max_roe: float = Query(None),
+    min_market_cap: float = Query(None), max_market_cap: float = Query(None),
+    min_de: float = Query(None), max_de: float = Query(None),
+    min_dividend_yield: float = Query(None), max_dividend_yield: float = Query(None),
+    min_eps: float = Query(None), max_eps: float = Query(None),
+    min_week_change: float = Query(None), max_week_change: float = Query(None),
+):
     raw_tickers = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     if not raw_tickers:
         return {"error": "No valid tickers provided."}
@@ -788,44 +1307,45 @@ def get_screener(
     results = []
 
     for raw in raw_tickers:
-        ticker_sym = raw
-        if market.lower() == "india" and not ticker_sym.endswith(".NS"):
-            ticker_sym += ".NS"
-
+        resolved, use_fmp = resolve_ticker(raw, market, False)
         try:
-            stock = yf.Ticker(ticker_sym)
-            info  = stock.info
+            if use_fmp:
+                info = get_fmp_profile(resolved)
+                current_price  = info.get("currentPrice") or info.get("regularMarketPrice")
+                pe_ratio       = info.get("trailingPE")
+                pb_ratio       = info.get("priceToBook")
+                roe            = info.get("returnOnEquity")
+                market_cap     = info.get("marketCap")
+                de_ratio       = info.get("debtToEquity")
+                dividend_yield = info.get("dividendYield")
+                eps            = info.get("trailingEps")
+                week_change    = None  # FMP profile doesn't include 1-week change directly
+            else:
+                stock = yf.Ticker(resolved)
+                info  = stock.info
+                current_price  = info.get("currentPrice") or info.get("regularMarketPrice")
+                pe_ratio       = info.get("trailingPE")
+                pb_ratio       = info.get("priceToBook")
+                roe            = info.get("returnOnEquity")
+                market_cap     = info.get("marketCap")
+                de_ratio       = info.get("debtToEquity")
+                dividend_yield = info.get("dividendYield")
+                eps            = info.get("trailingEps")
+                week_change    = None
+                try:
+                    hist = stock.history(period="5d")
+                    if hist is not None and len(hist) >= 2:
+                        price_now  = float(hist["Close"].iloc[-1])
+                        price_prev = float(hist["Close"].iloc[0])
+                        if price_prev and price_prev != 0:
+                            week_change = ((price_now - price_prev) / price_prev) * 100
+                except Exception:
+                    pass
 
-            current_price  = info.get("currentPrice") or info.get("regularMarketPrice")
-            pe_ratio       = info.get("trailingPE")
-            pb_ratio       = info.get("priceToBook")
-            roe            = info.get("returnOnEquity")
-            market_cap     = info.get("marketCap")
-            de_ratio       = info.get("debtToEquity")
-            dividend_yield = info.get("dividendYield")
-            eps            = info.get("trailingEps")
-            week_change    = None
-
-            # 1-week price change
-            try:
-                hist = stock.history(period="5d")
-                if hist is not None and len(hist) >= 2:
-                    price_now  = float(hist["Close"].iloc[-1])
-                    price_prev = float(hist["Close"].iloc[0])
-                    if price_prev and price_prev != 0:
-                        week_change = ((price_now - price_prev) / price_prev) * 100
-            except Exception:
-                week_change = None
-
-            # ── Apply filters ─────────────────────────────────────────────────
             def in_range(val, mn, mx):
-                """Return False only if val exists AND violates the range."""
-                if val is None:
-                    return True   # can't filter what we don't have
-                if mn is not None and val < mn:
-                    return False
-                if mx is not None and val > mx:
-                    return False
+                if val is None: return True
+                if mn is not None and val < mn: return False
+                if mx is not None and val > mx: return False
                 return True
 
             passed = all([
@@ -840,94 +1360,89 @@ def get_screener(
             ])
 
             results.append({
-                "ticker":         ticker_sym,
-                "current_price":  current_price,
-                "pe_ratio":       round(pe_ratio, 2)       if pe_ratio       is not None else None,
-                "pb_ratio":       round(pb_ratio, 2)       if pb_ratio       is not None else None,
-                "roe":            round(roe, 4)             if roe            is not None else None,
-                "market_cap":     market_cap,
-                "de_ratio":       round(de_ratio, 2)       if de_ratio       is not None else None,
-                "dividend_yield": round(dividend_yield, 4) if dividend_yield is not None else None,
-                "eps":            round(eps, 2)             if eps            is not None else None,
-                "week_change_pct":round(week_change, 2)    if week_change    is not None else None,
-                "passed_filters": passed,
+                "ticker":          resolved,
+                "data_source":     "FMP" if use_fmp else "yfinance",
+                "current_price":   current_price,
+                "pe_ratio":        round(pe_ratio, 2)       if pe_ratio       is not None else None,
+                "pb_ratio":        round(pb_ratio, 2)       if pb_ratio       is not None else None,
+                "roe":             round(roe, 4)             if roe            is not None else None,
+                "market_cap":      market_cap,
+                "de_ratio":        round(de_ratio, 2)       if de_ratio       is not None else None,
+                "dividend_yield":  round(dividend_yield, 4) if dividend_yield is not None else None,
+                "eps":             round(eps, 2)             if eps            is not None else None,
+                "week_change_pct": round(week_change, 2)    if week_change    is not None else None,
+                "passed_filters":  passed,
             })
 
         except Exception as e:
-            results.append({
-                "ticker":          ticker_sym,
-                "error":           str(e),
-                "passed_filters":  False,
-            })
+            results.append({"ticker": resolved, "error": str(e), "passed_filters": False})
 
     passed_count = sum(1 for r in results if r.get("passed_filters"))
-
     return {
-        "market":        market,
-        "tickers_scanned": len(results),
-        "passed_count":  passed_count,
+        "market":            market,
+        "tickers_scanned":   len(results),
+        "passed_count":      passed_count,
         "filters_applied": {
-            "pe":             [min_pe, max_pe],
-            "pb":             [min_pb, max_pb],
-            "roe":            [min_roe, max_roe],
-            "market_cap":     [min_market_cap, max_market_cap],
-            "de":             [min_de, max_de],
-            "dividend_yield": [min_dividend_yield, max_dividend_yield],
-            "eps":            [min_eps, max_eps],
-            "week_change_pct":[min_week_change, max_week_change],
+            "pe": [min_pe, max_pe], "pb": [min_pb, max_pb],
+            "roe": [min_roe, max_roe], "market_cap": [min_market_cap, max_market_cap],
+            "de": [min_de, max_de], "dividend_yield": [min_dividend_yield, max_dividend_yield],
+            "eps": [min_eps, max_eps], "week_change_pct": [min_week_change, max_week_change],
         },
         "results": results,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /ipos  — unchanged (Indian IPOs via yfinance)
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.get("/ipos")
 def get_ipos():
     results = []
-
     IPOS = [
-        {"name": "ZOMATO", "ticker": "ZOMATO.NS", "ipo_price": 76, "ipo_date": "2021-07-23"},
-        {"name": "PAYTM", "ticker": "PAYTM.NS", "ipo_price": 2150, "ipo_date": "2021-11-18"}
+        {"name": "ZOMATO",  "ticker": "ZOMATO.NS",  "ipo_price": 76,   "ipo_date": "2021-07-23"},
+        {"name": "PAYTM",   "ticker": "PAYTM.NS",   "ipo_price": 2150, "ipo_date": "2021-11-18"},
     ]
-
     for ipo in IPOS:
         stock = yf.Ticker(ipo["ticker"])
-        info = stock.info
+        info  = stock.info
         current_price = info.get("currentPrice")
-
         gain_pct = None
         if current_price:
             gain_pct = ((current_price - ipo["ipo_price"]) / ipo["ipo_price"]) * 100
-
         results.append({
-            "name": ipo["name"],
-            "ipo_date": ipo["ipo_date"],
-            "ipo_price": ipo["ipo_price"],
-            "current_price": current_price,
-            "gain_pct": gain_pct
+            "name": ipo["name"], "ipo_date": ipo["ipo_date"],
+            "ipo_price": ipo["ipo_price"], "current_price": current_price,
+            "gain_pct": gain_pct,
         })
-
     return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /commodities  — unchanged
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/commodities")
 def get_commodities():
     commodities = {
-        "Gold": "GC=F",
-        "Silver": "SI=F",
-        "Crude Oil": "CL=F",
-        "Natural Gas": "NG=F"
+        "Gold": "GC=F", "Silver": "SI=F",
+        "Crude Oil": "CL=F", "Natural Gas": "NG=F",
     }
-
     data = []
-
     for name, ticker in commodities.items():
         stock = yf.Ticker(ticker)
-        info = stock.info
-
+        info  = stock.info
         data.append({
             "name": name,
             "price": info.get("regularMarketPrice"),
-            "change": info.get("regularMarketChangePercent")
+            "change": info.get("regularMarketChangePercent"),
         })
-
     return data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /ai-verdict  — with competitor comparison + all new data sources
+# ─────────────────────────────────────────────────────────────────────────────
 
 class VerdictRequest(BaseModel):
     ticker:     str
@@ -936,83 +1451,131 @@ class VerdictRequest(BaseModel):
 
 @app.post("/ai-verdict")
 async def get_ai_verdict(request: VerdictRequest):
-    """
-    AI-powered investment verdict.
-    Accepts full DCF result from frontend (user sets their own assumptions).
-    1. Extracts key metrics from DCF result
-    2. Fetches recent news via yfinance
-    3. Feeds both into Claude API
-    4. Returns structured verdict
-    """
     try:
         ticker     = request.ticker.upper()
         market     = request.market.lower()
         dcf_result = request.dcf_result
 
-        if market == "india" and not ticker.endswith(".NS"):
-            ticker += ".NS"
+        resolved, use_fmp = resolve_ticker(ticker, market, False)
 
-        # ── Step 1: Validate DCF result ───────────────────────────────────────
         if not dcf_result:
             return {"error": "DCF result is empty. Please run the DCF model first."}
-
         if dcf_result.get("error"):
-            return {"error": f"DCF result has an error: {dcf_result['error']}. Please fix and rerun."}
+            return {"error": f"DCF result has an error: {dcf_result['error']}"}
 
-        # ── Step 2: Fetch company info + news ─────────────────────────────────
-        stock = yf.Ticker(ticker)
+        # ── Step 1: Company info ──────────────────────────────────────────────
+        if use_fmp:
+            profile      = get_fmp_profile(resolved)
+            company_name = profile.get("longName") or resolved
+            sector       = profile.get("sector", "Unknown")
+            industry     = profile.get("industry", "Unknown")
+            current_price = profile.get("currentPrice")
+        else:
+            stock         = yf.Ticker(resolved)
+            company_name  = stock.info.get("longName") or resolved
+            sector        = stock.info.get("sector", "Unknown")
+            industry      = stock.info.get("industry", "Unknown")
+            current_price = stock.info.get("currentPrice")
 
-        company_name = stock.info.get("longName") or ticker
-        sector       = stock.info.get("sector", "Unknown")
-        industry     = stock.info.get("industry", "Unknown")
+        # ── Step 2: Fetch competitor data via FMP ─────────────────────────────
+        peers_data = fmp_get(f"/stock_peers/{resolved}")
+        peer_list  = peers_data.get("peersList", []) if isinstance(peers_data, dict) else []
+        peer_list  = peer_list[:4]  # top 4 competitors
 
+        competitor_summaries = []
+        for peer in peer_list:
+            try:
+                p_profile = get_fmp_profile(peer)
+                if p_profile:
+                    competitor_summaries.append(
+                        f"  {peer}: Price={p_profile.get('currentPrice')}, "
+                        f"PE={p_profile.get('trailingPE')}, "
+                        f"MCap={p_profile.get('marketCap')}, "
+                        f"ROE={p_profile.get('returnOnEquity')}"
+                    )
+            except Exception:
+                pass
+
+        competitors_text = "\n".join(competitor_summaries) if competitor_summaries else "  No peer data available"
+
+        # ── Step 3: Analyst targets ───────────────────────────────────────────
+        targets_data = fmp_get(f"/price-target/{resolved}", {"limit": 5})
+        analyst_targets = []
+        if isinstance(targets_data, list):
+            for t in targets_data[:5]:
+                analyst_targets.append(
+                    f"  {t.get('analystCompany', 'N/A')}: Target ${t.get('priceTarget', 'N/A')}"
+                )
+        analyst_text = "\n".join(analyst_targets) if analyst_targets else "  No analyst targets available"
+
+        # ── Step 4: Insider sentiment ─────────────────────────────────────────
+        insider_data   = fmp_get(f"/insider-trading/{resolved}", {"limit": 10})
+        insider_buys   = sum(1 for t in (insider_data or []) if "purchase" in (t.get("transactionType") or "").lower())
+        insider_sells  = sum(1 for t in (insider_data or []) if "sale" in (t.get("transactionType") or "").lower())
+        insider_signal = "Bullish" if insider_buys > insider_sells else "Bearish" if insider_sells > insider_buys else "Neutral"
+
+        # ── Step 5: Earnings surprise history ────────────────────────────────
+        earn_data = fmp_get(f"/historical/earning_calendar/{resolved}", {"limit": 4})
+        earn_lines = []
+        if isinstance(earn_data, list):
+            for e in earn_data[:4]:
+                actual = e.get("eps"); est = e.get("epsEstimated")
+                surprise = round(((actual - est) / abs(est)) * 100, 1) if actual and est and est != 0 else None
+                earn_lines.append(f"  {e.get('date')}: Actual EPS={actual}, Est={est}, Surprise={surprise}%")
+        earnings_text = "\n".join(earn_lines) if earn_lines else "  No earnings history available"
+
+        # ── Step 6: News ──────────────────────────────────────────────────────
         news_items = []
         try:
-            news = stock.news or []
-            for item in news[:8]:
-                # yfinance v0.2+ nests content in a dict
-                if "content" in item and isinstance(item["content"], dict):
-                    inner   = item["content"]
-                    title   = inner.get("title", "")
-                    summary = (inner.get("summary", "") or inner.get("description", ""))[:250]
-                    provider = inner.get("provider", {})
-                    source  = provider.get("displayName", "") if isinstance(provider, dict) else str(provider)
-                else:
-                    title   = item.get("title", "")
-                    summary = (item.get("summary", "") or item.get("description", ""))[:250]
-                    source  = item.get("publisher", "") or item.get("source", "")
-                if title:
-                    news_items.append(f"- [{source}] {title}: {summary}")
+            if use_fmp:
+                news_data = fmp_get(f"/stock_news", {"tickers": resolved, "limit": 8})
+                if isinstance(news_data, list):
+                    for item in news_data[:8]:
+                        title   = item.get("title", "")
+                        summary = (item.get("text", ""))[:200]
+                        source  = item.get("site", "")
+                        if title:
+                            news_items.append(f"- [{source}] {title}: {summary}")
+            else:
+                stock = yf.Ticker(resolved)
+                news  = stock.news or []
+                for item in news[:8]:
+                    if "content" in item and isinstance(item["content"], dict):
+                        inner   = item["content"]
+                        title   = inner.get("title", "")
+                        summary = (inner.get("summary", "") or "")[:250]
+                        source  = inner.get("provider", {}).get("displayName", "") if isinstance(inner.get("provider"), dict) else ""
+                    else:
+                        title   = item.get("title", "")
+                        summary = (item.get("summary", "") or "")[:250]
+                        source  = item.get("publisher", "")
+                    if title:
+                        news_items.append(f"- [{source}] {title}: {summary}")
         except Exception:
             pass
 
-        # Fallback: Google News RSS if yfinance returned nothing
         if not news_items:
             try:
-                import re
-                company_query = (company_name or ticker).replace(" ", "+")
-                rss_url  = f"https://news.google.com/rss/search?q={company_query}+stock&hl=en&gl=IN&ceid=IN:en"
+                company_query = (company_name or resolved).replace(" ", "+")
+                rss_url = f"https://news.google.com/rss/search?q={company_query}+stock&hl=en&gl=IN&ceid=IN:en"
                 async with httpx.AsyncClient(timeout=10.0) as nc:
                     rss_resp = await nc.get(rss_url)
                 if rss_resp.status_code == 200:
-                    # Try CDATA format first, then plain <title> format
                     titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", rss_resp.text)
                     if not titles:
                         titles = re.findall(r"<title>(.*?)</title>", rss_resp.text)
-                    for t in titles[1:6]:  # skip first (feed title)
-                        if t and len(t) > 10:  # filter out empty/short titles
+                    for t in titles[1:6]:
+                        if t and len(t) > 10:
                             news_items.append(f"- {t}")
             except Exception:
                 pass
 
         if not news_items:
-            news_items = ["No recent news available — analysis based on DCF data only."]
-
+            news_items = ["No recent news available."]
         news_text = "\n".join(news_items)
 
-        # ── Step 3: Extract key DCF metrics for Claude ────────────────────────
+        # ── Step 7: DCF metrics ───────────────────────────────────────────────
         def fmt_num(n):
-            """Format large numbers to readable form for Claude prompt."""
             if n is None: return "N/A"
             try:
                 n = float(n)
@@ -1022,12 +1585,11 @@ async def get_ai_verdict(request: VerdictRequest):
                 return f"{n:.2f}"
             except: return str(n)
 
-        current_price = dcf_result.get("current_price", "N/A")
         intrinsic     = dcf_result.get("intrinsic_value_per_share", "N/A")
         intrinsic_mos = dcf_result.get("intrinsic_value_with_margin_of_safety", "N/A")
         upside        = dcf_result.get("upside_downside_pct", "N/A")
         wacc_raw      = dcf_result.get("wacc", "N/A")
-        wacc          = f"{float(wacc_raw)*100:.2f}%" if wacc_raw is not None and wacc_raw != "N/A" else "N/A"
+        wacc          = f"{float(wacc_raw)*100:.2f}%" if wacc_raw not in (None, "N/A") else "N/A"
         verdict_dcf   = dcf_result.get("verdict", "N/A")
         ev_raw        = dcf_result.get("enterprise_value", "N/A")
         ev            = fmt_num(ev_raw) if ev_raw != "N/A" else "N/A"
@@ -1035,41 +1597,32 @@ async def get_ai_verdict(request: VerdictRequest):
         hist_years    = dcf_result.get("historical_years_used", "N/A")
         mos_used      = dcf_result.get("margin_of_safety_used", "N/A")
 
-        gr          = dcf_result.get("derived_growth_rates", {})
-        rev_growth  = gr.get("revenue_growth", 0)
+        gr         = dcf_result.get("derived_growth_rates", {})
+        rev_growth = gr.get("revenue_growth", 0)
         opex_growth = gr.get("opex_growth", 0)
         term_growth = gr.get("terminal_growth", 0)
 
-        # Build historical FCFF summary
         hist = dcf_result.get("historical_table", [])
-        hist_lines = []
-        for row in hist[:4]:
-            hist_lines.append(
-                f"  {row.get('year')}: Revenue={fmt_num(row.get('revenue'))}, "
-                f"NOP After Tax={fmt_num(row.get('nop_after_tax'))}, "
-                f"CapEx={fmt_num(row.get('capex'))}, ΔNWC={fmt_num(row.get('delta_nwc'))}, "
-                f"FCFF={fmt_num(row.get('fcff'))}"
-            )
+        hist_lines = [
+            f"  {r.get('year')}: Revenue={fmt_num(r.get('revenue'))}, NOP After Tax={fmt_num(r.get('nop_after_tax'))}, CapEx={fmt_num(r.get('capex'))}, FCFF={fmt_num(r.get('fcff'))}"
+            for r in hist[:4]
+        ]
         hist_summary = "\n".join(hist_lines) if hist_lines else "  Not available"
 
-        # Build projection summary
         proj = dcf_result.get("projection_table", [])
-        proj_lines = []
-        for row in proj[:3]:
-            proj_lines.append(
-                f"  {row.get('year')}: Revenue={fmt_num(row.get('revenue'))}, "
-                f"FCFF={fmt_num(row.get('fcff'))}, PV={fmt_num(row.get('pv_fcff'))}"
-            )
+        proj_lines = [
+            f"  {r.get('year')}: Revenue={fmt_num(r.get('revenue'))}, FCFF={fmt_num(r.get('fcff'))}, PV={fmt_num(r.get('pv_fcff'))}"
+            for r in proj[:3]
+        ]
         proj_summary = "\n".join(proj_lines) if proj_lines else "  Not available"
 
         term = dcf_result.get("terminal_year", {})
         term_summary = (
-            f"  {term.get('year')}: Revenue={fmt_num(term.get('revenue'))}, "
-            f"FCFF={fmt_num(term.get('fcff'))}"
+            f"  {term.get('year')}: Revenue={fmt_num(term.get('revenue'))}, FCFF={fmt_num(term.get('fcff'))}"
         ) if term else "  Not available"
 
-        # ── Step 4: Build Claude prompt ───────────────────────────────────────
-        prompt = f"""You are a senior equity research analyst at a top investment bank. Provide a rigorous investment analysis for {company_name} ({ticker}) in the {sector} sector ({industry}).
+        # ── Step 8: Build prompt ──────────────────────────────────────────────
+        prompt = f"""You are a senior equity research analyst. Provide a rigorous investment analysis for {company_name} ({resolved}) in the {sector} sector ({industry}).
 
 ═══ DCF VALUATION OUTPUT ═══
 Current Market Price:     {current_price}
@@ -1081,13 +1634,11 @@ Enterprise Value:         {ev}
 DCF Model Signal:         {verdict_dcf}
 Historical Years Used:    {hist_years}
 Avg Effective Tax Rate:   {avg_tax}
+Revenue Growth:    {round(float(rev_growth or 0)*100,1)}%
+OpEx Growth:       {round(float(opex_growth or 0)*100,1)}%
+Terminal Growth:   {round(float(term_growth or 0)*100,1)}%
 
-Growth Rates (data-derived):
-  Revenue Growth:    {round(float(rev_growth or 0) * 100, 1)}%
-  OpEx Growth:       {round(float(opex_growth or 0) * 100, 1)}%
-  Terminal Growth:   {round(float(term_growth or 0) * 100, 1)}%
-
-Historical FCFF (actuals):
+Historical FCFF:
 {hist_summary}
 
 Projected FCFF (Years 1-3):
@@ -1096,48 +1647,59 @@ Projected FCFF (Years 1-3):
 Terminal Year:
 {term_summary}
 
+═══ COMPETITORS ═══
+{competitors_text}
+
+═══ ANALYST PRICE TARGETS ═══
+{analyst_text}
+
+═══ INSIDER ACTIVITY (last 10 trades) ═══
+Buys: {insider_buys} | Sells: {insider_sells} | Signal: {insider_signal}
+
+═══ EARNINGS SURPRISE HISTORY ═══
+{earnings_text}
+
 ═══ RECENT NEWS ═══
 {news_text}
 
 ═══ INSTRUCTIONS ═══
-Respond ONLY with a valid JSON object. No preamble, no explanation, no markdown fences. Pure JSON only.
+Respond ONLY with a valid JSON object. No preamble, no markdown. Pure JSON only.
 
 {{
   "verdict": "one of: Strong Buy / Buy / Hold / Sell / Strong Sell",
   "confidence": "one of: High / Medium / Low",
-  "summary": "3-4 sentence plain English investment thesis — mention valuation, growth, and key risk",
-  "bull_case": "3 specific bullish arguments referencing actual numbers from the data above",
-  "bear_case": "3 specific bearish arguments referencing actual numbers from the data above",
+  "summary": "3-4 sentence plain English investment thesis mentioning valuation, growth, and key risk",
+  "bull_case": "3 specific bullish arguments referencing actual numbers",
+  "bear_case": "3 specific bearish arguments referencing actual numbers",
+  "competitor_analysis": "2-3 sentences: how does {resolved} compare to peers on valuation and growth? Is it cheaper or more expensive than peers? Any competitive moat?",
   "management_guidance": {{
-    "capex": "CapEx guidance from news, or N/A if not found",
-    "revenue": "Revenue or volume growth guidance from news, or N/A if not found",
-    "expansion": "Any expansion, M&A, or strategic plans from news, or N/A if not found"
+    "capex": "CapEx guidance from news or N/A",
+    "revenue": "Revenue growth guidance from news or N/A",
+    "expansion": "Any expansion or strategic plans from news or N/A"
   }},
-  "model_vs_reality": "2 sentences: how do the DCF assumptions (revenue growth, WACC, terminal rate) compare to what management is guiding and what the market expects?",
+  "model_vs_reality": "2 sentences: how do DCF assumptions compare to analyst targets and what the market expects?",
+  "insider_read": "1 sentence: what does insider activity signal about management confidence?",
+  "earnings_track_record": "1 sentence: summarize earnings beat/miss history and what it implies",
   "news_sentiment": "one of: Positive / Neutral / Negative",
-  "recent_headlines": ["top headline 1", "top headline 2", "top headline 3"],
+  "recent_headlines": ["headline 1", "headline 2", "headline 3"],
   "key_risks": ["specific risk 1", "specific risk 2", "specific risk 3"],
-  "analyst_note": "One actionable sentence: what specific metric or event should investors watch in the next quarter?"
+  "analyst_note": "One actionable sentence: what specific metric or event should investors watch next quarter?"
 }}"""
 
-        # ── Step 5: Call Claude API ───────────────────────────────────────────
-        api_key = os.environ.get("GROQ_API_KEY", "")
-        if not api_key:
+        # ── Step 9: Call Groq ─────────────────────────────────────────────────
+        if not GROQ_API_KEY:
             return {"error": "GROQ_API_KEY environment variable not set on server."}
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Content-Type":  "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                },
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"},
                 json={
-                    "model":      "llama-3.3-70b-versatile",
-                    "max_tokens": 1500,
+                    "model": "llama-3.3-70b-versatile",
+                    "max_tokens": 1800,
                     "messages": [
                         {"role": "system", "content": "You are a senior equity research analyst. Always respond with valid JSON only. No preamble, no markdown, no explanation outside the JSON object."},
-                        {"role": "user",   "content": prompt}
+                        {"role": "user",   "content": prompt},
                     ],
                     "temperature": 0.3,
                     "response_format": {"type": "json_object"},
@@ -1150,9 +1712,7 @@ Respond ONLY with a valid JSON object. No preamble, no explanation, no markdown 
         raw     = response.json()
         ai_text = raw.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
-        # ── Step 6: Parse Claude JSON response ────────────────────────────────
         try:
-            # Find the JSON object — handle any accidental wrapping
             clean = ai_text
             if "```" in clean:
                 for part in clean.split("```"):
@@ -1162,30 +1722,26 @@ Respond ONLY with a valid JSON object. No preamble, no explanation, no markdown 
                     if stripped.startswith("{"):
                         clean = stripped
                         break
-            # Find first { and last } to extract JSON cleanly
-            start = clean.find("{")
-            end   = clean.rfind("}") + 1
+            start = clean.find("{"); end = clean.rfind("}") + 1
             if start != -1 and end > start:
                 clean = clean[start:end]
             ai_verdict = json.loads(clean)
-        except Exception as parse_err:
+        except Exception:
             ai_verdict = {
-                "verdict":     "Analysis Complete",
-                "confidence":  "Medium",
-                "summary":     ai_text[:500],
-                "parse_error": True,
-                "raw_response": ai_text,
+                "verdict": "Analysis Complete", "confidence": "Medium",
+                "summary": ai_text[:500], "parse_error": True, "raw_response": ai_text,
             }
 
-        # ── Step 7: Return response ───────────────────────────────────────────
         return {
-            "ticker":       ticker,
-            "company_name": company_name,
-            "sector":       sector,
-            "industry":     industry,
+            "ticker":        resolved,
+            "company_name":  company_name,
+            "sector":        sector,
+            "industry":      industry,
             "current_price": current_price,
-            "ai_verdict":   ai_verdict,
-            "news_fed":     news_items[:5],
+            "data_source":   "FMP" if use_fmp else "yfinance",
+            "ai_verdict":    ai_verdict,
+            "news_fed":      news_items[:5],
+            "competitors_analyzed": peer_list,
         }
 
     except Exception as e:
