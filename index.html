@@ -402,7 +402,47 @@
       .hero-row { grid-template-columns: 1fr 1fr; }
       .hero-stat.main { grid-column: 1 / -1; }
       .header-tagline { display: none; }
+      .rdcf-scenario { flex-direction: column; }
     }
+
+    /* ── Advanced Mode toggle ── */
+    .adv-toggle {
+      display: flex; align-items: center; gap: 8px;
+      padding: 7px 14px; border: 1px solid var(--line); border-radius: 2px;
+      font-size: 0.78rem; color: var(--muted); cursor: pointer;
+      background: var(--cream); transition: all 0.15s; white-space: nowrap;
+      user-select: none;
+    }
+    .adv-toggle.active { background: #1a1814; color: #fff; border-color: #1a1814; }
+    .adv-toggle .adv-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink:0; }
+    .adv-toggle.active .adv-dot { background: var(--accent); }
+
+    /* ── Competitor cards ── */
+    .comp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .comp-card { background: var(--cream); border: 1px solid var(--line); border-radius: 3px; padding: 14px 16px; }
+    .comp-card .cc-ticker { font-family: 'DM Mono', monospace; font-weight: 600; font-size: 0.9rem; color: var(--ink); margin-bottom: 8px; }
+    .comp-card .cc-row { display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--muted); margin-bottom: 4px; }
+    .comp-card .cc-row span:last-child { color: var(--ink); font-family: 'DM Mono', monospace; }
+
+    /* ── Insider bar ── */
+    .insider-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; margin: 8px 0 4px; }
+    .insider-bar .buy-fill  { background: var(--green); }
+    .insider-bar .sell-fill { background: var(--red); }
+    .insider-label { display: flex; justify-content: space-between; font-size: 0.7rem; color: var(--muted); }
+
+    /* ── Earnings beat badge ── */
+    .earn-beat { display: inline-block; padding: 2px 7px; border-radius: 2px; font-size: 0.65rem; font-weight: 600; }
+    .earn-beat.yes { background: var(--green-light); color: var(--green); }
+    .earn-beat.no  { background: var(--red-light);   color: var(--red); }
+
+    /* ── Reverse DCF scenarios ── */
+    .rdcf-scenario { display: flex; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 3px; overflow: hidden; margin-bottom: 20px; }
+    .rdcf-cell { flex: 1; padding: 16px 12px; text-align: center; background: var(--white); }
+    .rdcf-cell.implied { background: var(--cream); }
+    .rdcf-cell .rs-label { font-size: 0.58rem; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+    .rdcf-cell .rs-growth { font-family: 'Playfair Display', serif; font-size: 1.2rem; font-weight: 700; color: var(--ink); }
+    .rdcf-cell .rs-price { font-family: 'DM Mono', monospace; font-size: 0.8rem; color: var(--ink2); margin-top: 4px; }
+    .rdcf-cell .rs-vs { font-size: 0.68rem; margin-top: 2px; }
   </style>
 </head>
 <body>
@@ -431,6 +471,10 @@
   <button class="btn-primary" onclick="runValuation()">Analyze</button>
   <button class="btn-ghost" onclick="runDCF()">⚡ DCF Model</button>
   <button class="btn-ghost" onclick="runFinancials()">📊 Financials</button>
+  <div class="adv-toggle" id="adv-toggle" onclick="toggleAdvanced()" title="Advanced mode: uses FMP for all markets including Indian stocks">
+    <div class="adv-dot"></div>
+    <span id="adv-label">Standard</span>
+  </div>
 </div>
 
 <div class="tab-row">
@@ -439,6 +483,10 @@
   <div class="tab" onclick="switchTab('financials',this)">Financials</div>
   <div class="tab" onclick="switchTab('screener',this)">Screener</div>
   <div class="tab" onclick="switchTab('verdict',this)">⚡ AI Verdict</div>
+  <div class="tab" onclick="switchTab('reverse-dcf',this)">Reverse DCF</div>
+  <div class="tab" onclick="switchTab('insider',this)">Insider</div>
+  <div class="tab" onclick="switchTab('analyst',this)">Analyst Targets</div>
+  <div class="tab" onclick="switchTab('earnings',this)">Earnings</div>
   <div class="tab" onclick="switchTab('ipos',this)">IPO Tracker</div>
   <div class="tab" onclick="switchTab('commodities',this)">Commodities</div>
 </div>
@@ -607,6 +655,71 @@
   </div>
 </div>
 
+<!-- REVERSE DCF TAB -->
+<div id="tab-reverse-dcf" class="tab-content">
+  <div class="container">
+    <div class="card">
+      <div class="card-head">Reverse DCF — What Growth Rate Is The Market Pricing In?</div>
+      <div style="font-size:0.72rem;color:var(--muted);margin-bottom:16px;padding:10px 14px;background:var(--cream);border-radius:2px;border:1px solid var(--line)">
+        💡 Enter a ticker above, then click <strong>Run Reverse DCF</strong>. The model solves backwards from the current stock price to find the implied revenue growth rate.
+      </div>
+      <div class="param-grid" style="margin-bottom:16px">
+        <div class="param-group"><label>Risk-Free Rate</label><input type="number" id="rdcf-rf" value="0.04" step="0.01"/></div>
+        <div class="param-group"><label>Market Return</label><input type="number" id="rdcf-mr" value="0.10" step="0.01"/></div>
+        <div class="param-group"><label>Terminal Growth Rate</label><input type="number" id="rdcf-tg" value="0.03" step="0.01"/></div>
+        <div class="param-group"><label>Projection Years</label><input type="number" id="rdcf-yrs" value="5" min="1" max="10"/></div>
+      </div>
+      <button class="btn-primary" onclick="runReverseDCF()">Run Reverse DCF</button>
+    </div>
+    <div id="rdcf-results">
+      <div class="state-empty"><span class="icon">⟳</span>Enter a ticker and run the model.</div>
+    </div>
+  </div>
+</div>
+
+<!-- INSIDER TAB -->
+<div id="tab-insider" class="tab-content">
+  <div class="container">
+    <div class="card" style="margin-bottom:0">
+      <div class="card-head">Insider Transactions & Institutional Holdings</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn-primary" onclick="loadInsider()">Load Insider Data</button>
+        <button class="btn-ghost" onclick="loadInstitutional()">Load Institutional Holdings</button>
+      </div>
+    </div>
+    <div id="insider-results" style="margin-top:20px">
+      <div class="state-empty"><span class="icon">👤</span>Enter a ticker above and click Load Insider Data.</div>
+    </div>
+    <div id="institutional-results" style="margin-top:20px"></div>
+  </div>
+</div>
+
+<!-- ANALYST TAB -->
+<div id="tab-analyst" class="tab-content">
+  <div class="container">
+    <div class="card" style="margin-bottom:0">
+      <div class="card-head">Analyst Price Targets & Recommendations</div>
+      <button class="btn-primary" onclick="loadAnalyst()">Load Analyst Data</button>
+    </div>
+    <div id="analyst-results" style="margin-top:20px">
+      <div class="state-empty"><span class="icon">🎯</span>Enter a ticker above and click Load Analyst Data.</div>
+    </div>
+  </div>
+</div>
+
+<!-- EARNINGS TAB -->
+<div id="tab-earnings" class="tab-content">
+  <div class="container">
+    <div class="card" style="margin-bottom:0">
+      <div class="card-head">Earnings Calendar & Surprise History</div>
+      <button class="btn-primary" onclick="loadEarnings()">Load Earnings Data</button>
+    </div>
+    <div id="earnings-results" style="margin-top:20px">
+      <div class="state-empty"><span class="icon">📅</span>Enter a ticker above and click Load Earnings Data.</div>
+    </div>
+  </div>
+</div>
+
 <!-- IPO TAB -->
 <div id="tab-ipos" class="tab-content">
   <div class="container">
@@ -686,7 +799,7 @@
     switchTab("valuation", document.querySelectorAll(".tab")[0]);
     setLoading("valuation-results", `Fetching ${ticker.toUpperCase()}...`);
     try {
-      const res = await fetch(`${BASE}/valuation?ticker=${ticker}&market=${market}`);
+      const res = await fetch(`${BASE}/valuation?ticker=${ticker}&market=${market}&advanced=${getAdvanced()}`);
       const d = await res.json();
       if (d.error) { setError("valuation-results", d.error); return; }
 
@@ -710,7 +823,7 @@
           <div class="hero-stat main">
             <div class="h-label">Current Market Price</div>
             <div class="h-value">${d.current_price ?? "—"}</div>
-            <div class="h-sub">Live quote via yfinance</div>
+            <div class="h-sub">via ${d.data_source || "yfinance"}</div>
           </div>
           <div class="hero-stat">
             <div class="h-label">Intrinsic Value</div>
@@ -772,7 +885,7 @@
     const mos      = document.getElementById("dcf-mos").value      || 0.25;
 
     try {
-      const res = await fetch(`${BASE}/dcf?ticker=${ticker}&market=${market}&projection_years=${years}&terminal_growth_rate=${terminal}&risk_free_rate=${rf}&market_return=${mr}&margin_of_safety=${mos}`);
+      const res = await fetch(`${BASE}/dcf?ticker=${ticker}&market=${market}&projection_years=${years}&terminal_growth_rate=${terminal}&risk_free_rate=${rf}&market_return=${mr}&margin_of_safety=${mos}&advanced=${getAdvanced()}`);
       const d = await res.json();
       if (d.error) { setError("dcf-results", d.error); return; }
 
@@ -1094,6 +1207,30 @@
           <p style="font-size:0.85rem;line-height:1.7;color:var(--ink2)">${av.model_vs_reality}</p>
         </div>` : ""}
 
+        <!-- Competitor Analysis -->
+        ${av.competitor_analysis ? `
+        <div class="verdict-card" style="margin-bottom:20px">
+          <div class="verdict-card-head">Competitor Analysis — How Does It Stack Up?</div>
+          <p style="font-size:0.85rem;line-height:1.7;color:var(--ink2)">${av.competitor_analysis}</p>
+          ${d.competitors_analyzed && d.competitors_analyzed.length ? `
+          <div style="margin-top:12px;font-size:0.7rem;color:var(--muted)">
+            Peers analyzed: <strong style="color:var(--ink2)">${d.competitors_analyzed.join(', ')}</strong>
+          </div>` : ''}
+        </div>` : ''}
+
+        <!-- Insider + Earnings track record -->
+        ${(av.insider_read || av.earnings_track_record) ? `
+        <div class="verdict-two-col" style="margin-bottom:20px">
+          ${av.insider_read ? `<div class="verdict-box" style="background:var(--blue-light);border-color:#a8c0d9">
+            <div class="verdict-box-title" style="color:var(--blue)">👤 Insider Signal</div>
+            <p>${av.insider_read}</p>
+          </div>` : ''}
+          ${av.earnings_track_record ? `<div class="verdict-box" style="background:var(--cream)">
+            <div class="verdict-box-title" style="color:var(--muted)">📅 Earnings Track Record</div>
+            <p>${av.earnings_track_record}</p>
+          </div>` : ''}
+        </div>` : ''}
+
         <!-- Key Risks -->
         <div class="section-label">Key Risks</div>
         <div class="card" style="padding:18px 22px;margin-bottom:20px">
@@ -1191,7 +1328,7 @@
     switchTab("financials", document.querySelector(".tab-row .tab:nth-child(3)"));
     setLoading("financials-results", `Loading financials for ${ticker.toUpperCase()}...`);
     try {
-      const res = await fetch(`${BASE}/financials?ticker=${ticker}&market=${market}`);
+      const res = await fetch(`${BASE}/financials?ticker=${ticker}&market=${market}&advanced=${getAdvanced()}`);
       const d = await res.json();
       if (d.error) { setError("financials-results", d.error); return; }
       if (!d.income_statement || Object.keys(d.income_statement).length === 0) {
@@ -1341,6 +1478,292 @@
           </table>
         </div>`;
     } catch (e) { setError("screener-results", e.message); }
+  }
+
+  // ── ADVANCED MODE ─────────────────────────────────────────────────────────
+  let advancedMode = false;
+  function toggleAdvanced() {
+    advancedMode = !advancedMode;
+    const el = document.getElementById("adv-toggle");
+    const lb = document.getElementById("adv-label");
+    el.classList.toggle("active", advancedMode);
+    lb.textContent = advancedMode ? "Advanced (FMP)" : "Standard";
+  }
+  function getAdvanced() { return advancedMode; }
+
+  // ── REVERSE DCF ───────────────────────────────────────────────────────────
+  async function runReverseDCF() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("rdcf-results", "Please enter a ticker symbol first."); return; }
+    setLoading("rdcf-results", `Solving for implied growth rate of ${ticker.toUpperCase()}...`);
+    const rf  = document.getElementById("rdcf-rf").value  || 0.04;
+    const mr  = document.getElementById("rdcf-mr").value  || 0.10;
+    const tg  = document.getElementById("rdcf-tg").value  || 0.03;
+    const yrs = document.getElementById("rdcf-yrs").value || 5;
+    try {
+      const res = await fetch(`${BASE}/reverse-dcf?ticker=${ticker}&market=${market}&risk_free_rate=${rf}&market_return=${mr}&terminal_growth_rate=${tg}&projection_years=${yrs}&advanced=${getAdvanced()}`);
+      const d = await res.json();
+      if (d.error) { setError("rdcf-results", d.error); return; }
+      const scenarios = d.scenarios || [];
+      const scenHtml = scenarios.map(s => {
+        const isImplied = s.scenario.includes("implied");
+        const vs = s.vs_current_price;
+        const vsClass = vs > 0 ? "nu" : vs < 0 ? "nd" : "";
+        return `<div class="rdcf-cell ${isImplied ? 'implied' : ''}">
+          <div class="rs-label">${s.scenario}</div>
+          <div class="rs-growth">${s.growth_rate}%</div>
+          <div class="rs-price">Intrinsic: ${s.intrinsic_per_share}</div>
+          <div class="rs-vs ${vsClass}">${vs > 0 ? '+' : ''}${vs}% vs price</div>
+        </div>`;
+      }).join('');
+      document.getElementById("rdcf-results").innerHTML = `
+        <div class="verdict-strip ${d.implied_growth_rate > 15 ? 'sell' : d.implied_growth_rate < 5 ? 'buy' : 'hold'}" style="margin-bottom:20px">
+          <div>
+            <div class="verdict-main">Implied Growth Rate: ${d.implied_growth_rate}%/yr</div>
+            <div class="verdict-sub">${d.ticker} &nbsp;·&nbsp; WACC ${d.wacc_used}% &nbsp;·&nbsp; Terminal ${d.terminal_growth_rate}% &nbsp;·&nbsp; ${d.projection_years}-yr model</div>
+          </div>
+        </div>
+        <div class="card" style="padding:16px 20px;margin-bottom:20px">
+          <div class="card-head">Interpretation</div>
+          <p style="font-size:0.88rem;line-height:1.7;color:var(--ink2)">${d.interpretation}</p>
+        </div>
+        <div class="section-label">Scenario Analysis</div>
+        <div class="rdcf-scenario">${scenHtml}</div>
+        <div class="metrics-grid">
+          <div class="metric"><div class="m-label">Current Price</div><div class="m-value">${d.current_price}</div></div>
+          <div class="metric"><div class="m-label">Implied Growth</div><div class="m-value">${d.implied_growth_rate}%</div></div>
+          <div class="metric"><div class="m-label">WACC Used</div><div class="m-value">${d.wacc_used}%</div></div>
+          <div class="metric"><div class="m-label">Data Source</div><div class="m-value">${d.data_source || "—"}</div></div>
+        </div>`;
+    } catch (e) { setError("rdcf-results", e.message); }
+  }
+
+  // ── INSIDER TRANSACTIONS ──────────────────────────────────────────────────
+  async function loadInsider() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("insider-results", "Please enter a ticker symbol first."); return; }
+    setLoading("insider-results", `Fetching insider transactions for ${ticker.toUpperCase()}...`);
+    try {
+      const res = await fetch(`${BASE}/insider-transactions?ticker=${ticker}&market=${market}&limit=20`);
+      const d = await res.json();
+      if (d.error) { setError("insider-results", d.error); return; }
+      const total = (d.buy_count || 0) + (d.sell_count || 0);
+      const buyPct = total > 0 ? (d.buy_count / total * 100).toFixed(0) : 50;
+      const sellPct = 100 - buyPct;
+      const sentCls = d.insider_sentiment === "Bullish" ? "nu" : d.insider_sentiment === "Bearish" ? "nd" : "";
+      const txRows = (d.transactions || []).map(t => {
+        const isBuy = (t.transaction_type || "").toLowerCase().includes("purchase") || (t.transaction_type || "").toLowerCase().includes("buy");
+        return `<tr>
+          <td class="lc">${t.date || "—"}</td>
+          <td>${t.insider_name || "—"}</td>
+          <td style="font-size:0.72rem;color:var(--muted)">${t.title || "—"}</td>
+          <td class="${isBuy ? 'nu' : 'nd'}">${t.transaction_type || "—"}</td>
+          <td>${t.shares ? fmt(t.shares, 0) : "—"}</td>
+          <td>${t.price ? "$" + Number(t.price).toFixed(2) : "—"}</td>
+          <td>${t.value ? fmt(t.value) : "—"}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById("insider-results").innerHTML = `
+        <div class="hero-row" style="margin-bottom:20px">
+          <div class="hero-stat main">
+            <div class="h-label">Insider Sentiment</div>
+            <div class="h-value ${sentCls}">${d.insider_sentiment || "—"}</div>
+            <div class="h-sub">${d.total_transactions} transactions analyzed</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Buy Transactions</div>
+            <div class="h-value nu">${d.buy_count || 0}</div>
+            <div class="h-sub">Total value: ${fmt(d.total_buy_value)}</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Sell Transactions</div>
+            <div class="h-value nd">${d.sell_count || 0}</div>
+            <div class="h-sub">Total value: ${fmt(d.total_sell_value)}</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Buy/Sell Ratio</div>
+            <div class="h-value">${d.buy_count && d.sell_count ? (d.buy_count / d.sell_count).toFixed(1) + "x" : "—"}</div>
+            <div class="h-sub">Buys vs Sells</div>
+          </div>
+        </div>
+        <div class="card" style="padding:16px 20px;margin-bottom:20px">
+          <div class="insider-bar">
+            <div class="buy-fill" style="width:${buyPct}%"></div>
+            <div class="sell-fill" style="width:${sellPct}%"></div>
+          </div>
+          <div class="insider-label"><span>Buys ${buyPct}%</span><span>Sells ${sellPct}%</span></div>
+        </div>
+        <div class="card" style="padding:0;overflow:auto">
+          <table class="data-table" style="min-width:700px">
+            <thead><tr><th>Date</th><th>Insider</th><th>Title</th><th>Type</th><th>Shares</th><th>Price</th><th>Value</th></tr></thead>
+            <tbody>${txRows}</tbody>
+          </table>
+        </div>`;
+    } catch (e) { setError("insider-results", e.message); }
+  }
+
+  async function loadInstitutional() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("institutional-results", "Please enter a ticker symbol first."); return; }
+    setLoading("institutional-results", `Fetching institutional holders for ${ticker.toUpperCase()}...`);
+    try {
+      const res = await fetch(`${BASE}/institutional-holders?ticker=${ticker}&market=${market}&limit=15`);
+      const d = await res.json();
+      if (d.error) { setError("institutional-results", d.error); return; }
+      const trendCls = d.institutional_trend === "Accumulating" ? "nu" : "nd";
+      const rows = (d.holders || []).map(h => {
+        const chg = h.change || 0;
+        return `<tr>
+          <td class="lc">${h.holder || "—"}</td>
+          <td>${h.shares ? fmt(h.shares, 0) : "—"}</td>
+          <td class="${chg >= 0 ? 'nu' : 'nd'}">${chg >= 0 ? '+' : ''}${h.shares ? fmt(chg, 0) : "—"}</td>
+          <td class="${chg >= 0 ? 'nu' : 'nd'}">${h.change_pct !== null ? (chg >= 0 ? '+' : '') + h.change_pct + "%" : "—"}</td>
+          <td style="color:var(--muted);font-size:0.75rem">${h.date_reported || "—"}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById("institutional-results").innerHTML = `
+        <div class="section-label">Institutional Holdings</div>
+        <div class="metrics-grid" style="margin-bottom:16px">
+          <div class="metric"><div class="m-label">Trend</div><div class="m-value ${trendCls}">${d.institutional_trend || "—"}</div></div>
+          <div class="metric"><div class="m-label">Total Shares Held</div><div class="m-value">${fmt(d.total_shares_held, 0)}</div></div>
+          <div class="metric"><div class="m-label">Net Change</div><div class="m-value ${d.net_institutional_change >= 0 ? 'nu' : 'nd'}">${d.net_institutional_change >= 0 ? '+' : ''}${fmt(d.net_institutional_change, 0)}</div></div>
+          <div class="metric"><div class="m-label">Holders Tracked</div><div class="m-value">${d.top_holders_count}</div></div>
+        </div>
+        <div class="card" style="padding:0;overflow:auto">
+          <table class="data-table" style="min-width:600px">
+            <thead><tr><th>Institution</th><th>Shares Held</th><th>Change</th><th>Change %</th><th>Reported</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`;
+    } catch (e) { setError("institutional-results", e.message); }
+  }
+
+  // ── ANALYST TARGETS ───────────────────────────────────────────────────────
+  async function loadAnalyst() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("analyst-results", "Please enter a ticker symbol first."); return; }
+    setLoading("analyst-results", `Fetching analyst targets for ${ticker.toUpperCase()}...`);
+    try {
+      const res = await fetch(`${BASE}/analyst-targets?ticker=${ticker}&market=${market}`);
+      const d = await res.json();
+      if (d.error) { setError("analyst-results", d.error); return; }
+      const ab = d.analyst_breakdown || {};
+      const total = ab.total || 1;
+      const ratingCls = (d.consensus_rating || "").toLowerCase().includes("buy") ? "nu" : (d.consensus_rating || "").toLowerCase().includes("sell") ? "nd" : "";
+      const targetRows = (d.price_targets || []).slice(0, 10).map(t => `<tr>
+        <td class="lc">${t.published_date ? t.published_date.slice(0,10) : "—"}</td>
+        <td>${t.analyst_company || "—"}</td>
+        <td style="font-size:0.78rem;color:var(--muted)">${t.analyst || "—"}</td>
+        <td class="nu">${t.price_target ? "$" + Number(t.price_target).toFixed(2) : "—"}</td>
+        <td style="font-size:0.73rem;color:var(--muted);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.news_title || "—"}</td>
+      </tr>`).join('');
+      const epsRows = (d.eps_estimates || []).slice(0, 4).map(e => `<tr>
+        <td class="lc">${e.date || "—"}</td>
+        <td>${e.estimated_eps_low ? Number(e.estimated_eps_low).toFixed(2) : "—"}</td>
+        <td class="nu">${e.estimated_eps_avg ? Number(e.estimated_eps_avg).toFixed(2) : "—"}</td>
+        <td>${e.estimated_eps_high ? Number(e.estimated_eps_high).toFixed(2) : "—"}</td>
+        <td>${e.estimated_revenue_avg ? fmt(e.estimated_revenue_avg) : "—"}</td>
+        <td style="color:var(--muted);font-size:0.75rem">${e.number_analysts_eps || "—"}</td>
+      </tr>`).join('');
+      document.getElementById("analyst-results").innerHTML = `
+        <div class="hero-row" style="margin-bottom:20px">
+          <div class="hero-stat main">
+            <div class="h-label">Consensus Rating</div>
+            <div class="h-value ${ratingCls}">${d.consensus_rating || "—"}</div>
+            <div class="h-sub">${ab.total || 0} analysts</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Avg Price Target</div>
+            <div class="h-value nu">${d.consensus_price_target ? "$" + d.consensus_price_target : "—"}</div>
+            <div class="h-sub">${d.total_price_targets} targets</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Buy / Hold / Sell</div>
+            <div class="h-value">${ab.strong_buy + ab.buy || 0} / ${ab.hold || 0} / ${ab.sell + ab.strong_sell || 0}</div>
+            <div class="h-sub">Strong Buy: ${ab.strong_buy || 0}</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Bull %</div>
+            <div class="h-value nu">${total > 0 ? (((ab.strong_buy + ab.buy) / total) * 100).toFixed(0) : "—"}%</div>
+            <div class="h-sub">Bullish analysts</div>
+          </div>
+        </div>
+        ${targetRows ? `
+        <div class="section-label">Recent Price Targets</div>
+        <div class="card" style="padding:0;overflow:auto;margin-bottom:20px">
+          <table class="data-table" style="min-width:600px">
+            <thead><tr><th>Date</th><th>Firm</th><th>Analyst</th><th>Target</th><th>Note</th></tr></thead>
+            <tbody>${targetRows}</tbody>
+          </table>
+        </div>` : ''}
+        ${epsRows ? `
+        <div class="section-label">EPS Estimates</div>
+        <div class="card" style="padding:0;overflow:auto">
+          <table class="data-table" style="min-width:500px">
+            <thead><tr><th>Period</th><th>EPS Low</th><th>EPS Avg</th><th>EPS High</th><th>Revenue Est.</th><th># Analysts</th></tr></thead>
+            <tbody>${epsRows}</tbody>
+          </table>
+        </div>` : ''}`;
+    } catch (e) { setError("analyst-results", e.message); }
+  }
+
+  // ── EARNINGS CALENDAR ─────────────────────────────────────────────────────
+  async function loadEarnings() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("earnings-results", "Please enter a ticker symbol first."); return; }
+    setLoading("earnings-results", `Fetching earnings data for ${ticker.toUpperCase()}...`);
+    try {
+      const res = await fetch(`${BASE}/earnings-calendar?ticker=${ticker}&market=${market}&limit=8`);
+      const d = await res.json();
+      if (d.error) { setError("earnings-results", d.error); return; }
+      const upcoming = d.upcoming_earnings || [];
+      const upHtml = upcoming.length ? upcoming.map(e => `
+        <div class="metric">
+          <div class="m-label">${e.date || "—"} ${e.time ? '· ' + e.time : ''}</div>
+          <div class="m-value">${e.fiscal_quarter || "—"}</div>
+          <div style="font-size:0.7rem;color:var(--muted);margin-top:3px">EPS Est: ${e.eps_estimated !== null && e.eps_estimated !== undefined ? Number(e.eps_estimated).toFixed(2) : "—"}</div>
+        </div>`).join('') : '<div style="color:var(--muted);font-size:0.82rem">No upcoming earnings scheduled.</div>';
+      const histRows = (d.earnings_history || []).map(e => {
+        const beat = e.beat === true ? '<span class="earn-beat yes">BEAT</span>' : e.beat === false ? '<span class="earn-beat no">MISS</span>' : '—';
+        const surprise = e.surprise_pct !== null && e.surprise_pct !== undefined;
+        return `<tr>
+          <td class="lc">${e.date || "—"}</td>
+          <td style="font-size:0.75rem;color:var(--muted)">${e.fiscal_quarter || "—"}</td>
+          <td>${e.eps_estimated !== null && e.eps_estimated !== undefined ? Number(e.eps_estimated).toFixed(2) : "—"}</td>
+          <td>${e.eps_actual !== null && e.eps_actual !== undefined ? Number(e.eps_actual).toFixed(2) : "—"}</td>
+          <td class="${e.surprise_pct > 0 ? 'nu' : e.surprise_pct < 0 ? 'nd' : ''}">${surprise ? (e.surprise_pct > 0 ? '+' : '') + e.surprise_pct + "%" : "—"}</td>
+          <td>${beat}</td>
+          <td style="font-size:0.75rem;color:var(--muted)">${e.time || "—"}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById("earnings-results").innerHTML = `
+        <div class="hero-row" style="margin-bottom:20px">
+          <div class="hero-stat main">
+            <div class="h-label">Beat Rate</div>
+            <div class="h-value ${d.beat_rate_pct >= 70 ? 'nu' : d.beat_rate_pct < 50 ? 'nd' : ''}">${d.beat_rate_pct !== null ? d.beat_rate_pct + "%" : "—"}</div>
+            <div class="h-sub">EPS beats in last ${d.earnings_history ? d.earnings_history.length : 0} quarters</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Avg EPS Surprise</div>
+            <div class="h-value ${d.avg_eps_surprise_pct > 0 ? 'nu' : 'nd'}">${d.avg_eps_surprise_pct !== null ? (d.avg_eps_surprise_pct > 0 ? '+' : '') + d.avg_eps_surprise_pct + "%" : "—"}</div>
+            <div class="h-sub">Vs. consensus estimate</div>
+          </div>
+          <div class="hero-stat" style="grid-column:span 2">
+            <div class="h-label">Next Earnings</div>
+            <div class="h-value">${upcoming.length ? upcoming[0].date : "N/A"}</div>
+            <div class="h-sub">${upcoming.length ? (upcoming[0].time || '') + " · EPS Est: " + (upcoming[0].eps_estimated !== null ? Number(upcoming[0].eps_estimated).toFixed(2) : "—") : "No upcoming date available"}</div>
+          </div>
+        </div>
+        <div class="section-label">Upcoming Earnings</div>
+        <div class="metrics-grid" style="margin-bottom:20px">${upHtml}</div>
+        <div class="section-label">Earnings Surprise History</div>
+        <div class="card" style="padding:0;overflow:auto">
+          <table class="data-table" style="min-width:600px">
+            <thead><tr><th>Date</th><th>Quarter</th><th>Est. EPS</th><th>Actual EPS</th><th>Surprise</th><th>Result</th><th>Time</th></tr></thead>
+            <tbody>${histRows}</tbody>
+          </table>
+        </div>`;
+    } catch (e) { setError("earnings-results", e.message); }
   }
 
   // ── IPOs ───────────────────────────────────────────────────────────────────
