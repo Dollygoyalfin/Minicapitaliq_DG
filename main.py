@@ -1,1809 +1,1908 @@
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional  # kept for forward compatibility
-import yfinance as yf
-import os
-import httpx
-import json
-import re
-
-from fastapi.responses import FileResponse
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ── API Keys ──────────────────────────────────────────────────────────────────
-FMP_API_KEY = os.getenv("FMP_API_KEY", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-
-# ── FMP Base URL ──────────────────────────────────────────────────────────────
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  FMP HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fmp_get(path: str, params: dict = None) -> dict | list:
-    """Generic FMP GET. Returns parsed JSON or empty list/dict on error."""
-    try:
-        url = f"{FMP_BASE}{path}"
-        p = dict(params) if params else {}
-        p["apikey"] = FMP_API_KEY
-        resp = httpx.get(url, params=p, timeout=15)
-        data = resp.json()
-        # FMP returns {"Error Message": "..."} on bad key / unknown ticker
-        if isinstance(data, dict) and ("Error Message" in data or "error" in data):
-            return []
-        return data
-    except Exception:
-        return []
-
-
-def get_fmp_profile(ticker: str) -> dict:
-    """Fetch stock profile + latest balance sheet from FMP, map to yfinance-style keys.
-    FMP /profile does NOT include totalDebt/totalCash — pulled from balance sheet instead.
-    """
-    data = fmp_get(f"/profile/{ticker}")
-    if not data or not isinstance(data, list) or not data[0]:
-        return {}
-    d = data[0]
-
-    # Pull totalDebt and totalCash from latest balance sheet
-    bal = fmp_get(f"/balance-sheet-statement/{ticker}", {"limit": 1})
-    bal0 = bal[0] if isinstance(bal, list) and bal else {}
-    total_debt = float(bal0.get("totalDebt") or bal0.get("longTermDebt") or 0)
-    total_cash = float(bal0.get("cashAndShortTermInvestments") or bal0.get("cashAndCashEquivalents") or 0)
-
-    # sharesOutstanding: use profile value, fall back to mktCap/price derivation
-    shares = d.get("sharesOutstanding")
-    if not shares:
-        mktcap = d.get("mktCap") or 0
-        price  = d.get("price") or 1
-        shares = mktcap / price if price else None
-
-    return {
-        "currentPrice":       d.get("price"),
-        "marketCap":          d.get("mktCap"),
-        "trailingEps":        d.get("eps"),
-        "trailingPE":         d.get("pe"),
-        "forwardPE":          None,
-        "priceToBook":        d.get("priceToBookRatio"),
-        "beta":               d.get("beta") or 1.0,
-        "returnOnEquity":     d.get("roe"),
-        "debtToEquity":       d.get("debtToEquityRatio"),
-        "bookValue":          d.get("bookValuePerShare"),
-        "longName":           d.get("companyName"),
-        "sector":             d.get("sector"),
-        "industry":           d.get("industry"),
-        "sharesOutstanding":  shares,
-        "totalDebt":          total_debt,
-        "totalCash":          total_cash,
-        "dividendYield":      d.get("lastDiv"),
-        "regularMarketPrice": d.get("price"),
-        "description":        d.get("description", ""),
-        "exchange":           d.get("exchangeShortName", ""),
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>MiniTradeIQ</title>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --cream: #faf9f6;
+      --white: #ffffff;
+      --ink: #1a1814;
+      --ink2: #3d3a35;
+      --muted: #9a9590;
+      --line: #e8e4de;
+      --accent: #c8421a;
+      --green: #1a7a4a;
+      --green-light: #edf7f2;
+      --red: #c8421a;
+      --red-light: #fdf2ee;
+      --blue: #1a4a7a;
+      --blue-light: #eef3f9;
     }
 
-
-def get_fmp_income(ticker: str, limit: int = 6) -> list:
-    """Annual income statements from FMP."""
-    data = fmp_get(f"/income-statement/{ticker}", {"limit": limit})
-    return data if isinstance(data, list) else []
-
-
-def get_fmp_cashflow(ticker: str, limit: int = 6) -> list:
-    """Annual cash flow statements from FMP."""
-    data = fmp_get(f"/cash-flow-statement/{ticker}", {"limit": limit})
-    return data if isinstance(data, list) else []
-
-
-def get_fmp_balance(ticker: str, limit: int = 7) -> list:
-    """Annual balance sheets from FMP."""
-    data = fmp_get(f"/balance-sheet-statement/{ticker}", {"limit": limit})
-    return data if isinstance(data, list) else []
-
-
-def resolve_ticker(ticker: str, market: str, advanced: bool = False) -> tuple[str, bool]:
-    """
-    Returns (resolved_ticker, use_fmp).
-    - India + default  → yfinance (.NS suffix)
-    - India + advanced → FMP (NO .NS — FMP uses bare ticker e.g. RELIANCE)
-    - US               → FMP always
-    """
-    t = ticker.upper()
-    if market.lower() == "india":
-        if advanced:
-            # FMP does not support .NS suffix — strip it
-            return t.replace(".NS", ""), True
-        else:
-            if not t.endswith(".NS"):
-                t += ".NS"
-            return t, False
-    else:
-        return t, True  # US always uses FMP
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  STATIC / ROOT
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/")
-def serve_frontend():
-    return FileResponse("index.html")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /valuation  — yfinance for India default, FMP for US / Advanced
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/valuation")
-def get_valuation(
-    ticker: str = Query(...),
-    market: str = Query("us"),
-    advanced: bool = Query(False, description="Use FMP for Indian stocks too"),
-    risk_free_rate: float = Query(0.04),
-    market_return: float = Query(0.10),
-    growth_rate: float = Query(0.08),
-):
-    try:
-        resolved, use_fmp = resolve_ticker(ticker, market, advanced)
-
-        if use_fmp:
-            info = get_fmp_profile(resolved)
-            if not info:
-                return {"error": f"FMP returned no data for {resolved}"}
-        else:
-            stock = yf.Ticker(resolved)
-            info = stock.info
-
-        current_price = info.get("currentPrice")
-        eps           = info.get("trailingEps") or 0.0
-        pe_ratio      = info.get("trailingPE")
-        forward_pe    = info.get("forwardPE")
-        beta          = info.get("beta") or 1.0
-        pb_ratio      = info.get("priceToBook")
-        market_cap    = info.get("marketCap")
-        roe           = info.get("returnOnEquity")
-        de_ratio      = info.get("debtToEquity")
-        book_value    = info.get("bookValue")
-
-        cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
-        cost_of_debt   = 0.06
-        equity_value   = market_cap if (market_cap and market_cap > 0) else 1
-        debt_value     = equity_value * 0.2  # assumed 20% debt ratio when no real debt data
-        wacc = (
-            (equity_value / (equity_value + debt_value)) * cost_of_equity +
-            (debt_value   / (equity_value + debt_value)) * cost_of_debt
-        )
-
-        intrinsic_value = None
-        if eps and wacc > growth_rate:
-            intrinsic_value = (eps * (1 + growth_rate)) / (wacc - growth_rate)
-
-        valuation_low = valuation_high = None
-        if eps:
-            low_growth, high_growth = growth_rate - 0.02, growth_rate + 0.02
-            low_disc,  high_disc    = wacc + 0.02,        wacc - 0.02
-            if low_disc  > low_growth:
-                valuation_low  = (eps * (1 + low_growth))  / (low_disc  - low_growth)
-            if high_disc > high_growth:
-                valuation_high = (eps * (1 + high_growth)) / (high_disc - high_growth)
-
-        return {
-            "ticker":          resolved,
-            "market":          market,
-            "data_source":     "FMP" if use_fmp else "yfinance",
-            "current_price":   current_price,
-            "eps":             eps,
-            "pe_ratio":        pe_ratio,
-            "forward_pe":      forward_pe,
-            "beta":            beta,
-            "pb_ratio":        pb_ratio,
-            "book_value":      book_value,
-            "market_cap":      market_cap,
-            "roe":             roe,
-            "de_ratio":        de_ratio,
-            "intrinsic_value": intrinsic_value,
-            "valuation_low":   valuation_low,
-            "valuation_high":  valuation_high,
-            "growth_rate_used":   growth_rate,
-            "discount_rate_used": wacc,
-            "wacc":               wacc,
-            "promoters_holding":  None,
-            "fii_holding":        None,
-            "dii_holding":        None,
-            "retail_holding":     None,
-        }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /financials  — yfinance for India default, FMP for US / Advanced
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/financials")
-def get_financials(
-    ticker: str = Query(...),
-    market: str = Query("us"),
-    advanced: bool = Query(False),
-):
-    try:
-        resolved, use_fmp = resolve_ticker(ticker, market, advanced)
-
-        if use_fmp:
-            inc_list = get_fmp_income(resolved, 5)
-            cf_list  = get_fmp_cashflow(resolved, 5)
-            bal_list = get_fmp_balance(resolved, 5)
-
-            def list_to_dict(records: list, key_field: str = "calendarYear") -> dict:
-                out = {}
-                for r in records:
-                    yr = r.get(key_field) or r.get("date", "N/A")
-                    out[str(yr)] = r   # always string key
-                return out
-
-            income        = list_to_dict(inc_list)
-            cashflow      = list_to_dict(cf_list)
-            balance_sheet = list_to_dict(bal_list)
-
-            roe_dupont = {}
-            for yr, r in income.items():
-                net_income = r.get("netIncome") or 1
-                revenue    = r.get("revenue") or 1
-                # Balance sheet key may use date string instead of calendarYear — try both
-                bal = balance_sheet.get(yr) or balance_sheet.get(r.get("date", "")[:4]) or {}
-                assets = bal.get("totalAssets") or 1
-                equity = bal.get("totalStockholdersEquity") or bal.get("totalEquity") or 1
-                try:
-                    roe_dupont[yr] = (net_income / revenue) * (revenue / assets) * (assets / equity)
-                except ZeroDivisionError:
-                    roe_dupont[yr] = 0.0
-
-        else:
-            stock       = yf.Ticker(resolved)
-            income_df   = stock.financials
-            cashflow_df = stock.cashflow
-            balance_df  = stock.balance_sheet
-
-            income        = {} if income_df  is None or income_df.empty  else income_df.T.head(5).to_dict()
-            cashflow      = {} if cashflow_df is None or cashflow_df.empty else cashflow_df.T.head(5).to_dict()
-            balance_sheet = {} if balance_df  is None or balance_df.empty  else balance_df.T.head(5).to_dict()
-
-            roe_dupont = {}
-            for year in income:
-                net_income = income[year].get("Net Income", 1)
-                revenue    = income[year].get("Total Revenue", 1)
-                assets     = balance_sheet.get(year, {}).get("Total Assets", 1)
-                equity     = balance_sheet.get(year, {}).get("Total Stockholder Equity", 1)
-                roe_dupont[year] = (
-                    (net_income / revenue) * (revenue / assets) * (assets / equity)
-                )
-
-        return {
-            "data_source":      "FMP" if use_fmp else "yfinance",
-            "income_statement": income,
-            "cash_flow":        cashflow,
-            "balance_sheet":    balance_sheet,
-            "dupont_roe":       roe_dupont,
-        }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /dcf  — yfinance for India default, FMP for US / Advanced
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/dcf")
-def get_dcf(
-    ticker: str = Query(...),
-    market: str = Query("us"),
-    advanced: bool = Query(False),
-    projection_years: int = Query(5),
-    risk_free_rate: float = Query(0.04),
-    market_return: float = Query(0.10),
-    terminal_growth_rate: float = Query(0.03),
-    margin_of_safety: float = Query(0.25),
-):
-    try:
-        resolved, use_fmp = resolve_ticker(ticker, market, advanced)
-
-        # ── Pull data (FMP or yfinance) ───────────────────────────────────────
-        if use_fmp:
-            info     = get_fmp_profile(resolved)
-            inc_list = get_fmp_income(resolved, 7)
-            cf_list  = get_fmp_cashflow(resolved, 7)
-            bal_list = get_fmp_balance(resolved, 8)
-
-            if not info:
-                return {"error": f"FMP profile returned no data for {resolved}. Check ticker symbol."}
-            if not inc_list:
-                return {"error": f"FMP income statement empty for {resolved}. Ticker may not be supported on your FMP plan."}
-            if not bal_list:
-                return {"error": f"FMP balance sheet empty for {resolved}."}
-
-            current_price      = info.get("currentPrice")
-            shares_outstanding = info.get("sharesOutstanding")
-            beta               = info.get("beta") or 1.0
-            market_cap         = info.get("marketCap")
-            total_debt         = info.get("totalDebt") or 0
-            total_cash         = info.get("totalCash") or 0
-
-            if not shares_outstanding or shares_outstanding == 0:
-                return {"error": "Shares outstanding not available for this ticker."}
-
-            # FMP field extractors
-            def fi(record, field, fallback=0.0):
-                v = record.get(field)
-                try:
-                    return float(v) if v is not None else fallback
-                except Exception:
-                    return fallback
-
-            # Build series from FMP (index 0 = most recent)
-            revenue_series = []; opex_series = []; tax_rates = []; year_labels = []
-            ca_series = []; cl_series = []; cash_series = []; cpltd_series = []
-            net_ppe_series = []; depr_series = []
-
-            n = min(len(inc_list), len(cf_list), len(bal_list), 7)
-
-            for i in range(n):
-                inc = inc_list[i] if i < len(inc_list) else {}
-                cf  = cf_list[i]  if i < len(cf_list)  else {}
-                bal = bal_list[i] if i < len(bal_list) else {}
-
-                revenue = fi(inc, "revenue")
-                if revenue == 0.0:
-                    continue
-
-                # FMP: operatingExpenses = SG&A only (NOT total cost).
-                # Total operating cost = costOfRevenue + operatingExpenses.
-                # Fall back to costAndExpenses if both are zero.
-                cogs   = fi(inc, "costOfRevenue")
-                sgna   = fi(inc, "operatingExpenses")
-                opex   = (cogs + sgna) if (cogs + sgna) > 0 else fi(inc, "costAndExpenses")
-                # Last resort: derive from grossProfit
-                if opex == 0:
-                    gross = fi(inc, "grossProfit")
-                    ebit  = fi(inc, "operatingIncome") or fi(inc, "ebitda")
-                    opex  = revenue - gross + (gross - ebit) if gross and ebit else revenue * 0.7
-
-                # Tax rate
-                pretax   = fi(inc, "incomeBeforeTax")
-                tax_prov = fi(inc, "incomeTaxExpense")
-                if pretax != 0 and tax_prov != 0:
-                    yr_tax = max(0.05, min(abs(tax_prov / pretax), 0.40))
-                else:
-                    yr_tax = 0.25
-
-                ca      = fi(bal, "totalCurrentAssets")
-                cl      = fi(bal, "totalCurrentLiabilities")
-                csh     = fi(bal, "cashAndCashEquivalents")
-                cpltd   = fi(bal, "shortTermDebt") or fi(bal, "capitalLeaseObligations") or 0.0
-                net_ppe = fi(bal, "propertyPlantEquipmentNet")
-                depr    = abs(fi(cf, "depreciationAndAmortization"))
-
-                try:
-                    year_labels.append(str(inc.get("calendarYear", inc.get("date", f"Y-{i}"))))
-                except Exception:
-                    year_labels.append(f"Y-{i}")
-
-                revenue_series.append(revenue)
-                opex_series.append(opex)
-                tax_rates.append(yr_tax)
-                ca_series.append(ca)
-                cl_series.append(cl)
-                cash_series.append(csh)
-                cpltd_series.append(cpltd)
-                net_ppe_series.append(net_ppe)
-                depr_series.append(depr)
-
-            # Interest expense for WACC cost of debt
-            interest_expense = abs(fi(inc_list[0], "interestExpense")) if inc_list else 0.0
-
-        else:
-            # ── yfinance path (Indian stocks default) ─────────────────────────
-            stock = yf.Ticker(resolved)
-            info  = stock.info
-
-            current_price      = info.get("currentPrice")
-            shares_outstanding = info.get("sharesOutstanding")
-            beta               = info.get("beta", 1.0) or 1.0
-            market_cap         = info.get("marketCap")
-            total_debt         = info.get("totalDebt", 0) or 0
-            total_cash         = info.get("totalCash", 0) or 0
-
-            if not shares_outstanding or shares_outstanding == 0:
-                return {"error": "Shares outstanding not available for this ticker."}
-
-            income_df   = stock.financials
-            cashflow_df = stock.cashflow
-            balance_df  = stock.balance_sheet
-
-            for label, df in [("Income statement", income_df),
-                               ("Cash flow statement", cashflow_df),
-                               ("Balance sheet", balance_df)]:
-                if df is None or df.empty:
-                    return {"error": f"{label} not available for this ticker."}
-
-            def find_row(df, *keywords):
-                for idx in df.index:
-                    if all(k.lower() in idx.lower() for k in keywords):
-                        return idx
-                return None
-
-            def safe_float(df, row_key, col):
-                if row_key is None:
-                    return None
-                try:
-                    val = df.loc[row_key].iloc[col]
-                    if val is None or str(val) == "nan":
-                        return None
-                    return float(val)
-                except Exception:
-                    return None
-
-            revenue_row  = find_row(income_df, "total revenue") or find_row(income_df, "revenue")
-            opex_row     = (find_row(income_df, "total expenses")
-                            or find_row(income_df, "total operating expenses")
-                            or find_row(income_df, "operating expense")
-                            or find_row(income_df, "cost of revenue"))
-            pretax_row   = find_row(income_df, "pretax") or find_row(income_df, "income before tax")
-            tax_row      = find_row(income_df, "tax", "provision") or find_row(income_df, "income tax")
-            interest_row = find_row(income_df, "interest", "expense")
-            ca_row       = find_row(balance_df, "current assets")
-            cl_row       = find_row(balance_df, "current liabilities")
-            cash_row     = (find_row(balance_df, "cash and cash equivalents")
-                            or find_row(balance_df, "cash"))
-            cpltd_row    = (find_row(balance_df, "current portion", "long term")
-                            or find_row(balance_df, "current", "long term debt")
-                            or find_row(balance_df, "current portion"))
-            net_ppe_row  = (find_row(balance_df, "net ppe")
-                            or find_row(balance_df, "net property plant")
-                            or find_row(balance_df, "property plant equipment"))
-            depr_row_inc = (find_row(income_df, "reconciled depreciation")
-                            or find_row(income_df, "depreciation amortization")
-                            or find_row(income_df, "depreciation"))
-            depr_row_cf  = (find_row(cashflow_df, "depreciation amortization")
-                            or find_row(cashflow_df, "depreciation"))
-
-            if not revenue_row:
-                return {"error": "Could not find Revenue in income statement."}
-
-            n_inc   = min(len(income_df.columns), 6)
-            n_cf    = min(len(cashflow_df.columns), 6)
-            n_bal   = min(len(balance_df.columns), 7)
-            n_years = min(n_inc, n_cf, n_bal)
-
-            if n_years == 0:
-                return {"error": "Not enough historical data to compute FCFF."}
-
-            revenue_series = []; opex_series = []; tax_rates = []; year_labels = []
-            ca_series = []; cl_series = []; cash_series = []; cpltd_series = []
-            net_ppe_series = []; depr_series = []
-
-            for col in range(n_years):
-                revenue = safe_float(income_df, revenue_row, col) or 0.0
-                if revenue == 0.0:
-                    continue
-                pretax   = safe_float(income_df, pretax_row, col)
-                tax_prov = safe_float(income_df, tax_row, col)
-                if pretax and pretax != 0 and tax_prov is not None and tax_prov != 0:
-                    yr_tax = max(0.05, min(abs(tax_prov / pretax), 0.40))
-                else:
-                    yr_tax = 0.25
-                if opex_row:
-                    opex = abs(safe_float(income_df, opex_row, col) or 0.0)
-                else:
-                    ebit_row_fb = find_row(income_df, "ebit") or find_row(income_df, "operating income")
-                    ebit_val    = safe_float(income_df, ebit_row_fb, col) or 0.0
-                    opex        = abs(revenue - ebit_val)
-
-                ca      = safe_float(balance_df, ca_row, col) or 0.0
-                cl      = safe_float(balance_df, cl_row, col) or 0.0
-                csh     = safe_float(balance_df, cash_row, col) or 0.0
-                cpltd   = safe_float(balance_df, cpltd_row, col) or 0.0
-                net_ppe = safe_float(balance_df, net_ppe_row, col) or 0.0
-                depr    = abs(safe_float(income_df, depr_row_inc, col) or
-                              safe_float(cashflow_df, depr_row_cf, col) or 0.0)
-
-                try:
-                    year_labels.append(str(income_df.columns[col].year))
-                except Exception:
-                    year_labels.append(f"Y-{col}")
-
-                revenue_series.append(revenue)
-                opex_series.append(opex)
-                tax_rates.append(yr_tax)
-                ca_series.append(ca)
-                cl_series.append(cl)
-                cash_series.append(csh)
-                cpltd_series.append(cpltd)
-                net_ppe_series.append(net_ppe)
-                depr_series.append(depr)
-
-            interest_expense = abs(safe_float(income_df, interest_row, 0) or 0.0)
-
-        # ── Shared DCF Math (same for both data sources) ──────────────────────
-
-        if not revenue_series:
-            return {"error": "No valid historical revenue data found for this ticker."}
-
-        # Ensure interest_expense always defined (FMP path may skip all rows)
-        try:
-            interest_expense
-        except NameError:
-            interest_expense = 0.0
-
-        n_valid = len(revenue_series)
-
-        def avg_yoy_growth(series):
-            rates = []
-            for i in range(len(series) - 1):
-                v_new, v_old = series[i], series[i + 1]
-                if v_new is None or v_old is None or v_old == 0:
-                    continue
-                if v_old < 0 or v_new < 0:
-                    continue
-                rates.append((v_new - v_old) / v_old)
-            if rates:
-                return sum(rates) / len(rates)
-            valid = [v for v in series if v is not None and v > 0]
-            if len(valid) >= 2:
-                n = len(valid) - 1
-                return (valid[0] / valid[-1]) ** (1 / n) - 1
-            return 0.0
-
-        def project_line(base, growth, years):
-            g = max(min(growth, 1.0), -0.5)
-            if base == 0.0:
-                return [0.0] * years
-            return [base * ((1 + g) ** y) for y in range(1, years + 1)]
-
-        def rolling_avg_terminal(projected):
-            if not projected:
-                return 0.0
-            window = projected[-5:] if len(projected) >= 5 else projected
-            return sum(window) / len(window)
-
-        wc_series = [
-            ca_series[i] - cl_series[i] - cash_series[i] - cpltd_series[i]
-            for i in range(n_valid)
-        ]
-        capex_series = []
-        for i in range(n_valid):
-            if i + 1 < len(net_ppe_series):
-                capex_val = net_ppe_series[i] - net_ppe_series[i + 1] + depr_series[i]
-            else:
-                capex_val = depr_series[i]
-            capex_series.append(max(capex_val, 0.0))
-
-        delta_nwc_series = []
-        for i in range(n_valid):
-            if i + 1 < len(wc_series):
-                delta_nwc_series.append(wc_series[i] - wc_series[i + 1])
-            else:
-                delta_nwc_series.append(0.0)
-
-        revenue_growth = avg_yoy_growth(revenue_series)
-        opex_growth    = avg_yoy_growth(opex_series)
-        # Cap opex growth: use 1.5x revenue growth when positive, else cap at 30%
-        opex_growth    = min(opex_growth, max(revenue_growth * 1.5, 0.30))
-        ca_growth      = avg_yoy_growth(ca_series)
-        cl_growth      = avg_yoy_growth(cl_series)
-        cash_growth    = avg_yoy_growth(cash_series)
-        cpltd_growth   = avg_yoy_growth(cpltd_series)
-        net_ppe_growth = avg_yoy_growth(net_ppe_series)
-        depr_growth    = avg_yoy_growth(depr_series)
-
-        if all(d == 0.0 for d in depr_series) and any(p > 0 for p in net_ppe_series):
-            depr_series = [n * 0.05 for n in net_ppe_series]
-            depr_growth = net_ppe_growth
-
-        ca_growth      = min(ca_growth,      revenue_growth)
-        cl_growth      = min(cl_growth,      revenue_growth)
-        cash_growth    = min(cash_growth,    revenue_growth)
-        cpltd_growth   = min(cpltd_growth,   revenue_growth)
-        net_ppe_growth = min(net_ppe_growth, revenue_growth)
-        depr_growth    = min(depr_growth,    revenue_growth)
-
-        avg_tax_rate = sum(tax_rates) / len(tax_rates) if tax_rates else 0.25
-
-        display_years = min(n_valid, 5)
-        historical_table = []
-        for i in range(display_years):
-            rev   = revenue_series[i]
-            opex  = opex_series[i]
-            capex = capex_series[i]
-            t     = tax_rates[i]
-            d_nwc = delta_nwc_series[i]
-            nop   = rev - opex
-            nop_at = nop * (1 - t)
-            fcff  = nop_at - d_nwc - capex
-            historical_table.append({
-                "year": year_labels[i],
-                "revenue": round(rev, 2),
-                "operating_expenses": round(-opex, 2),
-                "nop": round(nop, 2),
-                "tax_rate": round(t, 4),
-                "nop_after_tax": round(nop_at, 2),
-                "delta_nwc": round(-d_nwc, 2),
-                "capex": round(-capex, 2),
-                "fcff": round(fcff, 2),
-                "bs_ca": round(ca_series[i], 2),
-                "bs_cl": round(cl_series[i], 2),
-                "bs_cash": round(cash_series[i], 2),
-                "bs_cpltd": round(cpltd_series[i], 2),
-                "bs_net_ppe": round(net_ppe_series[i], 2),
-                "bs_depreciation": round(depr_series[i], 2),
-                "bs_wc": round(wc_series[i], 2),
-            })
-
-        # WACC
-        cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
-        if total_debt > 0 and interest_expense > 0:
-            cost_of_debt = max(0.03, min(interest_expense / total_debt, 0.15))
-        else:
-            cost_of_debt = 0.06
-
-        equity_val    = market_cap if market_cap else 1
-        debt_val      = total_debt if total_debt else equity_val * 0.2
-        total_capital = equity_val + debt_val
-        wacc = (
-            (equity_val / total_capital) * cost_of_equity +
-            (debt_val   / total_capital) * cost_of_debt * (1 - avg_tax_rate)
-        )
-
-        if wacc <= terminal_growth_rate:
-            return {"error": f"WACC ({wacc:.2%}) must be greater than terminal growth rate ({terminal_growth_rate:.2%})."}
-
-        # Projections
-        base_ca = ca_series[0]; base_cl = cl_series[0]; base_cash = cash_series[0]
-        base_cpltd = cpltd_series[0]; base_net_ppe = net_ppe_series[0]
-        base_depr = depr_series[0]; base_rev = revenue_series[0]; base_opex = opex_series[0]
-
-        proj_ca_list      = project_line(base_ca,      ca_growth,      projection_years)
-        proj_cl_list      = project_line(base_cl,      cl_growth,      projection_years)
-        proj_cash_list    = project_line(base_cash,    cash_growth,    projection_years)
-        proj_cpltd_list   = project_line(base_cpltd,   cpltd_growth,   projection_years)
-        proj_net_ppe_list = project_line(base_net_ppe, net_ppe_growth, projection_years)
-        proj_depr_list    = project_line(base_depr,    depr_growth,    projection_years)
-        proj_rev_list     = project_line(base_rev,     revenue_growth, projection_years)
-        proj_opex_list    = project_line(base_opex,    opex_growth,    projection_years)
-
-        projection_table = []
-        pv_fcffs = []
-        prev_wc = wc_series[0]
-
-        for year in range(projection_years):
-            idx = year
-            proj_ca      = proj_ca_list[idx]
-            proj_cl      = proj_cl_list[idx]
-            proj_csh     = proj_cash_list[idx]
-            proj_cpltd   = proj_cpltd_list[idx]
-            proj_net_ppe = proj_net_ppe_list[idx]
-            proj_depr    = proj_depr_list[idx]
-            proj_rev     = proj_rev_list[idx]
-            proj_opex    = proj_opex_list[idx]
-
-            proj_wc        = proj_ca - proj_cl - proj_csh - proj_cpltd
-            proj_delta_nwc = proj_wc - prev_wc
-            prev_wc        = proj_wc
-
-            prior_net_ppe = proj_net_ppe_list[idx - 1] if idx > 0 else base_net_ppe
-            proj_capex    = max(proj_net_ppe - prior_net_ppe + proj_depr, proj_depr)
-
-            proj_nop    = proj_rev - proj_opex
-            proj_nop_at = proj_nop * (1 - avg_tax_rate)
-            proj_fcff   = proj_nop_at - proj_delta_nwc - proj_capex
-            pv = proj_fcff / ((1 + wacc) ** (year + 1))
-
-            projection_table.append({
-                "year": f"Year {year + 1}",
-                "revenue": round(proj_rev, 2),
-                "operating_expenses": round(-proj_opex, 2),
-                "nop": round(proj_nop, 2),
-                "tax_rate": round(avg_tax_rate, 4),
-                "nop_after_tax": round(proj_nop_at, 2),
-                "delta_nwc": round(-proj_delta_nwc, 2),
-                "capex": round(-proj_capex, 2),
-                "fcff": round(proj_fcff, 2),
-                "pv_fcff": round(pv, 2),
-                "bs_ca": round(proj_ca, 2), "bs_cl": round(proj_cl, 2),
-                "bs_cash": round(proj_csh, 2), "bs_cpltd": round(proj_cpltd, 2),
-                "bs_net_ppe": round(proj_net_ppe, 2),
-                "bs_depreciation": round(proj_depr, 2),
-                "bs_wc": round(proj_wc, 2),
-            })
-            pv_fcffs.append(round(pv, 2))
-
-        total_pv_fcff = sum(pv_fcffs)
-
-        term_rev     = proj_rev_list[-1]  * (1 + terminal_growth_rate)
-        term_opex    = proj_opex_list[-1] * (1 + terminal_growth_rate)
-        term_ca      = rolling_avg_terminal(proj_ca_list)
-        term_cl      = rolling_avg_terminal(proj_cl_list)
-        term_cash    = rolling_avg_terminal(proj_cash_list)
-        term_cpltd   = rolling_avg_terminal(proj_cpltd_list)
-        term_net_ppe = rolling_avg_terminal(proj_net_ppe_list)
-        term_depr    = rolling_avg_terminal(proj_depr_list)
-        term_wc      = term_ca - term_cl - term_cash - term_cpltd
-        term_delta_nwc = term_wc - prev_wc
-        term_capex   = max(term_net_ppe - proj_net_ppe_list[-1] + term_depr, term_depr)
-        term_nop     = term_rev - term_opex
-        term_nop_at  = term_nop * (1 - avg_tax_rate)
-        term_fcff    = term_nop_at - term_delta_nwc - term_capex
-
-        terminal_year = {
-            "year": f"Year {projection_years + 1} (Terminal)",
-            "revenue": round(term_rev, 2),
-            "operating_expenses": round(-term_opex, 2),
-            "nop": round(term_nop, 2),
-            "tax_rate": round(avg_tax_rate, 4),
-            "nop_after_tax": round(term_nop_at, 2),
-            "delta_nwc": round(-term_delta_nwc, 2),
-            "capex": round(-term_capex, 2),
-            "fcff": round(term_fcff, 2),
-            "bs_ca": round(term_ca, 2), "bs_cl": round(term_cl, 2),
-            "bs_cash": round(term_cash, 2), "bs_cpltd": round(term_cpltd, 2),
-            "bs_net_ppe": round(term_net_ppe, 2),
-            "bs_depreciation": round(term_depr, 2),
-            "bs_wc": round(term_wc, 2),
-        }
-
-        terminal_value    = term_fcff / (wacc - terminal_growth_rate)
-        pv_terminal_value = terminal_value / ((1 + wacc) ** projection_years)
-        enterprise_value  = total_pv_fcff + pv_terminal_value
-
-        if use_fmp:
-            investments = 0.0
-            minority_interest = 0.0
-        else:
-            investments_row   = (find_row(balance_df, "long term investments") or find_row(balance_df, "investments"))
-            minority_row      = find_row(balance_df, "minority interest")
-            investments       = safe_float(balance_df, investments_row, 0) or 0.0
-            minority_interest = safe_float(balance_df, minority_row, 0) or 0.0
-
-        equity_value_dcf          = enterprise_value + total_cash + investments - total_debt - minority_interest
-        intrinsic_value_per_share = equity_value_dcf / shares_outstanding
-        intrinsic_value_with_mos  = intrinsic_value_per_share * (1 - margin_of_safety)
-
-        upside_pct = None
-        if current_price and current_price > 0:
-            upside_pct = ((intrinsic_value_per_share - current_price) / current_price) * 100
-
-        verdict = (
-            "Potentially Undervalued" if upside_pct is not None and upside_pct > 20
-            else "Potentially Overvalued" if upside_pct is not None and upside_pct < -20
-            else "Fairly Valued" if upside_pct is not None
-            else None
-        )
-
-        return {
-            "ticker": resolved, "market": market,
-            "data_source": "FMP" if use_fmp else "yfinance",
-            "current_price": current_price,
-            "derived_growth_rates": {
-                "revenue_growth": round(revenue_growth, 4),
-                "opex_growth":    round(opex_growth, 4),
-                "ca_growth":      round(ca_growth, 4),
-                "cl_growth":      round(cl_growth, 4),
-                "cash_growth":    round(cash_growth, 4),
-                "cpltd_growth":   round(cpltd_growth, 4),
-                "net_ppe_growth": round(net_ppe_growth, 4),
-                "depr_growth":    round(depr_growth, 4),
-                "terminal_growth": terminal_growth_rate,
-            },
-            "historical_years_used": display_years,
-            "avg_tax_rate_used":     round(avg_tax_rate, 4),
-            "wacc":                  round(wacc, 4),
-            "cost_of_equity":        round(cost_of_equity, 4),
-            "cost_of_debt":          round(cost_of_debt, 4),
-            "beta_used":             beta,
-            "projection_years":      projection_years,
-            "historical_table":      historical_table,
-            "projection_table":      projection_table,
-            "terminal_year":         terminal_year,
-            "pv_of_fcffs":           pv_fcffs,
-            "total_pv_fcff":         round(total_pv_fcff, 2),
-            "terminal_value":        round(terminal_value, 2),
-            "pv_terminal_value":     round(pv_terminal_value, 2),
-            "total_cash":            total_cash,
-            "investments":           round(investments, 2),
-            "total_debt":            total_debt,
-            "minority_interest":     round(minority_interest, 2),
-            "shares_outstanding":    shares_outstanding,
-            "enterprise_value":                     round(enterprise_value, 2),
-            "equity_value_dcf":                     round(equity_value_dcf, 2),
-            "intrinsic_value_per_share":             round(intrinsic_value_per_share, 2),
-            "intrinsic_value_with_margin_of_safety": round(intrinsic_value_with_mos, 2),
-            "margin_of_safety_used":                 margin_of_safety,
-            "upside_downside_pct":                   round(upside_pct, 2) if upside_pct is not None else None,
-            "verdict":                               verdict,
-        }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /reverse-dcf  — What growth rate does the current price imply?
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/reverse-dcf")
-def get_reverse_dcf(
-    ticker: str = Query(...),
-    market: str = Query("us"),
-    advanced: bool = Query(False),
-    risk_free_rate: float = Query(0.04),
-    market_return: float = Query(0.10),
-    terminal_growth_rate: float = Query(0.03),
-    projection_years: int = Query(5),
-):
-    """
-    Reverse DCF: given the current market price, solve for the implied
-    revenue growth rate that justifies it.
-    Uses binary search over growth_rate in [-10%, +100%].
-    """
-    try:
-        resolved, use_fmp = resolve_ticker(ticker, market, advanced)
-
-        if use_fmp:
-            info = get_fmp_profile(resolved)
-            if not info:
-                return {"error": f"FMP returned no data for {resolved}"}
-
-            current_price      = info.get("currentPrice")
-            shares_outstanding = info.get("sharesOutstanding")
-            beta               = info.get("beta") or 1.0
-            market_cap         = info.get("marketCap")
-            total_debt         = info.get("totalDebt") or 0
-            total_cash         = info.get("totalCash") or 0
-
-            # Pull latest income + cashflow statements
-            inc_list = get_fmp_income(resolved, 3)
-            cf_list  = get_fmp_cashflow(resolved, 1)
-
-            if not inc_list:
-                return {"error": f"FMP income data unavailable for {resolved}"}
-
-            inc0 = inc_list[0]
-            base_revenue = float(inc0.get("revenue") or 0)
-            cogs         = float(inc0.get("costOfRevenue") or 0)
-            sgna         = float(inc0.get("operatingExpenses") or 0)
-            base_opex    = (cogs + sgna) if (cogs + sgna) > 0 else float(inc0.get("costAndExpenses") or 0)
-
-            pretax   = float(inc0.get("incomeBeforeTax") or 0)
-            tax_prov = float(inc0.get("incomeTaxExpense") or 0)
-            avg_tax_rate = max(0.05, min(abs(tax_prov / pretax), 0.40)) if pretax != 0 else 0.25
-
-            cf0 = cf_list[0] if cf_list else {}
-            base_depr        = abs(float(cf0.get("depreciationAndAmortization") or 0))
-            base_capex_proxy = abs(float(cf0.get("capitalExpenditure") or 0)) or base_depr
-
-        else:
-            stock = yf.Ticker(resolved)
-            info  = stock.info
-            current_price      = info.get("currentPrice")
-            shares_outstanding = info.get("sharesOutstanding")
-            beta               = info.get("beta", 1.0) or 1.0
-            market_cap         = info.get("marketCap")
-            total_debt         = info.get("totalDebt", 0) or 0
-            total_cash         = info.get("totalCash", 0) or 0
-
-            income_df = stock.financials
-            cashflow_df = stock.cashflow
-
-            def find_row(df, *kw):
-                for idx in df.index:
-                    if all(k.lower() in idx.lower() for k in kw):
-                        return idx
-                return None
-
-            def sf(df, row, col=0):
-                if row is None: return None
-                try:
-                    v = df.loc[row].iloc[col]
-                    return float(v) if v is not None and str(v) != "nan" else None
-                except: return None
-
-            rev_row  = find_row(income_df, "total revenue") or find_row(income_df, "revenue")
-            opex_row = find_row(income_df, "total operating expenses") or find_row(income_df, "cost of revenue")
-            tax_row  = find_row(income_df, "tax", "provision")
-            pre_row  = find_row(income_df, "pretax")
-            depr_row = find_row(cashflow_df, "depreciation")
-
-            base_revenue = sf(income_df, rev_row) or 0
-            base_opex    = abs(sf(income_df, opex_row) or 0)
-            pretax_v     = sf(income_df, pre_row) or 0
-            tax_v        = sf(income_df, tax_row) or 0
-            avg_tax_rate = max(0.05, min(abs(tax_v / pretax_v), 0.40)) if pretax_v != 0 else 0.25
-            base_depr    = abs(sf(cashflow_df, depr_row) or 0)
-            base_capex_proxy = base_depr
-
-        if not current_price or not shares_outstanding or not base_revenue:
-            return {"error": "Insufficient data for Reverse DCF."}
-
-        # Use market_cap as the equity target (avoids shares_outstanding precision issues)
-        # Add back debt, subtract cash to get implied EV, then solve for growth
-        target_equity = market_cap if market_cap else (current_price * shares_outstanding if (current_price and shares_outstanding) else None)
-        if not target_equity or target_equity <= 0:
-            return {"error": "Cannot determine market cap — check ticker."}
-
-        # Guard: base_opex=0 causes div/zero in terminal formula
-        if base_revenue == 0:
-            return {"error": "Base revenue is zero — cannot run Reverse DCF."}
-        safe_base_opex = base_opex if base_opex > 0 else base_revenue * 0.6
-
-        cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
-        equity_val     = market_cap if market_cap else 1
-        debt_val       = total_debt if total_debt else equity_val * 0.2
-        total_capital  = equity_val + debt_val
-        wacc = (
-            (equity_val / total_capital) * cost_of_equity +
-            (debt_val   / total_capital) * 0.06 * (1 - avg_tax_rate)
-        )
-
-        if wacc <= terminal_growth_rate:
-            return {"error": "WACC must be greater than terminal growth rate."}
-
-        # target_equity already set above from market_cap — do NOT recompute here
-        def compute_equity_value(growth_rate: float) -> float:
-            """Returns equity value = EV + cash - debt"""
-            g = max(min(growth_rate, 1.0), -0.5)
-            pv_total  = 0.0
-            prev_rev  = base_revenue
-            prev_opex = safe_base_opex
-
-            for yr in range(1, projection_years + 1):
-                rev    = prev_rev  * (1 + g)
-                opex   = prev_opex * (1 + g * 0.9)  # opex grows slightly slower than revenue
-                nop_at = (rev - opex) * (1 - avg_tax_rate)
-                capex  = base_capex_proxy * (1 + g * 0.5)   # capex scales with growth
-                fcff   = nop_at - capex
-                pv_total += fcff / ((1 + wacc) ** yr)
-                prev_rev  = rev
-                prev_opex = opex
-
-            # Terminal value
-            term_rev   = prev_rev  * (1 + terminal_growth_rate)
-            term_opex  = prev_opex * (1 + terminal_growth_rate)
-            term_fcff  = (term_rev - term_opex) * (1 - avg_tax_rate) - base_capex_proxy
-            if wacc <= terminal_growth_rate:
-                tv = 0
-            else:
-                tv = term_fcff / (wacc - terminal_growth_rate)
-            pv_total += tv / ((1 + wacc) ** projection_years)
-
-            return pv_total + total_cash - total_debt
-
-        # Binary search: find growth_rate where compute_equity_value ≈ market_cap
-        lo, hi = -0.10, 1.50
-        implied_growth = None
-        for _ in range(80):
-            mid = (lo + hi) / 2
-            eq  = compute_equity_value(mid)
-            diff = eq - target_equity
-            if abs(diff) < target_equity * 0.0005:
-                implied_growth = mid
-                break
-            if eq < target_equity:
-                lo = mid
-            else:
-                hi = mid
-        if implied_growth is None:
-            implied_growth = (lo + hi) / 2
-
-        # Scenarios
-        scenarios = []
-        for label, g in [("Bear (-5%)", implied_growth - 0.05),
-                          ("Bear (-2%)", implied_growth - 0.02),
-                          ("Base (Implied)", implied_growth),
-                          ("Bull (+2%)", implied_growth + 0.02),
-                          ("Bull (+5%)", implied_growth + 0.05)]:
-            eq   = compute_equity_value(g)
-            ivps = eq / shares_outstanding if shares_outstanding else None
-            scenarios.append({
-                "scenario":             label,
-                "growth_rate":          round(g * 100, 2),
-                "implied_equity_value": round(eq, 0),
-                "intrinsic_per_share":  round(ivps, 2) if ivps else None,
-                "vs_current_price":     round(((ivps - current_price) / current_price) * 100, 1) if ivps and current_price else None,
-            })
-
-        interpretation = (
-            "The market is pricing in HIGH growth expectations — stock may be expensive unless growth materializes."
-            if implied_growth > 0.15 else
-            "The market expects MODERATE growth — fairly valued if historical growth continues."
-            if implied_growth > 0.05 else
-            "The market expects LOW or NO growth — potential value opportunity if business improves."
-        )
-
-        return {
-            "ticker":               resolved,
-            "market":               market,
-            "data_source":          "FMP" if use_fmp else "yfinance",
-            "current_price":        current_price,
-            "implied_growth_rate":  round(implied_growth * 100, 2),
-            "wacc_used":            round(wacc * 100, 2),
-            "terminal_growth_rate": round(terminal_growth_rate * 100, 2),
-            "projection_years":     projection_years,
-            "interpretation":       interpretation,
-            "scenarios":            scenarios,
-        }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /insider-transactions  — FMP for US, yfinance fallback for India
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/insider-transactions")
-def get_insider_transactions(
-    ticker: str = Query(...),
-    market: str = Query("us"),
-    limit: int = Query(20),
-):
-    try:
-        resolved, use_fmp = resolve_ticker(ticker, market, False)
-
-        # FMP insider trades
-        data = fmp_get(f"/insider-trading/{resolved}", {"limit": limit})
-        if not data or not isinstance(data, list):
-            # yfinance fallback
-            if not use_fmp:
-                stock = yf.Ticker(resolved)
-                holders = stock.insider_transactions
-                if holders is not None and not holders.empty:
-                    return {"source": "yfinance", "transactions": holders.to_dict(orient="records")}
-            return {"error": "No insider transaction data available."}
-
-        transactions = []
-        for t in data:
-            ttype = t.get("transactionType") or t.get("acquistionOrDisposition") or ""
-            transactions.append({
-                "date":               t.get("transactionDate") or t.get("filingDate"),
-                "insider_name":       t.get("reportingName") or t.get("reporterName"),
-                "title":              t.get("typeOfOwner") or t.get("reporterTitle"),
-                "transaction_type":   ttype,
-                "shares":             t.get("securitiesTransacted") or t.get("sharesTransacted"),
-                "price":              t.get("price"),
-                "value":              t.get("value") or (
-                    (t.get("securitiesTransacted") or 0) * (t.get("price") or 0)
-                ),
-                "shares_owned_after": t.get("securitiesOwned"),
-            })
-
-        # Summary stats
-        buys  = [t for t in transactions if "purchase" in (t.get("transaction_type") or "").lower() or "acquisition" in (t.get("transaction_type") or "").lower()]
-        sells = [t for t in transactions if "sale" in (t.get("transaction_type") or "").lower() or "disposition" in (t.get("transaction_type") or "").lower()]
-        buy_value  = sum(t.get("value") or 0 for t in buys)
-        sell_value = sum(t.get("value") or 0 for t in sells)
-
-        sentiment = "Bullish" if buy_value > sell_value * 1.5 else "Bearish" if sell_value > buy_value * 1.5 else "Neutral"
-
-        return {
-            "ticker":       resolved,
-            "source":       "FMP",
-            "total_transactions": len(transactions),
-            "buy_count":    len(buys),
-            "sell_count":   len(sells),
-            "total_buy_value":  round(buy_value, 0),
-            "total_sell_value": round(sell_value, 0),
-            "insider_sentiment": sentiment,
-            "transactions": transactions,
-        }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /institutional-holders  — FMP for all markets
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/institutional-holders")
-def get_institutional_holders(
-    ticker: str = Query(...),
-    market: str = Query("us"),
-    limit: int = Query(15),
-):
-    try:
-        resolved, _ = resolve_ticker(ticker, market, False)
-
-        data = fmp_get(f"/institutional-holder/{resolved}", {"limit": limit})
-        if not data or not isinstance(data, list):
-            return {"error": "No institutional holder data available from FMP."}
-
-        holders = []
-        for h in data:
-            holders.append({
-                "holder":          h.get("holder"),
-                "shares":          h.get("shares"),
-                "date_reported":   h.get("dateReported"),
-                "change":          h.get("change"),
-                "change_pct":      round(h.get("change") / h.get("shares") * 100, 2) if (h.get("shares") and h.get("shares") != 0 and h.get("change") is not None) else None,
-            })
-
-        total_shares = sum(h.get("shares") or 0 for h in holders)
-        net_change   = sum(h.get("change") or 0 for h in holders)
-
-        return {
-            "ticker":              resolved,
-            "source":              "FMP",
-            "top_holders_count":   len(holders),
-            "total_shares_held":   total_shares,
-            "net_institutional_change": net_change,
-            "institutional_trend": "Accumulating" if net_change > 0 else "Distributing",
-            "holders":             holders,
-        }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /analyst-targets  — FMP analyst price targets & recommendations
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/analyst-targets")
-def get_analyst_targets(
-    ticker: str = Query(...),
-    market: str = Query("us"),
-):
-    try:
-        resolved, _ = resolve_ticker(ticker, market, False)
-
-        # Price targets
-        targets_data = fmp_get(f"/price-target/{resolved}", {"limit": 20})
-        # Consensus
-        consensus_data = fmp_get(f"/analyst-stock-recommendations/{resolved}", {"limit": 10})
-        # Estimate summary
-        estimates_data = fmp_get(f"/analyst-estimates/{resolved}", {"limit": 4})
-
-        targets = []
-        if isinstance(targets_data, list):
-            for t in targets_data[:15]:
-                targets.append({
-                    "published_date": t.get("publishedDate"),
-                    "analyst_company": t.get("analystCompany"),
-                    "analyst":         t.get("analyst"),
-                    "price_target":    t.get("priceTarget"),
-                    "adj_price_target": t.get("adjPriceTarget"),
-                    "news_title":      t.get("newsTitle"),
-                })
-
-        # Aggregate consensus
-        all_targets = [t.get("price_target") for t in targets if t.get("price_target")]
-        consensus_target = round(sum(all_targets) / len(all_targets), 2) if all_targets else None
-
-        recommendations = []
-        if isinstance(consensus_data, list):
-            for r in consensus_data[:8]:
-                recommendations.append({
-                    "date":         r.get("date"),
-                    "strong_buy":   r.get("analystRatingsStrongBuy") or r.get("analystRatingsbuy") or 0,
-                    "buy":          r.get("analystRatingsBuy") or r.get("analystRatingsOverweight") or 0,
-                    "hold":         r.get("analystRatingsHold") or 0,
-                    "sell":         r.get("analystRatingsSell") or r.get("analystRatingsUnderweight") or 0,
-                    "strong_sell":  r.get("analystRatingsStrongSell") or 0,
-                })
-
-        # Latest recommendation tally
-        latest_rec = recommendations[0] if recommendations else {}
-        strong_buy  = latest_rec.get("strong_buy") or 0
-        buy         = latest_rec.get("buy") or 0
-        hold        = latest_rec.get("hold") or 0
-        sell        = latest_rec.get("sell") or 0
-        strong_sell = latest_rec.get("strong_sell") or 0
-        total_analysts = strong_buy + buy + hold + sell + strong_sell
-        bullish = strong_buy + buy
-        bearish = sell + strong_sell
-        consensus_rating = (
-            "Strong Buy" if strong_buy > total_analysts * 0.4 else
-            "Buy"        if bullish  > total_analysts * 0.5 else
-            "Hold"       if hold     > total_analysts * 0.4 else
-            "Sell"       if bearish  > total_analysts * 0.3 else
-            "N/A"
-        )
-
-        # EPS estimates
-        eps_estimates = []
-        if isinstance(estimates_data, list):
-            for e in estimates_data:
-                eps_estimates.append({
-                    "date":              e.get("date"),
-                    "estimated_eps_avg": e.get("estimatedEpsAverage"),
-                    "estimated_eps_low": e.get("estimatedEpsLow"),
-                    "estimated_eps_high": e.get("estimatedEpsHigh"),
-                    "estimated_revenue_avg": e.get("estimatedRevenueAverage"),
-                    "number_analysts_eps":   e.get("numberAnalystEstimatedEps"),
-                })
-
-        return {
-            "ticker":              resolved,
-            "source":              "FMP",
-            "consensus_price_target": consensus_target,
-            "total_price_targets": len(targets),
-            "consensus_rating":    consensus_rating,
-            "analyst_breakdown": {
-                "strong_buy": strong_buy, "buy": buy, "hold": hold,
-                "sell": sell, "strong_sell": strong_sell,
-                "total": total_analysts,
-            },
-            "price_targets":    targets,
-            "recommendations":  recommendations,
-            "eps_estimates":    eps_estimates,
-        }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /earnings-calendar  — earnings dates + surprise history via FMP
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/earnings-calendar")
-def get_earnings_calendar(
-    ticker: str = Query(...),
-    market: str = Query("us"),
-    limit: int = Query(8),
-):
-    try:
-        resolved, _ = resolve_ticker(ticker, market, False)
-
-        # Historical earnings surprises
-        hist_data = fmp_get(f"/historical/earning_calendar/{resolved}", {"limit": limit})
-        # Upcoming earnings — use from/to so we only get future dates
-        from datetime import date, timedelta
-        today = date.today().isoformat()
-        future = (date.today() + timedelta(days=90)).isoformat()
-        upcoming_data = fmp_get(f"/earning_calendar", {"from": today, "to": future, "symbol": resolved})
-        # Fallback: if parameterized call returns nothing, try the ticker-based endpoint
-        if not upcoming_data:
-            upcoming_data = fmp_get(f"/earning_calendar/{resolved}")
-
-        history = []
-        if isinstance(hist_data, list):
-            for e in hist_data:
-                actual  = e.get("eps")
-                est     = e.get("epsEstimated")
-                surprise_pct = None
-                if actual is not None and est and est != 0:
-                    surprise_pct = round(((actual - est) / abs(est)) * 100, 2)
-                beat = None
-                if actual is not None and est is not None:
-                    beat = actual >= est
-
-                history.append({
-                    "date":              e.get("date"),
-                    "eps_actual":        actual,
-                    "eps_estimated":     est,
-                    "surprise_pct":      surprise_pct,
-                    "beat":              beat,
-                    "revenue_actual":    e.get("revenue") or e.get("actualRevenue"),
-                    "revenue_estimated": e.get("revenueEstimated") or e.get("estimatedRevenue"),
-                    "fiscal_quarter":    e.get("period") or e.get("fiscalQuarter"),
-                    "time":              e.get("time"),
-                })
-
-        # Compute beat rate
-        beats = [h for h in history if h.get("beat") is True]
-        beat_rate = round(len(beats) / len(history) * 100, 1) if history else None
-        avg_surprise = None
-        surprises = [h["surprise_pct"] for h in history if h.get("surprise_pct") is not None]
-        if surprises:
-            avg_surprise = round(sum(surprises) / len(surprises), 2)
-
-        upcoming = []
-        if isinstance(upcoming_data, list):
-            for e in upcoming_data[:3]:
-                upcoming.append({
-                    "date":          e.get("date"),
-                    "eps_estimated": e.get("epsEstimated"),
-                    "time":          e.get("time"),
-                    "fiscal_quarter": e.get("period"),
-                })
-
-        return {
-            "ticker":           resolved,
-            "source":           "FMP",
-            "beat_rate_pct":    beat_rate,
-            "avg_eps_surprise_pct": avg_surprise,
-            "upcoming_earnings": upcoming,
-            "earnings_history":  history,
-        }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /screener  — yfinance for India, FMP for US
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/screener")
-def get_screener(
-    tickers: str = Query(...),
-    market: str = Query("us"),
-    min_pe: float = Query(None), max_pe: float = Query(None),
-    min_pb: float = Query(None), max_pb: float = Query(None),
-    min_roe: float = Query(None), max_roe: float = Query(None),
-    min_market_cap: float = Query(None), max_market_cap: float = Query(None),
-    min_de: float = Query(None), max_de: float = Query(None),
-    min_dividend_yield: float = Query(None), max_dividend_yield: float = Query(None),
-    min_eps: float = Query(None), max_eps: float = Query(None),
-    min_week_change: float = Query(None), max_week_change: float = Query(None),
-):
-    raw_tickers = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-    if not raw_tickers:
-        return {"error": "No valid tickers provided."}
-    if len(raw_tickers) > 50:
-        return {"error": "Maximum 50 tickers per request."}
-
-    results = []
-
-    for raw in raw_tickers:
-        resolved, use_fmp = resolve_ticker(raw, market, False)
-        try:
-            if use_fmp:
-                # Use raw FMP profile (no balance sheet call) to avoid 100 API calls for 50 tickers
-                raw = fmp_get(f"/profile/{resolved}")
-                raw0 = raw[0] if isinstance(raw, list) and raw else {}
-                current_price  = raw0.get("price")
-                pe_ratio       = raw0.get("pe")
-                pb_ratio       = raw0.get("priceToBookRatio")
-                roe            = raw0.get("roe")
-                market_cap     = raw0.get("mktCap")
-                de_ratio       = raw0.get("debtToEquityRatio")
-                dividend_yield = raw0.get("lastDiv")
-                eps            = raw0.get("eps")
-                week_change    = None  # FMP profile doesn't include 1-week change directly
-            else:
-                stock = yf.Ticker(resolved)
-                info  = stock.info
-                current_price  = info.get("currentPrice") or info.get("regularMarketPrice")
-                pe_ratio       = info.get("trailingPE")
-                pb_ratio       = info.get("priceToBook")
-                roe            = info.get("returnOnEquity")
-                market_cap     = info.get("marketCap")
-                de_ratio       = info.get("debtToEquity")
-                dividend_yield = info.get("dividendYield")
-                eps            = info.get("trailingEps")
-                week_change    = None
-                try:
-                    hist = stock.history(period="5d")
-                    if hist is not None and len(hist) >= 2:
-                        price_now  = float(hist["Close"].iloc[-1])
-                        price_prev = float(hist["Close"].iloc[0])
-                        if price_prev and price_prev != 0:
-                            week_change = ((price_now - price_prev) / price_prev) * 100
-                except Exception:
-                    pass
-
-            def in_range(val, mn, mx):
-                if val is None: return True
-                if mn is not None and val < mn: return False
-                if mx is not None and val > mx: return False
-                return True
-
-            passed = all([
-                in_range(pe_ratio,       min_pe,             max_pe),
-                in_range(pb_ratio,       min_pb,             max_pb),
-                in_range(roe,            min_roe,            max_roe),
-                in_range(market_cap,     min_market_cap,     max_market_cap),
-                in_range(de_ratio,       min_de,             max_de),
-                in_range(dividend_yield, min_dividend_yield, max_dividend_yield),
-                in_range(eps,            min_eps,            max_eps),
-                in_range(week_change,    min_week_change,    max_week_change),
-            ])
-
-            results.append({
-                "ticker":          resolved,
-                "data_source":     "FMP" if use_fmp else "yfinance",
-                "current_price":   current_price,
-                "pe_ratio":        round(pe_ratio, 2)       if pe_ratio       is not None else None,
-                "pb_ratio":        round(pb_ratio, 2)       if pb_ratio       is not None else None,
-                "roe":             round(roe, 4)             if roe            is not None else None,
-                "market_cap":      market_cap,
-                "de_ratio":        round(de_ratio, 2)       if de_ratio       is not None else None,
-                "dividend_yield":  round(dividend_yield, 4) if dividend_yield is not None else None,
-                "eps":             round(eps, 2)             if eps            is not None else None,
-                "week_change_pct": round(week_change, 2)    if week_change    is not None else None,
-                "passed_filters":  passed,
-            })
-
-        except Exception as e:
-            results.append({"ticker": resolved, "error": str(e), "passed_filters": False})
-
-    passed_count = sum(1 for r in results if r.get("passed_filters"))
-    return {
-        "market":            market,
-        "tickers_scanned":   len(results),
-        "passed_count":      passed_count,
-        "filters_applied": {
-            "pe": [min_pe, max_pe], "pb": [min_pb, max_pb],
-            "roe": [min_roe, max_roe], "market_cap": [min_market_cap, max_market_cap],
-            "de": [min_de, max_de], "dividend_yield": [min_dividend_yield, max_dividend_yield],
-            "eps": [min_eps, max_eps], "week_change_pct": [min_week_change, max_week_change],
-        },
-        "results": results,
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--cream);
+      color: var(--ink);
+      font-family: 'DM Sans', sans-serif;
+      font-weight: 300;
+      min-height: 100vh;
     }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /ipos  — unchanged (Indian IPOs via yfinance)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/ipos")
-def get_ipos():
-    results = []
-    IPOS = [
-        {"name": "ZOMATO",  "ticker": "ZOMATO.NS",  "ipo_price": 76,   "ipo_date": "2021-07-23"},
-        {"name": "PAYTM",   "ticker": "PAYTM.NS",   "ipo_price": 2150, "ipo_date": "2021-11-18"},
-    ]
-    for ipo in IPOS:
-        stock = yf.Ticker(ipo["ticker"])
-        info  = stock.info
-        current_price = info.get("currentPrice")
-        gain_pct = None
-        if current_price:
-            gain_pct = ((current_price - ipo["ipo_price"]) / ipo["ipo_price"]) * 100
-        results.append({
-            "name": ipo["name"], "ipo_date": ipo["ipo_date"],
-            "ipo_price": ipo["ipo_price"], "current_price": current_price,
-            "gain_pct": gain_pct,
-        })
-    return results
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /commodities  — unchanged
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/commodities")
-def get_commodities():
-    commodities = {
-        "Gold": "GC=F", "Silver": "SI=F",
-        "Crude Oil": "CL=F", "Natural Gas": "NG=F",
+    header {
+      background: var(--white);
+      border-bottom: 2px solid var(--ink);
+      padding: 0 40px;
+      display: flex;
+      align-items: stretch;
+      justify-content: space-between;
+      height: 64px;
     }
-    data = []
-    for name, ticker in commodities.items():
-        stock = yf.Ticker(ticker)
-        info  = stock.info
-        data.append({
-            "name": name,
-            "price": info.get("regularMarketPrice"),
-            "change": info.get("regularMarketChangePercent"),
-        })
-    return data
+    .header-left { display: flex; align-items: center; gap: 20px; }
+    .wordmark { font-family: 'Playfair Display', serif; font-weight: 900; font-size: 1.5rem; color: var(--ink); letter-spacing: -0.5px; }
+    .wordmark em { color: var(--accent); font-style: normal; }
+    .header-divider { width: 1px; background: var(--line); height: 30px; align-self: center; }
+    .header-tagline { font-size: 0.72rem; color: var(--muted); letter-spacing: 0.5px; font-weight: 400; }
+    .header-right { display: flex; align-items: center; gap: 6px; }
+    .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    .live-label { font-size: 0.7rem; color: var(--green); font-weight: 500; letter-spacing: 1px; text-transform: uppercase; }
 
+    .search-row {
+      background: var(--white);
+      border-bottom: 1px solid var(--line);
+      padding: 16px 40px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .ticker-input-wrap { flex: 1; min-width: 200px; position: relative; display: flex; align-items: center; }
+    .ticker-icon { position: absolute; left: 14px; color: var(--muted); font-size: 1rem; pointer-events: none; }
+    .ticker-input {
+      width: 100%;
+      padding: 10px 14px 10px 38px;
+      border: 1px solid var(--line);
+      border-radius: 2px;
+      font-family: 'DM Mono', monospace;
+      font-size: 0.95rem;
+      font-weight: 500;
+      color: var(--ink);
+      background: var(--cream);
+      outline: none;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      transition: border-color 0.15s;
+    }
+    .ticker-input:focus { border-color: var(--ink); background: var(--white); }
+    .ticker-input::placeholder { color: var(--muted); font-weight: 400; letter-spacing: 0.5px; text-transform: none; }
+    .market-select {
+      padding: 10px 14px;
+      border: 1px solid var(--line);
+      border-radius: 2px;
+      font-family: 'DM Sans', sans-serif;
+      font-size: 0.85rem;
+      color: var(--ink);
+      background: var(--cream);
+      outline: none;
+      cursor: pointer;
+    }
+    .btn-primary {
+      padding: 10px 24px;
+      background: var(--ink);
+      color: var(--white);
+      border: none;
+      border-radius: 2px;
+      font-family: 'DM Sans', sans-serif;
+      font-weight: 500;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-primary:hover { background: var(--accent); }
+    .btn-ghost {
+      padding: 10px 18px;
+      background: transparent;
+      color: var(--ink2);
+      border: 1px solid var(--line);
+      border-radius: 2px;
+      font-family: 'DM Sans', sans-serif;
+      font-weight: 400;
+      font-size: 0.82rem;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-ghost:hover { border-color: var(--ink); color: var(--ink); }
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  /ai-verdict  — with competitor comparison + all new data sources
-# ─────────────────────────────────────────────────────────────────────────────
+    .tab-row {
+      background: var(--white);
+      border-bottom: 1px solid var(--line);
+      padding: 0 40px;
+      display: flex;
+      overflow-x: auto;
+    }
+    .tab {
+      padding: 14px 22px;
+      font-size: 0.78rem;
+      font-weight: 500;
+      color: var(--muted);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      white-space: nowrap;
+      letter-spacing: 0.3px;
+      transition: all 0.15s;
+      margin-bottom: -1px;
+    }
+    .tab:hover { color: var(--ink); }
+    .tab.active { color: var(--ink); border-bottom-color: var(--accent); }
 
-class VerdictRequest(BaseModel):
-    ticker:     str
-    market:     str = "us"
-    dcf_result: dict
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
 
-@app.post("/ai-verdict")
-async def get_ai_verdict(request: VerdictRequest):
-    try:
-        ticker     = request.ticker.upper()
-        market     = request.market.lower()
-        dcf_result = request.dcf_result
+    .container { max-width: 1120px; margin: 0 auto; padding: 36px 40px; }
 
-        resolved, use_fmp = resolve_ticker(ticker, market, False)
+    .hero-row {
+      display: grid;
+      grid-template-columns: 2fr 1fr 1fr 1fr;
+      gap: 1px;
+      background: var(--line);
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      overflow: hidden;
+      margin-bottom: 28px;
+    }
+    .hero-stat { background: var(--white); padding: 20px 24px; }
+    .hero-stat.main { background: var(--ink); }
+    .hero-stat.main .h-label { color: rgba(255,255,255,0.45); }
+    .hero-stat.main .h-value { color: var(--white); font-size: 2rem; }
+    .hero-stat.main .h-sub { color: rgba(255,255,255,0.5); }
+    .h-label { font-size: 0.63rem; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+    .h-value { font-family: 'Playfair Display', serif; font-size: 1.5rem; font-weight: 700; color: var(--ink); line-height: 1.1; margin-bottom: 4px; }
+    .h-sub { font-size: 0.7rem; color: var(--muted); }
 
-        if not dcf_result:
-            return {"error": "DCF result is empty. Please run the DCF model first."}
-        if dcf_result.get("error"):
-            return {"error": f"DCF result has an error: {dcf_result['error']}"}
+    .verdict-strip {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 18px 24px; border-radius: 3px; margin-bottom: 24px; flex-wrap: wrap; gap: 12px;
+    }
+    .verdict-strip.buy  { background: var(--green-light); border-left: 4px solid var(--green); }
+    .verdict-strip.sell { background: var(--red-light);   border-left: 4px solid var(--red); }
+    .verdict-strip.hold { background: var(--blue-light);  border-left: 4px solid var(--blue); }
+    .verdict-main { font-family: 'Playfair Display', serif; font-size: 1.3rem; font-weight: 700; }
+    .verdict-strip.buy  .verdict-main { color: var(--green); }
+    .verdict-strip.sell .verdict-main { color: var(--red); }
+    .verdict-strip.hold .verdict-main { color: var(--blue); }
+    .verdict-sub { font-size: 0.75rem; color: var(--muted); margin-top: 3px; }
+    .verdict-pct { font-family: 'Playfair Display', serif; font-size: 2rem; font-weight: 900; }
+    .verdict-strip.buy  .verdict-pct { color: var(--green); }
+    .verdict-strip.sell .verdict-pct { color: var(--red); }
+    .verdict-strip.hold .verdict-pct { color: var(--blue); }
 
-        # ── Step 1: Company info ──────────────────────────────────────────────
-        if use_fmp:
-            profile      = get_fmp_profile(resolved)
-            company_name = profile.get("longName") or resolved
-            sector       = profile.get("sector", "Unknown")
-            industry     = profile.get("industry", "Unknown")
-            current_price = profile.get("currentPrice")
-        else:
-            stock         = yf.Ticker(resolved)
-            company_name  = stock.info.get("longName") or resolved
-            sector        = stock.info.get("sector", "Unknown")
-            industry      = stock.info.get("industry", "Unknown")
-            current_price = stock.info.get("currentPrice")
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 1px; background: var(--line);
+      border: 1px solid var(--line); border-radius: 3px; overflow: hidden; margin-bottom: 24px;
+    }
+    .metric { background: var(--white); padding: 16px 18px; transition: background 0.1s; }
+    .metric:hover { background: var(--cream); }
+    .m-label { font-size: 0.62rem; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 6px; }
+    .m-value { font-family: 'DM Mono', monospace; font-size: 1.02rem; font-weight: 500; color: var(--ink); }
+    .m-value.up   { color: var(--green); }
+    .m-value.down { color: var(--red); }
 
-        # ── Step 2: Fetch competitor data via FMP ─────────────────────────────
-        peers_data = fmp_get(f"/stock_peers/{resolved}")
-        # FMP /stock_peers returns a LIST: [{"symbol":"X","peersList":[...]}]
-        if isinstance(peers_data, list) and peers_data:
-            peer_list = peers_data[0].get("peersList", [])
-        elif isinstance(peers_data, dict):
-            peer_list = peers_data.get("peersList", [])
-        else:
-            peer_list = []
-        peer_list  = peer_list[:4]  # top 4 competitors
+    .section-label {
+      font-size: 0.63rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 2px; color: var(--muted); margin: 28px 0 14px;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .section-label::after { content: ''; flex: 1; height: 1px; background: var(--line); }
 
-        competitor_summaries = []
-        for peer in peer_list:
-            try:
-                # Lightweight: only fetch /profile, skip balance sheet for speed
-                p_data = fmp_get(f"/profile/{peer}")
-                if isinstance(p_data, list) and p_data:
-                    p = p_data[0]
-                    competitor_summaries.append(
-                        f"  {peer}: Price={p.get('price')}, "
-                        f"PE={p.get('pe')}, "
-                        f"MCap={p.get('mktCap')}, "
-                        f"ROE={p.get('roe')}"
-                    )
-            except Exception:
-                pass
+    .card { background: var(--white); border: 1px solid var(--line); border-radius: 3px; padding: 22px 26px; margin-bottom: 20px; }
+    .card-head {
+      font-size: 0.63rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 1.5px; color: var(--muted); margin-bottom: 18px;
+      padding-bottom: 12px; border-bottom: 1px solid var(--line);
+    }
 
-        competitors_text = "\n".join(competitor_summaries) if competitor_summaries else "  No peer data available"
+    .param-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 14px; margin-bottom: 20px; }
+    .param-group label { display: block; font-size: 0.62rem; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 6px; }
+    .param-group input, .param-group select {
+      width: 100%; padding: 9px 12px; border: 1px solid var(--line); border-radius: 2px;
+      font-family: 'DM Mono', monospace; font-size: 0.88rem; color: var(--ink);
+      background: var(--cream); outline: none; transition: border-color 0.15s;
+    }
+    .param-group input:focus, .param-group select:focus { border-color: var(--ink); background: var(--white); }
 
-        # ── Step 3: Analyst targets ───────────────────────────────────────────
-        targets_data = fmp_get(f"/price-target/{resolved}", {"limit": 5})
-        analyst_targets = []
-        if isinstance(targets_data, list):
-            for t in targets_data[:5]:
-                analyst_targets.append(
-                    f"  {t.get('analystCompany', 'N/A')}: Target ${t.get('priceTarget', 'N/A')}"
-                )
-        analyst_text = "\n".join(analyst_targets) if analyst_targets else "  No analyst targets available"
+    /* ── Screener specific ── */
+    .screener-filters {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .filter-group {
+      background: var(--cream);
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      padding: 14px 16px;
+    }
+    .filter-group .fg-label {
+      font-size: 0.62rem; font-weight: 600; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 10px;
+    }
+    .filter-range { display: flex; gap: 8px; align-items: center; }
+    .filter-range input {
+      flex: 1; padding: 7px 10px; border: 1px solid var(--line); border-radius: 2px;
+      font-family: 'DM Mono', monospace; font-size: 0.82rem; color: var(--ink);
+      background: var(--white); outline: none; min-width: 0;
+    }
+    .filter-range input:focus { border-color: var(--ink); }
+    .filter-range span { font-size: 0.72rem; color: var(--muted); flex-shrink: 0; }
 
-        # ── Step 4: Insider sentiment ─────────────────────────────────────────
-        insider_data   = fmp_get(f"/insider-trading/{resolved}", {"limit": 10})
-        insider_buys   = sum(1 for t in (insider_data or []) if any(x in (t.get("transactionType") or "").lower() for x in ["purchase","acquisition","buy"]))
-        insider_sells  = sum(1 for t in (insider_data or []) if any(x in (t.get("transactionType") or "").lower() for x in ["sale","disposition","sell"]))
-        insider_signal = "Bullish" if insider_buys > insider_sells else "Bearish" if insider_sells > insider_buys else "Neutral"
+    .screener-ticker-input {
+      width: 100%;
+      padding: 10px 14px;
+      border: 1px solid var(--line);
+      border-radius: 2px;
+      font-family: 'DM Mono', monospace;
+      font-size: 0.9rem;
+      color: var(--ink);
+      background: var(--cream);
+      outline: none;
+      letter-spacing: 1px;
+      margin-bottom: 20px;
+    }
+    .screener-ticker-input:focus { border-color: var(--ink); background: var(--white); }
 
-        # ── Step 5: Earnings surprise history ────────────────────────────────
-        earn_data = fmp_get(f"/historical/earning_calendar/{resolved}", {"limit": 4})
-        earn_lines = []
-        if isinstance(earn_data, list):
-            for e in earn_data[:4]:
-                actual = e.get("eps"); est = e.get("epsEstimated")
-                surprise = round(((actual - est) / abs(est)) * 100, 1) if actual and est and est != 0 else None
-                earn_lines.append(f"  {e.get('date')}: Actual EPS={actual}, Est={est}, Surprise={surprise}%")
-        earnings_text = "\n".join(earn_lines) if earn_lines else "  No earnings history available"
+    /* Screener results table */
+    .screener-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    .screener-table thead tr { border-bottom: 2px solid var(--ink); }
+    .screener-table th {
+      text-align: left; padding: 10px 12px;
+      font-size: 0.6rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.8px; color: var(--muted); white-space: nowrap;
+      cursor: pointer; user-select: none;
+    }
+    .screener-table th:hover { color: var(--ink); }
+    .screener-table td { padding: 10px 12px; border-bottom: 1px solid var(--line); font-family: 'DM Mono', monospace; white-space: nowrap; }
+    .screener-table td.lc { font-family: 'DM Sans', sans-serif; font-weight: 500; color: var(--ink); }
+    .screener-table tbody tr:hover td { background: var(--cream); }
+    .screener-table tbody tr:last-child td { border-bottom: none; }
+    .screener-table tbody tr.failed { opacity: 0.4; }
 
-        # ── Step 6: News ──────────────────────────────────────────────────────
-        news_items = []
-        try:
-            if use_fmp:
-                news_data = fmp_get(f"/stock_news", {"tickers": resolved, "limit": 8})
-                if isinstance(news_data, list):
-                    for item in news_data[:8]:
-                        title   = item.get("title", "")
-                        summary = (item.get("text", ""))[:200]
-                        source  = item.get("site", "")
-                        if title:
-                            news_items.append(f"- [{source}] {title}: {summary}")
-            else:
-                stock = yf.Ticker(resolved)
-                news  = stock.news or []
-                for item in news[:8]:
-                    if "content" in item and isinstance(item["content"], dict):
-                        inner   = item["content"]
-                        title   = inner.get("title", "")
-                        summary = (inner.get("summary", "") or "")[:250]
-                        source  = inner.get("provider", {}).get("displayName", "") if isinstance(inner.get("provider"), dict) else ""
-                    else:
-                        title   = item.get("title", "")
-                        summary = (item.get("summary", "") or "")[:250]
-                        source  = item.get("publisher", "")
-                    if title:
-                        news_items.append(f"- [{source}] {title}: {summary}")
-        except Exception:
-            pass
+    .badge-pass { display: inline-block; padding: 2px 8px; border-radius: 2px; font-size: 0.65rem; font-weight: 600; letter-spacing: 0.5px; background: var(--green-light); color: var(--green); }
+    .badge-fail { display: inline-block; padding: 2px 8px; border-radius: 2px; font-size: 0.65rem; font-weight: 600; letter-spacing: 0.5px; background: var(--red-light); color: var(--red); }
 
-        if not news_items:
-            try:
-                company_query = (company_name or resolved).replace(" ", "+")
-                rss_url = f"https://news.google.com/rss/search?q={company_query}+stock&hl=en&gl=IN&ceid=IN:en"
-                async with httpx.AsyncClient(timeout=10.0) as nc:
-                    rss_resp = await nc.get(rss_url)
-                if rss_resp.status_code == 200:
-                    titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", rss_resp.text)
-                    if not titles:
-                        titles = re.findall(r"<title>(.*?)</title>", rss_resp.text)
-                    for t in titles[1:6]:
-                        if t and len(t) > 10:
-                            news_items.append(f"- {t}")
-            except Exception:
-                pass
+    .screener-summary {
+      display: flex; gap: 24px; align-items: center;
+      padding: 14px 20px; background: var(--white);
+      border: 1px solid var(--line); border-radius: 3px;
+      margin-bottom: 16px; flex-wrap: wrap;
+    }
+    .screener-summary .ss-item { font-size: 0.78rem; color: var(--muted); }
+    .screener-summary .ss-item strong { color: var(--ink); font-weight: 500; }
 
-        if not news_items:
-            news_items = ["No recent news available."]
-        news_text = "\n".join(news_items)
+    .data-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    .data-table thead tr { border-bottom: 2px solid var(--ink); }
+    .data-table th { text-align: left; padding: 10px 14px; font-size: 0.62rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); white-space: nowrap; }
+    .data-table td { padding: 11px 14px; border-bottom: 1px solid var(--line); font-family: 'DM Mono', monospace; font-size: 0.82rem; }
+    .data-table td.lc { font-family: 'DM Sans', sans-serif; font-weight: 400; color: var(--ink2); }
+    .data-table tbody tr:hover td { background: var(--cream); }
+    .data-table tbody tr:last-child td { border-bottom: none; }
+    .nu { color: var(--green); }
+    .nd { color: var(--red); }
 
-        # ── Step 7: DCF metrics ───────────────────────────────────────────────
-        def fmt_num(n):
-            if n is None: return "N/A"
-            try:
-                n = float(n)
-                if abs(n) >= 1e12: return f"{n/1e12:.2f}T"
-                if abs(n) >= 1e9:  return f"{n/1e9:.2f}B"
-                if abs(n) >= 1e6:  return f"{n/1e6:.2f}M"
-                return f"{n:.2f}"
-            except: return str(n)
+    .sens-row { display: flex; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 3px; overflow: hidden; margin-top: 20px; }
+    .sens-cell { flex: 1; background: var(--white); padding: 16px 20px; text-align: center; }
+    .sens-cell.bear { background: var(--red-light); }
+    .sens-cell.base { background: var(--cream); }
+    .sens-cell.bull { background: var(--green-light); }
+    .sens-cell .s-label { font-size: 0.6rem; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+    .sens-cell .s-value { font-family: 'Playfair Display', serif; font-size: 1.3rem; font-weight: 700; }
+    .sens-cell.bear .s-value { color: var(--red); }
+    .sens-cell.base .s-value { color: var(--ink); }
+    .sens-cell.bull .s-value { color: var(--green); }
 
-        intrinsic     = dcf_result.get("intrinsic_value_per_share", "N/A")
-        intrinsic_mos = dcf_result.get("intrinsic_value_with_margin_of_safety", "N/A")
-        upside        = dcf_result.get("upside_downside_pct", "N/A")
-        wacc_raw      = dcf_result.get("wacc", "N/A")
-        wacc          = f"{float(wacc_raw)*100:.2f}%" if wacc_raw not in (None, "N/A") else "N/A"
-        verdict_dcf   = dcf_result.get("verdict", "N/A")
-        ev_raw        = dcf_result.get("enterprise_value", "N/A")
-        ev            = fmt_num(ev_raw) if ev_raw != "N/A" else "N/A"
-        avg_tax       = f"{float(dcf_result.get('avg_tax_rate_used', 0))*100:.2f}%" if dcf_result.get('avg_tax_rate_used') is not None else "N/A"
-        hist_years    = dcf_result.get("historical_years_used", "N/A")
-        mos_used      = dcf_result.get("margin_of_safety_used", "N/A")
+    /* ── AI Verdict ── */
+    .verdict-card {
+      background: var(--white);
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      padding: 24px 28px;
+      margin-bottom: 20px;
+    }
+    .verdict-card-head {
+      font-size: 0.63rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 1.5px; color: var(--muted);
+      margin-bottom: 14px; padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .verdict-badge {
+      display: inline-block; padding: 4px 12px; border-radius: 2px;
+      font-size: 0.75rem; font-weight: 600; letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+    .verdict-badge.strong-buy  { background: #edf7f2; color: #1a7a4a; }
+    .verdict-badge.buy         { background: #edf7f2; color: #1a7a4a; }
+    .verdict-badge.hold        { background: var(--blue-light); color: var(--blue); }
+    .verdict-badge.sell        { background: var(--red-light); color: var(--red); }
+    .verdict-badge.strong-sell { background: var(--red-light); color: var(--red); }
+    .verdict-badge.neutral     { background: var(--blue-light); color: var(--blue); }
+    .confidence-dot {
+      display: inline-block; width: 8px; height: 8px;
+      border-radius: 50%; margin-right: 6px;
+    }
+    .conf-high   { background: var(--green); }
+    .conf-medium { background: #f59e0b; }
+    .conf-low    { background: var(--red); }
+    .verdict-summary {
+      font-size: 0.95rem; line-height: 1.7; color: var(--ink2);
+      margin-bottom: 20px; font-weight: 300;
+    }
+    .verdict-two-col {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;
+    }
+    @media (max-width: 700px) { .verdict-two-col { grid-template-columns: 1fr; } }
+    .verdict-box {
+      padding: 16px 18px; border-radius: 3px; border: 1px solid var(--line);
+    }
+    .verdict-box.bull { background: var(--green-light); border-color: #a7d9bc; }
+    .verdict-box.bear { background: var(--red-light);   border-color: #f0b8a8; }
+    .verdict-box-title {
+      font-size: 0.62rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 1px; margin-bottom: 10px;
+    }
+    .verdict-box.bull .verdict-box-title { color: var(--green); }
+    .verdict-box.bear .verdict-box-title { color: var(--red); }
+    .verdict-box p { font-size: 0.82rem; line-height: 1.65; color: var(--ink2); }
+    .guidance-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px; margin-bottom: 20px;
+    }
+    .guidance-item {
+      padding: 14px 16px; background: var(--cream);
+      border: 1px solid var(--line); border-radius: 3px;
+    }
+    .guidance-item .g-label {
+      font-size: 0.6rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.8px; color: var(--muted); margin-bottom: 6px;
+    }
+    .guidance-item .g-value {
+      font-size: 0.82rem; color: var(--ink2); line-height: 1.5;
+    }
+    .news-list { list-style: none; padding: 0; }
+    .news-list li {
+      padding: 10px 0; border-bottom: 1px solid var(--line);
+      font-size: 0.82rem; color: var(--ink2); line-height: 1.5;
+    }
+    .news-list li:last-child { border-bottom: none; }
+    .news-list li::before { content: "→ "; color: var(--accent); font-weight: 600; }
+    .sentiment-tag {
+      display: inline-block; padding: 3px 10px; border-radius: 2px;
+      font-size: 0.65rem; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;
+    }
+    .sentiment-tag.positive { background: var(--green-light); color: var(--green); }
+    .sentiment-tag.neutral  { background: var(--blue-light);  color: var(--blue); }
+    .sentiment-tag.negative { background: var(--red-light);   color: var(--red); }
 
-        gr         = dcf_result.get("derived_growth_rates", {})
-        rev_growth = gr.get("revenue_growth", 0)
-        opex_growth = gr.get("opex_growth", 0)
-        term_growth = gr.get("terminal_growth", 0)
+    .state-empty { padding: 56px 0; text-align: center; color: var(--muted); font-size: 0.85rem; line-height: 1.8; }
+    .state-empty .icon { font-family: 'Playfair Display', serif; font-size: 3rem; color: var(--line); display: block; margin-bottom: 10px; }
+    .loading-state { padding: 32px 0; color: var(--muted); font-size: 0.82rem; display: flex; align-items: center; gap: 10px; }
+    .spinner { width: 16px; height: 16px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error-state { color: var(--red); font-size: 0.82rem; padding: 20px 0; }
 
-        hist = dcf_result.get("historical_table", [])
-        hist_lines = [
-            f"  {r.get('year')}: Revenue={fmt_num(r.get('revenue'))}, NOP After Tax={fmt_num(r.get('nop_after_tax'))}, CapEx={fmt_num(r.get('capex'))}, FCFF={fmt_num(r.get('fcff'))}"
-            for r in hist[:4]
-        ]
-        hist_summary = "\n".join(hist_lines) if hist_lines else "  Not available"
+    @media (max-width: 700px) {
+      header, .search-row, .tab-row { padding-left: 16px; padding-right: 16px; }
+      .container { padding: 20px 16px; }
+      .hero-row { grid-template-columns: 1fr 1fr; }
+      .hero-stat.main { grid-column: 1 / -1; }
+      .header-tagline { display: none; }
+      .rdcf-scenario { flex-direction: column; }
+    }
 
-        proj = dcf_result.get("projection_table", [])
-        proj_lines = [
-            f"  {r.get('year')}: Revenue={fmt_num(r.get('revenue'))}, FCFF={fmt_num(r.get('fcff'))}, PV={fmt_num(r.get('pv_fcff'))}"
-            for r in proj[:3]
-        ]
-        proj_summary = "\n".join(proj_lines) if proj_lines else "  Not available"
+    /* ── Advanced Mode toggle ── */
+    .adv-toggle {
+      display: flex; align-items: center; gap: 8px;
+      padding: 7px 14px; border: 1px solid var(--line); border-radius: 2px;
+      font-size: 0.78rem; color: var(--muted); cursor: pointer;
+      background: var(--cream); transition: all 0.15s; white-space: nowrap;
+      user-select: none;
+    }
+    .adv-toggle.active { background: #1a1814; color: #fff; border-color: #1a1814; }
+    .adv-toggle .adv-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink:0; }
+    .adv-toggle.active .adv-dot { background: var(--accent); }
 
-        term = dcf_result.get("terminal_year", {})
-        term_summary = (
-            f"  {term.get('year')}: Revenue={fmt_num(term.get('revenue'))}, FCFF={fmt_num(term.get('fcff'))}"
-        ) if term else "  Not available"
+    /* ── Competitor cards ── */
+    .comp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .comp-card { background: var(--cream); border: 1px solid var(--line); border-radius: 3px; padding: 14px 16px; }
+    .comp-card .cc-ticker { font-family: 'DM Mono', monospace; font-weight: 600; font-size: 0.9rem; color: var(--ink); margin-bottom: 8px; }
+    .comp-card .cc-row { display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--muted); margin-bottom: 4px; }
+    .comp-card .cc-row span:last-child { color: var(--ink); font-family: 'DM Mono', monospace; }
 
-        # ── Step 8: Build prompt ──────────────────────────────────────────────
-        prompt = f"""You are a senior equity research analyst. Provide a rigorous investment analysis for {company_name} ({resolved}) in the {sector} sector ({industry}).
+    /* ── Insider bar ── */
+    .insider-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; margin: 8px 0 4px; }
+    .insider-bar .buy-fill  { background: var(--green); }
+    .insider-bar .sell-fill { background: var(--red); }
+    .insider-label { display: flex; justify-content: space-between; font-size: 0.7rem; color: var(--muted); }
 
-═══ DCF VALUATION OUTPUT ═══
-Current Market Price:     {current_price}
-Intrinsic Value (DCF):    {intrinsic}
-Intrinsic Value (w/ MOS): {intrinsic_mos}  [MOS used: {mos_used}]
-Upside / Downside:        {upside}%
-WACC:                     {wacc}
-Enterprise Value:         {ev}
-DCF Model Signal:         {verdict_dcf}
-Historical Years Used:    {hist_years}
-Avg Effective Tax Rate:   {avg_tax}
-Revenue Growth:    {round(float(rev_growth or 0)*100,1)}%
-OpEx Growth:       {round(float(opex_growth or 0)*100,1)}%
-Terminal Growth:   {round(float(term_growth or 0)*100,1)}%
+    /* ── Earnings beat badge ── */
+    .earn-beat { display: inline-block; padding: 2px 7px; border-radius: 2px; font-size: 0.65rem; font-weight: 600; }
+    .earn-beat.yes { background: var(--green-light); color: var(--green); }
+    .earn-beat.no  { background: var(--red-light);   color: var(--red); }
 
-Historical FCFF:
-{hist_summary}
+    /* ── Reverse DCF scenarios ── */
+    .rdcf-scenario { display: flex; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 3px; overflow: hidden; margin-bottom: 20px; }
+    .rdcf-cell { flex: 1; padding: 16px 12px; text-align: center; background: var(--white); }
+    .rdcf-cell.implied { background: var(--cream); }
+    .rdcf-cell .rs-label { font-size: 0.58rem; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+    .rdcf-cell .rs-growth { font-family: 'Playfair Display', serif; font-size: 1.2rem; font-weight: 700; color: var(--ink); }
+    .rdcf-cell .rs-price { font-family: 'DM Mono', monospace; font-size: 0.8rem; color: var(--ink2); margin-top: 4px; }
+    .rdcf-cell .rs-vs { font-size: 0.68rem; margin-top: 2px; }
+  </style>
+</head>
+<body>
 
-Projected FCFF (Years 1-3):
-{proj_summary}
+<header>
+  <div class="header-left">
+    <div class="wordmark">MiniTrade<em>IQ</em></div>
+    <div class="header-divider"></div>
+    <div class="header-tagline">Intelligent Valuation · AI-Powered Analysis</div>
+  </div>
+  <div class="header-right">
+    <div class="live-dot"></div>
+    <div class="live-label">Live</div>
+  </div>
+</header>
 
-Terminal Year:
-{term_summary}
+<div class="search-row">
+  <div class="ticker-input-wrap">
+    <span class="ticker-icon">⌕</span>
+    <input class="ticker-input" type="text" id="ticker" placeholder="Enter ticker — AAPL, RELIANCE, TSLA..."/>
+  </div>
+  <select class="market-select" id="market">
+    <option value="us">🇺🇸 US Markets</option>
+    <option value="india">🇮🇳 India (NSE)</option>
+  </select>
+  <button class="btn-primary" onclick="runValuation()">Analyze</button>
+  <button class="btn-ghost" onclick="runDCF()">⚡ DCF Model</button>
+  <button class="btn-ghost" onclick="runFinancials()">📊 Financials</button>
+  <div class="adv-toggle" id="adv-toggle" onclick="toggleAdvanced()" title="Advanced mode: uses FMP for all markets including Indian stocks">
+    <div class="adv-dot"></div>
+    <span id="adv-label">Standard</span>
+  </div>
+</div>
 
-═══ COMPETITORS ═══
-{competitors_text}
+<div class="tab-row">
+  <div class="tab active" onclick="switchTab('valuation',this)">Overview</div>
+  <div class="tab" onclick="switchTab('dcf',this)">DCF Valuation</div>
+  <div class="tab" onclick="switchTab('financials',this)">Financials</div>
+  <div class="tab" onclick="switchTab('screener',this)">Screener</div>
+  <div class="tab" onclick="switchTab('verdict',this)">⚡ AI Verdict</div>
+  <div class="tab" onclick="switchTab('reverse-dcf',this)">Reverse DCF</div>
+  <div class="tab" onclick="switchTab('insider',this)">Insider</div>
+  <div class="tab" onclick="switchTab('analyst',this)">Analyst Targets</div>
+  <div class="tab" onclick="switchTab('earnings',this)">Earnings</div>
+  <div class="tab" onclick="switchTab('ipos',this)">IPO Tracker</div>
+  <div class="tab" onclick="switchTab('commodities',this)">Commodities</div>
+</div>
 
-═══ ANALYST PRICE TARGETS ═══
-{analyst_text}
+<!-- VALUATION TAB -->
+<div id="tab-valuation" class="tab-content active">
+  <div class="container">
+    <div id="valuation-results">
+      <div class="state-empty"><span class="icon">↗</span>Enter a ticker above and click <strong>Analyze</strong> to begin.</div>
+    </div>
+  </div>
+</div>
 
-═══ INSIDER ACTIVITY (last 10 trades) ═══
-Buys: {insider_buys} | Sells: {insider_sells} | Signal: {insider_signal}
+<!-- DCF TAB -->
+<div id="tab-dcf" class="tab-content">
+  <div class="container">
+    <div class="card">
+      <div class="card-head">Model Parameters</div>
+      <div class="param-grid">
+        <div class="param-group"><label>Projection Years</label><input type="number" id="dcf-years" value="5" min="1" max="10"/></div>
+        <div class="param-group"><label>Terminal Growth Rate</label><input type="number" id="dcf-terminal" value="0.03" step="0.01"/></div>
+        <div class="param-group"><label>Risk-Free Rate</label><input type="number" id="dcf-rf" value="0.04" step="0.01"/></div>
+        <div class="param-group"><label>Market Return</label><input type="number" id="dcf-mr" value="0.10" step="0.01"/></div>
+        <div class="param-group"><label>Margin of Safety</label><input type="number" id="dcf-mos" value="0.25" step="0.05"/></div>
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);margin-bottom:16px;padding:10px 14px;background:var(--cream);border-radius:2px;border:1px solid var(--line)">
+        💡 <strong>India (NSE)</strong> defaults: Risk-Free Rate <strong>0.07</strong>, Market Return <strong>0.13</strong> &nbsp;·&nbsp;
+        <strong>US</strong> defaults: Risk-Free Rate <strong>0.04</strong>, Market Return <strong>0.10</strong> &nbsp;·&nbsp;
+        Parameters auto-update when you switch market above.
+      </div>
+      <button class="btn-primary" onclick="runDCF()">Run DCF Model</button>
+    </div>
+    <div id="dcf-results">
+      <div class="state-empty"><span class="icon">∫</span>Configure parameters and run the model.</div>
+    </div>
+  </div>
+</div>
 
-═══ EARNINGS SURPRISE HISTORY ═══
-{earnings_text}
+<!-- FINANCIALS TAB -->
+<div id="tab-financials" class="tab-content">
+  <div class="container">
+    <div id="financials-results">
+      <div class="state-empty"><span class="icon">≡</span>Click <strong>Financials</strong> or enter a ticker to load data.</div>
+    </div>
+  </div>
+</div>
 
-═══ RECENT NEWS ═══
-{news_text}
+<!-- SCREENER TAB -->
+<div id="tab-screener" class="tab-content">
+  <div class="container">
+    <div class="card">
+      <div class="card-head">Stock Screener</div>
 
-═══ INSTRUCTIONS ═══
-Respond ONLY with a valid JSON object. No preamble, no markdown. Pure JSON only.
+      <label style="font-size:0.62rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;display:block;margin-bottom:6px;">
+        Tickers to Screen (comma-separated)
+      </label>
+      <input class="screener-ticker-input" type="text" id="screener-tickers"
+        placeholder="e.g. AAPL, MSFT, TSLA, GOOGL, AMZN  or  RELIANCE, TCS, INFY"/>
 
-{{
-  "verdict": "one of: Strong Buy / Buy / Hold / Sell / Strong Sell",
-  "confidence": "one of: High / Medium / Low",
-  "summary": "3-4 sentence plain English investment thesis mentioning valuation, growth, and key risk",
-  "bull_case": "3 specific bullish arguments referencing actual numbers",
-  "bear_case": "3 specific bearish arguments referencing actual numbers",
-  "competitor_analysis": "2-3 sentences: how does {resolved} compare to peers on valuation and growth? Is it cheaper or more expensive than peers? Any competitive moat?",
-  "management_guidance": {{
-    "capex": "CapEx guidance from news or N/A",
-    "revenue": "Revenue growth guidance from news or N/A",
-    "expansion": "Any expansion or strategic plans from news or N/A"
-  }},
-  "model_vs_reality": "2 sentences: how do DCF assumptions compare to analyst targets and what the market expects?",
-  "insider_read": "1 sentence: what does insider activity signal about management confidence?",
-  "earnings_track_record": "1 sentence: summarize earnings beat/miss history and what it implies",
-  "news_sentiment": "one of: Positive / Neutral / Negative",
-  "recent_headlines": ["headline 1", "headline 2", "headline 3"],
-  "key_risks": ["specific risk 1", "specific risk 2", "specific risk 3"],
-  "analyst_note": "One actionable sentence: what specific metric or event should investors watch next quarter?"
-}}"""
+      <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
+        <div class="param-group" style="margin:0">
+          <label>Market</label>
+          <select id="screener-market">
+            <option value="us">🇺🇸 US</option>
+            <option value="india">🇮🇳 India (NSE)</option>
+          </select>
+        </div>
+        <div style="display:flex;gap:8px;align-items:flex-end">
+          <button class="btn-primary" onclick="runScreener()">Run Screener</button>
+          <button class="btn-ghost" onclick="clearScreenerFilters()">Clear Filters</button>
+        </div>
+      </div>
 
-        # ── Step 9: Call Groq ─────────────────────────────────────────────────
-        if not GROQ_API_KEY:
-            return {"error": "GROQ_API_KEY environment variable not set on server."}
+      <div class="section-label">Filters <span style="font-size:0.6rem;color:var(--muted);letter-spacing:0;text-transform:none;font-weight:400">&nbsp;— leave blank to skip</span></div>
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "max_tokens": 1800,
-                    "messages": [
-                        {"role": "system", "content": "You are a senior equity research analyst. Always respond with valid JSON only. No preamble, no markdown, no explanation outside the JSON object."},
-                        {"role": "user",   "content": prompt},
-                    ],
-                    "temperature": 0.3,
-                    "response_format": {"type": "json_object"},
-                },
-            )
+      <div class="screener-filters">
+        <div class="filter-group">
+          <div class="fg-label">P/E Ratio</div>
+          <div class="filter-range">
+            <input type="number" id="f-pe-min" placeholder="Min"/>
+            <span>–</span>
+            <input type="number" id="f-pe-max" placeholder="Max"/>
+          </div>
+        </div>
+        <div class="filter-group">
+          <div class="fg-label">P/B Ratio</div>
+          <div class="filter-range">
+            <input type="number" id="f-pb-min" placeholder="Min"/>
+            <span>–</span>
+            <input type="number" id="f-pb-max" placeholder="Max"/>
+          </div>
+        </div>
+        <div class="filter-group">
+          <div class="fg-label">ROE (%)</div>
+          <div class="filter-range">
+            <input type="number" id="f-roe-min" placeholder="Min"/>
+            <span>–</span>
+            <input type="number" id="f-roe-max" placeholder="Max"/>
+          </div>
+        </div>
+        <div class="filter-group">
+          <div class="fg-label">Market Cap (B)</div>
+          <div class="filter-range">
+            <input type="number" id="f-mc-min" placeholder="Min"/>
+            <span>–</span>
+            <input type="number" id="f-mc-max" placeholder="Max"/>
+          </div>
+        </div>
+        <div class="filter-group">
+          <div class="fg-label">D/E Ratio</div>
+          <div class="filter-range">
+            <input type="number" id="f-de-min" placeholder="Min"/>
+            <span>–</span>
+            <input type="number" id="f-de-max" placeholder="Max"/>
+          </div>
+        </div>
+        <div class="filter-group">
+          <div class="fg-label">Dividend Yield (%)</div>
+          <div class="filter-range">
+            <input type="number" id="f-dy-min" placeholder="Min"/>
+            <span>–</span>
+            <input type="number" id="f-dy-max" placeholder="Max"/>
+          </div>
+        </div>
+        <div class="filter-group">
+          <div class="fg-label">EPS</div>
+          <div class="filter-range">
+            <input type="number" id="f-eps-min" placeholder="Min"/>
+            <span>–</span>
+            <input type="number" id="f-eps-max" placeholder="Max"/>
+          </div>
+        </div>
+        <div class="filter-group">
+          <div class="fg-label">1-Week Move (%)</div>
+          <div class="filter-range">
+            <input type="number" id="f-wk-min" placeholder="Min"/>
+            <span>–</span>
+            <input type="number" id="f-wk-max" placeholder="Max"/>
+          </div>
+        </div>
+      </div>
+    </div>
 
-        if response.status_code != 200:
-            return {"error": f"Groq API error {response.status_code}: {response.text[:300]}"}
+    <div id="screener-results">
+      <div class="state-empty"><span class="icon">⊞</span>Enter tickers and click <strong>Run Screener</strong>.</div>
+    </div>
+  </div>
+</div>
 
-        raw     = response.json()
-        ai_text = raw.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+<!-- AI VERDICT TAB -->
+<div id="tab-verdict" class="tab-content">
+  <div class="container">
+    <div class="card">
+      <div class="card-head">AI Verdict</div>
+      <div id="verdict-dcf-status" style="font-size:0.78rem;color:var(--muted);margin-bottom:16px;padding:12px 16px;background:var(--cream);border-radius:2px;border:1px solid var(--line)">
+        ⚠ No DCF results yet — run DCF model first on the <strong>DCF Valuation</strong> tab
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);margin-bottom:16px;padding:10px 14px;background:var(--cream);border-radius:2px;border:1px solid var(--line)">
+        💡 Uses <strong>your DCF assumptions</strong> — adjust parameters on the DCF tab first, then generate verdict here. Takes 15-30 seconds.
+      </div>
+      <button class="btn-primary" onclick="runVerdict()">Generate AI Verdict</button>
+    </div>
+    <div id="verdict-results">
+      <div class="state-empty"><span class="icon">⚡</span>Enter a ticker above and click <strong>Generate AI Verdict</strong>.</div>
+    </div>
+  </div>
+</div>
 
-        try:
-            clean = ai_text
-            if "```" in clean:
-                for part in clean.split("```"):
-                    stripped = part.strip()
-                    if stripped.startswith("json"):
-                        stripped = stripped[4:].strip()
-                    if stripped.startswith("{"):
-                        clean = stripped
-                        break
-            start = clean.find("{"); end = clean.rfind("}") + 1
-            if start != -1 and end > start:
-                clean = clean[start:end]
-            ai_verdict = json.loads(clean)
-        except Exception:
-            ai_verdict = {
-                "verdict": "Analysis Complete", "confidence": "Medium",
-                "summary": ai_text[:500], "parse_error": True, "raw_response": ai_text,
-            }
+<!-- REVERSE DCF TAB -->
+<div id="tab-reverse-dcf" class="tab-content">
+  <div class="container">
+    <div class="card">
+      <div class="card-head">Reverse DCF — What Growth Rate Is The Market Pricing In?</div>
+      <div style="font-size:0.72rem;color:var(--muted);margin-bottom:16px;padding:10px 14px;background:var(--cream);border-radius:2px;border:1px solid var(--line)">
+        💡 Enter a ticker above, then click <strong>Run Reverse DCF</strong>. The model solves backwards from the current stock price to find the implied revenue growth rate.
+      </div>
+      <div class="param-grid" style="margin-bottom:16px">
+        <div class="param-group"><label>Risk-Free Rate</label><input type="number" id="rdcf-rf" value="0.04" step="0.01"/></div>
+        <div class="param-group"><label>Market Return</label><input type="number" id="rdcf-mr" value="0.10" step="0.01"/></div>
+        <div class="param-group"><label>Terminal Growth Rate</label><input type="number" id="rdcf-tg" value="0.03" step="0.01"/></div>
+        <div class="param-group"><label>Projection Years</label><input type="number" id="rdcf-yrs" value="5" min="1" max="10"/></div>
+      </div>
+      <button class="btn-primary" onclick="runReverseDCF()">Run Reverse DCF</button>
+    </div>
+    <div id="rdcf-results">
+      <div class="state-empty"><span class="icon">⟳</span>Enter a ticker and run the model.</div>
+    </div>
+  </div>
+</div>
 
-        return {
-            "ticker":        resolved,
-            "company_name":  company_name,
-            "sector":        sector,
-            "industry":      industry,
-            "current_price": current_price,
-            "data_source":   "FMP" if use_fmp else "yfinance",
-            "ai_verdict":    ai_verdict,
-            "news_fed":      news_items[:5],
-            "competitors_analyzed": peer_list,
+<!-- INSIDER TAB -->
+<div id="tab-insider" class="tab-content">
+  <div class="container">
+    <div class="card" style="margin-bottom:0">
+      <div class="card-head">Insider Transactions & Institutional Holdings</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn-primary" onclick="loadInsider()">Load Insider Data</button>
+        <button class="btn-ghost" onclick="loadInstitutional()">Load Institutional Holdings</button>
+      </div>
+    </div>
+    <div id="insider-results" style="margin-top:20px">
+      <div class="state-empty"><span class="icon">👤</span>Enter a ticker above and click Load Insider Data.</div>
+    </div>
+    <div id="institutional-results" style="margin-top:20px"></div>
+  </div>
+</div>
+
+<!-- ANALYST TAB -->
+<div id="tab-analyst" class="tab-content">
+  <div class="container">
+    <div class="card" style="margin-bottom:0">
+      <div class="card-head">Analyst Price Targets & Recommendations</div>
+      <button class="btn-primary" onclick="loadAnalyst()">Load Analyst Data</button>
+    </div>
+    <div id="analyst-results" style="margin-top:20px">
+      <div class="state-empty"><span class="icon">🎯</span>Enter a ticker above and click Load Analyst Data.</div>
+    </div>
+  </div>
+</div>
+
+<!-- EARNINGS TAB -->
+<div id="tab-earnings" class="tab-content">
+  <div class="container">
+    <div class="card" style="margin-bottom:0">
+      <div class="card-head">Earnings Calendar & Surprise History</div>
+      <button class="btn-primary" onclick="loadEarnings()">Load Earnings Data</button>
+    </div>
+    <div id="earnings-results" style="margin-top:20px">
+      <div class="state-empty"><span class="icon">📅</span>Enter a ticker above and click Load Earnings Data.</div>
+    </div>
+  </div>
+</div>
+
+<!-- IPO TAB -->
+<div id="tab-ipos" class="tab-content">
+  <div class="container">
+    <div class="card">
+      <div class="card-head">IPO Performance — Since Listing</div>
+      <div id="ipo-results"><div class="loading-state"><div class="spinner"></div> Loading IPO data...</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- COMMODITIES TAB -->
+<div id="tab-commodities" class="tab-content">
+  <div class="container">
+    <div class="card">
+      <div class="card-head">Commodity Spot Prices</div>
+      <div id="commodity-results"><div class="loading-state"><div class="spinner"></div> Loading commodity data...</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const BASE = "https://minicapitaliq-dg.onrender.com";
+  let dcfCache = null;   // stores full DCF result for AI Verdict
+
+  function fmt(n, d=2) {
+    if (n === null || n === undefined || isNaN(n)) return "—";
+    const abs = Math.abs(n);
+    if (abs >= 1e12) return (n/1e12).toFixed(d) + "T";
+    if (abs >= 1e9)  return (n/1e9).toFixed(d)  + "B";
+    if (abs >= 1e6)  return (n/1e6).toFixed(d)  + "M";
+    return Number(n).toFixed(d);
+  }
+  function fmtPct(n, d=2) {
+    if (n === null || n === undefined || isNaN(n)) return "—";
+    return Number(n).toFixed(d) + "%";
+  }
+  function pctFmt(n) {
+    if (n === null || n === undefined) return "—";
+    return (n > 0 ? "+" : "") + Number(n).toFixed(2) + "%";
+  }
+  function getTicker() { return document.getElementById("ticker").value.trim(); }
+  function getMarket()  { return document.getElementById("market").value; }
+
+  // Auto-update DCF and Verdict defaults when market changes
+  document.getElementById("market").addEventListener("change", function() {
+    const isIndia = this.value === "india";
+    const rf  = isIndia ? "0.07" : "0.04";
+    const mr  = isIndia ? "0.13" : "0.10";
+    const tg  = isIndia ? "0.05" : "0.03";
+    document.getElementById("dcf-rf").value      = rf;
+    document.getElementById("dcf-mr").value      = mr;
+    document.getElementById("dcf-terminal").value = tg;
+
+  });
+
+  function switchTab(name, el) {
+    document.querySelectorAll(".tab-content").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    document.getElementById("tab-" + name).classList.add("active");
+    el.classList.add("active");
+    if (name === "ipos") loadIPOs();
+    if (name === "commodities") loadCommodities();
+    if (name === "verdict") updateVerdictStatus();
+  }
+
+  function setLoading(id, msg="Loading...") {
+    document.getElementById(id).innerHTML = `<div class="loading-state"><div class="spinner"></div>${msg}</div>`;
+  }
+  function setError(id, msg) {
+    document.getElementById(id).innerHTML = `<div class="error-state">⚠ ${msg}</div>`;
+  }
+
+  // ── VALUATION ──────────────────────────────────────────────────────────────
+  async function runValuation() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("valuation-results", "Please enter a ticker symbol."); return; }
+    switchTab("valuation", document.querySelectorAll(".tab")[0]);
+    setLoading("valuation-results", `Fetching ${ticker.toUpperCase()}...`);
+    try {
+      const res = await fetch(`${BASE}/valuation?ticker=${ticker}&market=${market}&advanced=${getAdvanced()}`);
+      if (!res.ok) { setError("valuation-results", `Server error ${res.status}`); return; }
+      const d = await res.json();
+      if (d.error) { setError("valuation-results", d.error); return; }
+
+      const upside = d.intrinsic_value && d.current_price
+        ? ((d.intrinsic_value - d.current_price) / d.current_price * 100) : null;
+      const isBuy = upside !== null && upside > 0;
+      const cls = isBuy ? "buy" : "sell";
+
+      document.getElementById("valuation-results").innerHTML = `
+        <div class="verdict-strip ${cls}">
+          <div>
+            <div class="verdict-main">${isBuy ? "Undervalued — Consider Buying" : "Overvalued — Exercise Caution"}</div>
+            <div class="verdict-sub">${d.ticker} &nbsp;·&nbsp; Gordon Growth Model &nbsp;·&nbsp; ${market === "india" ? "NSE" : "NYSE / NASDAQ"}</div>
+          </div>
+          <div style="text-align:right">
+            <div class="verdict-pct">${upside !== null ? pctFmt(upside) : "—"}</div>
+            <div class="verdict-sub">vs. current price</div>
+          </div>
+        </div>
+        <div class="hero-row">
+          <div class="hero-stat main">
+            <div class="h-label">Current Market Price</div>
+            <div class="h-value">${d.current_price ?? "—"}</div>
+            <div class="h-sub">via ${d.data_source || "yfinance"}</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Intrinsic Value</div>
+            <div class="h-value" style="color:${isBuy ? 'var(--green)' : 'var(--red)'}">${d.intrinsic_value ? Number(d.intrinsic_value).toFixed(2) : "—"}</div>
+            <div class="h-sub">Gordon Growth</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">WACC</div>
+            <div class="h-value">${d.wacc ? fmtPct(d.wacc * 100) : "—"}</div>
+            <div class="h-sub">Discount Rate</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Beta</div>
+            <div class="h-value">${d.beta ?? "—"}</div>
+            <div class="h-sub">Market Sensitivity</div>
+          </div>
+        </div>
+        <div class="section-label">Key Metrics</div>
+        <div class="metrics-grid">
+          <div class="metric"><div class="m-label">EPS</div><div class="m-value">${fmt(d.eps)}</div></div>
+          <div class="metric"><div class="m-label">P/E Ratio</div><div class="m-value">${fmt(d.pe_ratio)}</div></div>
+          <div class="metric"><div class="m-label">Forward P/E</div><div class="m-value">${fmt(d.forward_pe)}</div></div>
+          <div class="metric"><div class="m-label">P/B Ratio</div><div class="m-value">${fmt(d.pb_ratio)}</div></div>
+          <div class="metric"><div class="m-label">Market Cap</div><div class="m-value">${fmt(d.market_cap)}</div></div>
+          <div class="metric"><div class="m-label">Book Value</div><div class="m-value">${fmt(d.book_value)}</div></div>
+          <div class="metric"><div class="m-label">ROE</div><div class="m-value ${d.roe > 0 ? 'up' : 'down'}">${d.roe ? fmtPct(d.roe * 100) : "—"}</div></div>
+          <div class="metric"><div class="m-label">D/E Ratio</div><div class="m-value">${fmt(d.de_ratio)}</div></div>
+        </div>
+        ${d.valuation_low || d.valuation_high ? `
+        <div class="section-label">Sensitivity Range</div>
+        <div class="sens-row">
+          <div class="sens-cell bear"><div class="s-label">Bear Case</div><div class="s-value">${d.valuation_low ? Number(d.valuation_low).toFixed(2) : "—"}</div></div>
+          <div class="sens-cell base"><div class="s-label">Base Case</div><div class="s-value">${d.intrinsic_value ? Number(d.intrinsic_value).toFixed(2) : "—"}</div></div>
+          <div class="sens-cell bull"><div class="s-label">Bull Case</div><div class="s-value">${d.valuation_high ? Number(d.valuation_high).toFixed(2) : "—"}</div></div>
+        </div>` : ""}
+        ${market === "india" ? `
+        <div class="section-label">Ownership Structure</div>
+        <div class="metrics-grid">
+          <div class="metric"><div class="m-label">Promoters</div><div class="m-value">${d.promoters_holding ?? "—"}%</div></div>
+          <div class="metric"><div class="m-label">FII</div><div class="m-value">${d.fii_holding ?? "—"}%</div></div>
+          <div class="metric"><div class="m-label">DII</div><div class="m-value">${d.dii_holding ?? "—"}%</div></div>
+          <div class="metric"><div class="m-label">Retail</div><div class="m-value">${d.retail_holding ?? "—"}%</div></div>
+        </div>` : ""}
+      `;
+    } catch (e) { setError("valuation-results", e.message); }
+  }
+
+  // ── DCF ────────────────────────────────────────────────────────────────────
+  async function runDCF() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("dcf-results", "Please enter a ticker symbol first."); return; }
+    switchTab("dcf", document.querySelector(".tab-row .tab:nth-child(2)"));
+    setLoading("dcf-results", `Running DCF model for ${ticker.toUpperCase()}...`);
+
+    const years    = document.getElementById("dcf-years").value    || 5;
+    const terminal = document.getElementById("dcf-terminal").value || 0.03;
+    const rf       = document.getElementById("dcf-rf").value       || 0.04;
+    const mr       = document.getElementById("dcf-mr").value       || 0.10;
+    const mos      = document.getElementById("dcf-mos").value      || 0.25;
+
+    try {
+      const res = await fetch(`${BASE}/dcf?ticker=${ticker}&market=${market}&projection_years=${years}&terminal_growth_rate=${terminal}&risk_free_rate=${rf}&market_return=${mr}&margin_of_safety=${mos}&advanced=${getAdvanced()}`);
+      if (!res.ok) { setError("dcf-results", `Server error ${res.status}`); return; }
+      const d = await res.json();
+      if (d.error) { setError("dcf-results", d.error); return; }
+
+      // Store for AI Verdict tab
+      dcfCache = d;
+      updateVerdictStatus();
+
+      const isUnder = d.verdict === "Potentially Undervalued";
+      const isOver  = d.verdict === "Potentially Overvalued";
+      const cls = isUnder ? "buy" : isOver ? "sell" : "hold";
+
+      // Build growth rates display — grouped into IS and BS
+      const gr = d.derived_growth_rates || {};
+      const grLabels = {
+        revenue_growth: 'Revenue', opex_growth: 'Op. Expenses',
+        ca_growth: 'Current Assets', cl_growth: 'Current Liabilities',
+        cash_growth: 'Cash', cpltd_growth: 'CPLTD',
+        net_ppe_growth: 'Net PPE', depr_growth: 'Depreciation',
+        terminal_growth: 'Terminal'
+      };
+      const grHtml = Object.entries(gr).map(([k, v]) => {
+        const label  = grLabels[k] || k.replace(/_/g,' ');
+        const pct    = typeof v === 'number' ? (v*100).toFixed(1) + '%' : v;
+        const grCls  = typeof v === 'number' && v > 0 ? 'up' : typeof v === 'number' && v < 0 ? 'down' : '';
+        return `<div class="metric"><div class="m-label">${label}</div><div class="m-value ${grCls}">${pct}</div></div>`;
+      }).join('');
+
+      // Build FCFF model table (historical + projected + terminal)
+      const allRows = [
+        ...(d.historical_table || []),
+        ...(d.projection_table || []),
+        ...(d.terminal_year ? [d.terminal_year] : [])
+      ];
+
+      const tableRows = allRows.map((r, i) => {
+        const isHist     = i < (d.historical_table || []).length;
+        const isTerminal = r.year && r.year.toString().includes("Terminal");
+        const rowStyle   = isTerminal ? 'style="background:var(--blue-light)"'
+                         : isHist     ? '' : 'style="background:#f0fdf4"';
+        return `<tr ${rowStyle}>
+          <td class="lc">${r.year}</td>
+          <td>${fmt(r.revenue)}</td>
+          <td class="nd">${fmt(r.operating_expenses)}</td>
+          <td>${fmt(r.nop)}</td>
+          <td>${fmtPct((r.tax_rate||0)*100)}</td>
+          <td>${fmt(r.nop_after_tax)}</td>
+          <td class="${r.delta_nwc < 0 ? 'nd' : ''}">${fmt(r.delta_nwc)}</td>
+          <td class="nd">${fmt(r.capex)}</td>
+          <td class="${r.fcff >= 0 ? 'nu' : 'nd'}">${fmt(r.fcff)}</td>
+          <td>${r.pv_fcff !== undefined ? fmt(r.pv_fcff) : (isTerminal ? fmt(d.pv_terminal_value) : '—')}</td>
+        </tr>`;
+      }).join('');
+
+      // Build Balance Sheet forecast table
+      const bsRows = allRows.map((r, i) => {
+        const isHist     = i < (d.historical_table || []).length;
+        const isTerminal = r.year && r.year.toString().includes("Terminal");
+        const rowStyle   = isTerminal ? 'style="background:var(--blue-light)"'
+                         : isHist     ? '' : 'style="background:#f0fdf4"';
+        return `<tr ${rowStyle}>
+          <td class="lc">${r.year}</td>
+          <td class="nu">${fmt(r.bs_ca)}</td>
+          <td class="nd">${fmt(r.bs_cl)}</td>
+          <td class="nd">${fmt(r.bs_cash)}</td>
+          <td class="nd">${fmt(r.bs_cpltd)}</td>
+          <td class="${r.bs_wc >= 0 ? 'nu' : 'nd'}">${fmt(r.bs_wc)}</td>
+          <td>${fmt(r.bs_net_ppe)}</td>
+          <td>${fmt(r.bs_depreciation)}</td>
+        </tr>`;
+      }).join('');
+
+      document.getElementById("dcf-results").innerHTML = `
+        <div class="verdict-strip ${cls}">
+          <div>
+            <div class="verdict-main">${d.verdict ?? "—"}</div>
+            <div class="verdict-sub">${d.ticker} &nbsp;·&nbsp; Cash-Based FCFF &nbsp;·&nbsp; ${d.historical_years_used}-yr data &nbsp;·&nbsp; WACC ${d.wacc ? fmtPct(d.wacc*100) : "—"}</div>
+          </div>
+          <div style="text-align:right">
+            <div class="verdict-pct">${d.upside_downside_pct != null ? pctFmt(d.upside_downside_pct) : "—"}</div>
+            <div class="verdict-sub">upside / downside</div>
+          </div>
+        </div>
+
+        <div class="hero-row">
+          <div class="hero-stat main">
+            <div class="h-label">Intrinsic Value Per Share</div>
+            <div class="h-value">${d.intrinsic_value_per_share ? Number(d.intrinsic_value_per_share).toFixed(2) : "—"}</div>
+            <div class="h-sub">Before margin of safety</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Value w/ ${(parseFloat(mos)*100).toFixed(0)}% MOS</div>
+            <div class="h-value">${d.intrinsic_value_with_margin_of_safety ? Number(d.intrinsic_value_with_margin_of_safety).toFixed(2) : "—"}</div>
+            <div class="h-sub">Buy below this price</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Enterprise Value</div>
+            <div class="h-value">${fmt(d.enterprise_value)}</div>
+            <div class="h-sub">PV FCFF + Terminal</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Terminal Value</div>
+            <div class="h-value">${fmt(d.terminal_value)}</div>
+            <div class="h-sub">PV: ${fmt(d.pv_terminal_value)}</div>
+          </div>
+        </div>
+
+        <div class="section-label">Data-Derived Growth Rates</div>
+        <div class="metrics-grid">${grHtml}</div>
+
+        <div class="section-label">FCFF Model — Historical · Projected · Terminal</div>
+        <div class="card" style="padding:0;overflow:auto;margin-bottom:20px">
+          <table class="data-table" style="min-width:900px">
+            <thead><tr>
+              <th>Year</th>
+              <th>Revenue</th>
+              <th>Op. Expenses</th>
+              <th>NOP</th>
+              <th>Tax Rate</th>
+              <th>NOP After Tax</th>
+              <th>ΔNWC</th>
+              <th>CapEx</th>
+              <th>FCFF</th>
+              <th>PV of FCFF</th>
+            </tr></thead>
+            <tbody>${tableRows}</tbody>
+          </table>
+        </div>
+
+        <div class="section-label" style="cursor:pointer;user-select:none" onclick="toggleBS()">
+          Balance Sheet Forecast
+          <span id="bs-toggle-icon" style="font-size:0.7rem;color:var(--muted);margin-left:8px">▼ show</span>
+        </div>
+        <div id="bs-forecast-table" style="display:none;margin-top:0">
+          <div class="card" style="padding:0;overflow:auto;margin-bottom:20px">
+            <table class="data-table" style="min-width:800px">
+              <thead><tr>
+                <th>Year</th>
+                <th>Current Assets</th>
+                <th>Current Liabilities</th>
+                <th>Cash</th>
+                <th>CPLTD</th>
+                <th>Working Capital</th>
+                <th>Net PPE</th>
+                <th>Depreciation</th>
+              </tr></thead>
+              <tbody>${bsRows}</tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="section-label">Equity Bridge</div>
+        <div class="metrics-grid">
+          <div class="metric"><div class="m-label">+ Total PV FCFF</div><div class="m-value nu">${fmt(d.total_pv_fcff)}</div></div>
+          <div class="metric"><div class="m-label">+ PV Terminal Value</div><div class="m-value nu">${fmt(d.pv_terminal_value)}</div></div>
+          <div class="metric"><div class="m-label">= Enterprise Value</div><div class="m-value">${fmt(d.enterprise_value)}</div></div>
+          <div class="metric"><div class="m-label">+ Cash</div><div class="m-value nu">${fmt(d.total_cash)}</div></div>
+          <div class="metric"><div class="m-label">+ Investments</div><div class="m-value nu">${fmt(d.investments)}</div></div>
+          <div class="metric"><div class="m-label">− Total Debt</div><div class="m-value nd">${fmt(d.total_debt)}</div></div>
+          <div class="metric"><div class="m-label">− Minority Interest</div><div class="m-value nd">${fmt(d.minority_interest)}</div></div>
+          <div class="metric"><div class="m-label">= Equity Value</div><div class="m-value">${fmt(d.equity_value_dcf)}</div></div>
+          <div class="metric"><div class="m-label">÷ Shares Out.</div><div class="m-value">${fmt(d.shares_outstanding)}</div></div>
+          <div class="metric"><div class="m-label">= Intrinsic Value</div><div class="m-value nu">${d.intrinsic_value_per_share ? Number(d.intrinsic_value_per_share).toFixed(2) : "—"}</div></div>
+        </div>
+      `;
+    } catch (e) { setError("dcf-results", e.message); }
+  }
+
+  function updateVerdictStatus() {
+    const statusEl = document.getElementById("verdict-dcf-status");
+    if (!statusEl) return;
+    if (dcfCache && !dcfCache.error) {
+      const t = dcfCache.ticker || "";
+      statusEl.innerHTML = `<span style="color:var(--green)">✓ DCF loaded for <strong>${t}</strong> — ready to generate verdict</span>`;
+      statusEl.style.borderColor = "#a7d9bc";
+      statusEl.style.background  = "var(--green-light)";
+    } else {
+      statusEl.innerHTML = `<span style="color:var(--muted)">⚠ No DCF results yet — run DCF model first on the <strong>DCF Valuation</strong> tab</span>`;
+      statusEl.style.borderColor = "var(--line)";
+      statusEl.style.background  = "var(--cream)";
+    }
+  }
+
+  // ── AI VERDICT ────────────────────────────────────────────────────────────
+  async function runVerdict() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("verdict-results", "Please enter a ticker symbol first."); return; }
+    switchTab("verdict", document.querySelector(".tab-row .tab:nth-child(5)"));
+    updateVerdictStatus();
+    setLoading("verdict-results", `Analyzing ${ticker.toUpperCase()} — fetching news + calling Claude AI...`);
+
+    // Guard: require DCF to be run first
+    if (!dcfCache || dcfCache.error) {
+      setError("verdict-results", "Please run the DCF model first on the DCF Valuation tab, then come back here.");
+      return;
+    }
+
+    try {
+      const res = await fetch(`${BASE}/ai-verdict`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ticker:     ticker,
+          market:     market,
+          dcf_result: dcfCache,
+        }),
+      });
+      const d = await res.json();
+      if (d.error) { setError("verdict-results", d.error); return; }
+
+      const av  = d.ai_verdict || {};
+      const dcf = dcfCache || {};   // DCF data already in memory from user's run
+
+      // Verdict badge class
+      const vRaw   = (av.verdict || "hold").toLowerCase().replace(" ", "-");
+      const vClass = ["strong-buy","buy","hold","sell","strong-sell"].includes(vRaw) ? vRaw : "neutral";
+
+      // Confidence dot
+      const confRaw = (av.confidence || "medium").toLowerCase();
+      const confCls = confRaw === "high" ? "conf-high" : confRaw === "low" ? "conf-low" : "conf-medium";
+
+      // Sentiment tag
+      const sentRaw = (av.news_sentiment || "neutral").toLowerCase();
+      const sentCls = sentRaw === "positive" ? "positive" : sentRaw === "negative" ? "negative" : "neutral";
+
+      // Guidance
+      const guidance = av.management_guidance || {};
+      const guidanceHtml = Object.entries({
+        "CapEx Guidance":    guidance.capex    || "N/A",
+        "Revenue Guidance":  guidance.revenue  || "N/A",
+        "Expansion Plans":   guidance.expansion|| "N/A",
+      }).map(([k, v]) => `
+        <div class="guidance-item">
+          <div class="g-label">${k}</div>
+          <div class="g-value">${v}</div>
+        </div>`).join('');
+
+      // Headlines
+      const headlines = av.recent_headlines || d.news_fed || [];
+      const headlinesHtml = headlines.length
+        ? `<ul class="news-list">${headlines.map(h => `<li>${h}</li>`).join('')}</ul>`
+        : '<p style="color:var(--muted);font-size:0.82rem">No recent headlines available.</p>';
+
+      // Key risks
+      const risks = av.key_risks || [];
+      const risksHtml = risks.length
+        ? risks.map(r => `<li>${r}</li>`).join('')
+        : "<li>No specific risks identified.</li>";
+
+      document.getElementById("verdict-results").innerHTML = `
+        <!-- Header verdict strip -->
+        <div class="verdict-strip ${vClass === 'buy' || vClass === 'strong-buy' ? 'buy' : vClass === 'sell' || vClass === 'strong-sell' ? 'sell' : 'hold'}" style="margin-bottom:24px">
+          <div>
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+              <span class="verdict-badge ${vClass}">${av.verdict || "Hold"}</span>
+              <span style="font-size:0.75rem;color:var(--muted)">
+                <span class="confidence-dot ${confCls}"></span>
+                ${av.confidence || "Medium"} Confidence
+              </span>
+              <span class="sentiment-tag ${sentCls}">${av.news_sentiment || "Neutral"} Sentiment</span>
+            </div>
+            <div class="verdict-sub">${d.company_name} &nbsp;·&nbsp; ${d.sector} &nbsp;·&nbsp; WACC ${dcf.wacc ? fmtPct(dcf.wacc*100) : "—"}</div>
+          </div>
+          <div style="text-align:right">
+            <div class="verdict-pct">${(dcf.upside_downside_pct != null && dcf.upside_downside_pct !== undefined) ? pctFmt(dcf.upside_downside_pct) : "—"}</div>
+            <div class="verdict-sub">DCF upside / downside</div>
+          </div>
+        </div>
+
+        <!-- Hero stats -->
+        <div class="hero-row" style="margin-bottom:24px">
+          <div class="hero-stat main">
+            <div class="h-label">Current Price</div>
+            <div class="h-value">${d.current_price ?? "—"}</div>
+            <div class="h-sub">${d.ticker}</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Intrinsic Value</div>
+            <div class="h-value">${dcf.intrinsic_value_per_share ? Number(dcf.intrinsic_value_per_share).toFixed(2) : "—"}</div>
+            <div class="h-sub">Before MOS</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Value w/ MOS</div>
+            <div class="h-value">${dcf.intrinsic_value_with_margin_of_safety ? Number(dcf.intrinsic_value_with_margin_of_safety).toFixed(2) : "—"}</div>
+            <div class="h-sub">Buy below this</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Enterprise Value</div>
+            <div class="h-value">${fmt(dcf.enterprise_value)}</div>
+            <div class="h-sub">DCF derived</div>
+          </div>
+        </div>
+
+        <!-- AI Summary -->
+        <div class="verdict-card">
+          <div class="verdict-card-head">AI Analysis Summary</div>
+          <p class="verdict-summary">${av.summary || "Analysis not available."}</p>
+          <div class="verdict-two-col">
+            <div class="verdict-box bull">
+              <div class="verdict-box-title">↑ Bull Case</div>
+              <p>${av.bull_case || "No bull case available."}</p>
+            </div>
+            <div class="verdict-box bear">
+              <div class="verdict-box-title">↓ Bear Case</div>
+              <p>${av.bear_case || "No bear case available."}</p>
+            </div>
+          </div>
+          ${av.analyst_note ? `<div style="font-size:0.78rem;color:var(--muted);padding:12px 14px;background:var(--cream);border-radius:2px;border-left:3px solid var(--accent)">
+            <strong style="color:var(--ink2)">Watch:</strong> ${av.analyst_note}
+          </div>` : ""}
+        </div>
+
+        <!-- Management Guidance -->
+        <div class="section-label">Management Guidance — From Latest News</div>
+        <div class="guidance-grid">${guidanceHtml}</div>
+
+        ${av.model_vs_reality ? `
+        <div class="verdict-card" style="margin-bottom:20px">
+          <div class="verdict-card-head">Model vs Reality</div>
+          <p style="font-size:0.85rem;line-height:1.7;color:var(--ink2)">${av.model_vs_reality}</p>
+        </div>` : ""}
+
+        <!-- Competitor Analysis -->
+        ${av.competitor_analysis ? `
+        <div class="verdict-card" style="margin-bottom:20px">
+          <div class="verdict-card-head">Competitor Analysis — How Does It Stack Up?</div>
+          <p style="font-size:0.85rem;line-height:1.7;color:var(--ink2)">${av.competitor_analysis}</p>
+          ${d.competitors_analyzed && d.competitors_analyzed.length ? `
+          <div style="margin-top:12px;font-size:0.7rem;color:var(--muted)">
+            Peers analyzed: <strong style="color:var(--ink2)">${d.competitors_analyzed.join(', ')}</strong>
+          </div>` : ''}
+        </div>` : ''}
+
+        <!-- Insider + Earnings track record -->
+        ${(av.insider_read || av.earnings_track_record) ? `
+        <div class="verdict-two-col" style="margin-bottom:20px">
+          ${av.insider_read ? `<div class="verdict-box" style="background:var(--blue-light);border-color:#a8c0d9">
+            <div class="verdict-box-title" style="color:var(--blue)">👤 Insider Signal</div>
+            <p>${av.insider_read}</p>
+          </div>` : ''}
+          ${av.earnings_track_record ? `<div class="verdict-box" style="background:var(--cream)">
+            <div class="verdict-box-title" style="color:var(--muted)">📅 Earnings Track Record</div>
+            <p>${av.earnings_track_record}</p>
+          </div>` : ''}
+        </div>` : ''}
+
+        <!-- Key Risks -->
+        <div class="section-label">Key Risks</div>
+        <div class="card" style="padding:18px 22px;margin-bottom:20px">
+          <ul style="padding-left:16px;font-size:0.82rem;line-height:2;color:var(--ink2)">${risksHtml}</ul>
+        </div>
+
+        <!-- Recent Headlines -->
+        <div class="section-label">Recent Headlines Fed to AI</div>
+        <div class="card" style="padding:18px 22px;margin-bottom:20px">
+          ${headlinesHtml}
+        </div>
+
+        <!-- DCF Summary (collapsible) -->
+        <div class="section-label" style="cursor:pointer;user-select:none" onclick="toggleVerdictDCF()">
+          Full DCF Model
+          <span id="verdict-dcf-icon" style="font-size:0.7rem;color:var(--muted);margin-left:8px">▼ show</span>
+        </div>
+        <div id="verdict-dcf-table" style="display:none">
+          ${buildDCFTableHtml(dcf)}
+        </div>
+      `;
+    } catch (e) { setError("verdict-results", e.message); }
+  }
+
+  function toggleVerdictDCF() {
+    const el   = document.getElementById("verdict-dcf-table");
+    const icon = document.getElementById("verdict-dcf-icon");
+    if (!el) return;
+    const isHidden = el.style.display === "none";
+    el.style.display = isHidden ? "block" : "none";
+    icon.textContent = isHidden ? "▲ hide" : "▼ show";
+  }
+
+  function buildDCFTableHtml(dcf) {
+    const allRows = [
+      ...(dcf.historical_table || []),
+      ...(dcf.projection_table || []),
+      ...(dcf.terminal_year ? [dcf.terminal_year] : [])
+    ];
+    if (!allRows.length) return "<p style='color:var(--muted);font-size:0.82rem;padding:16px'>DCF data not available.</p>";
+
+    const rows = allRows.map((r, i) => {
+      const isHist     = i < (dcf.historical_table || []).length;
+      const isTerminal = r.year && r.year.toString().includes("Terminal");
+      const rowStyle   = isTerminal ? 'style="background:var(--blue-light)"'
+                       : isHist     ? '' : 'style="background:#f0fdf4"';
+      return `<tr ${rowStyle}>
+        <td class="lc">${r.year}</td>
+        <td>${fmt(r.revenue)}</td>
+        <td class="nd">${fmt(r.operating_expenses)}</td>
+        <td>${fmt(r.nop)}</td>
+        <td>${fmtPct((r.tax_rate||0)*100)}</td>
+        <td>${fmt(r.nop_after_tax)}</td>
+        <td class="${r.delta_nwc < 0 ? 'nd' : ''}">${fmt(r.delta_nwc)}</td>
+        <td class="nd">${fmt(r.capex)}</td>
+        <td class="${r.fcff >= 0 ? 'nu' : 'nd'}">${fmt(r.fcff)}</td>
+        <td>${r.pv_fcff !== undefined ? fmt(r.pv_fcff) : (isTerminal ? fmt(dcf.pv_terminal_value) : '—')}</td>
+      </tr>`;
+    }).join('');
+
+    return `<div class="card" style="padding:0;overflow:auto;margin-bottom:20px">
+      <table class="data-table" style="min-width:900px">
+        <thead><tr>
+          <th>Year</th><th>Revenue</th><th>Op. Expenses</th><th>NOP</th>
+          <th>Tax Rate</th><th>NOP After Tax</th><th>ΔNWC</th>
+          <th>CapEx</th><th>FCFF</th><th>PV of FCFF</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <div class="metrics-grid">
+      <div class="metric"><div class="m-label">+ Total PV FCFF</div><div class="m-value nu">${fmt(dcf.total_pv_fcff)}</div></div>
+      <div class="metric"><div class="m-label">+ PV Terminal Value</div><div class="m-value nu">${fmt(dcf.pv_terminal_value)}</div></div>
+      <div class="metric"><div class="m-label">= Enterprise Value</div><div class="m-value">${fmt(dcf.enterprise_value)}</div></div>
+      <div class="metric"><div class="m-label">+ Cash</div><div class="m-value nu">${fmt(dcf.total_cash)}</div></div>
+      <div class="metric"><div class="m-label">− Total Debt</div><div class="m-value nd">${fmt(dcf.total_debt)}</div></div>
+      <div class="metric"><div class="m-label">÷ Shares Out.</div><div class="m-value">${fmt(dcf.shares_outstanding)}</div></div>
+      <div class="metric"><div class="m-label">= Intrinsic Value</div><div class="m-value nu">${dcf.intrinsic_value_per_share ? Number(dcf.intrinsic_value_per_share).toFixed(2) : "—"}</div></div>
+    </div>`;
+  }
+
+  function toggleBS() {
+    const el   = document.getElementById("bs-forecast-table");
+    const icon = document.getElementById("bs-toggle-icon");
+    if (!el) return;
+    const isHidden = el.style.display === "none";
+    el.style.display   = isHidden ? "block" : "none";
+    icon.textContent   = isHidden ? "▲ hide" : "▼ show";
+  }
+
+  // ── FINANCIALS ─────────────────────────────────────────────────────────────
+  // Helper: read a field from FMP or yfinance income row
+  function fldInc(row, fmpKey, yfKey) {
+    // FMP keys are camelCase, yfinance keys are "Title Case With Spaces"
+    if (row[fmpKey] !== undefined && row[fmpKey] !== null) return row[fmpKey];
+    if (row[yfKey]  !== undefined && row[yfKey]  !== null) return row[yfKey];
+    return null;
+  }
+  function fldBal(row, fmpKey, yfKey) {
+    if (row[fmpKey] !== undefined && row[fmpKey] !== null) return row[fmpKey];
+    if (row[yfKey]  !== undefined && row[yfKey]  !== null) return row[yfKey];
+    return null;
+  }
+
+  async function runFinancials() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("financials-results", "Please enter a ticker symbol first."); return; }
+    switchTab("financials", document.querySelector(".tab-row .tab:nth-child(3)"));
+    setLoading("financials-results", `Loading financials for ${ticker.toUpperCase()}...`);
+    try {
+      const res = await fetch(`${BASE}/financials?ticker=${ticker}&market=${market}&advanced=${getAdvanced()}`);
+      if (!res.ok) { setError("financials-results", `Server error ${res.status}`); return; }
+      const d = await res.json();
+      if (d.error) { setError("financials-results", d.error); return; }
+      if (!d.income_statement || Object.keys(d.income_statement).length === 0) {
+        setError("financials-results", "Financial data not available for this ticker."); return;
+      }
+
+      const isFMP = d.data_source === "FMP";
+      const srcBadge = `<span style="font-size:0.68rem;padding:2px 8px;background:var(--cream);border:1px solid var(--line);border-radius:2px;color:var(--muted);margin-left:8px">${d.data_source || "yfinance"}</span>`;
+
+      // ── Income Statement ──
+      let incomeRows = "";
+      for (const year in d.income_statement) {
+        const row = d.income_statement[year];
+        const rev  = isFMP ? row.revenue        : row["Total Revenue"];
+        const ni   = isFMP ? row.netIncome       : row["Net Income"];
+        const gp   = isFMP ? row.grossProfit     : row["Gross Profit"];
+        const ebit = isFMP ? row.operatingIncome : row["Operating Income"];
+        const eps  = isFMP ? row.eps             : row["Basic EPS"];
+        const rnd  = isFMP ? row.researchAndDevelopmentExpenses : row["Research And Development"];
+        incomeRows += `<tr>
+          <td class="lc">${year}</td>
+          <td>${fmt(rev)}</td>
+          <td>${fmt(gp)}</td>
+          <td>${fmt(ebit)}</td>
+          <td class="${ni > 0 ? 'nu' : ni < 0 ? 'nd' : ''}">${fmt(ni)}</td>
+          <td>${eps !== null && eps !== undefined ? Number(eps).toFixed(2) : "—"}</td>
+          <td>${fmt(rnd)}</td>
+        </tr>`;
+      }
+
+      // ── Cash Flow ──
+      let cfRows = "";
+      for (const year in d.cash_flow) {
+        const row = d.cash_flow[year];
+        const ocf  = isFMP ? row.operatingCashFlow          : row["Operating Cash Flow"];
+        const cex  = isFMP ? row.capitalExpenditure         : row["Capital Expenditure"];
+        const fcf  = isFMP ? row.freeCashFlow               : row["Free Cash Flow"];
+        const depr = isFMP ? row.depreciationAndAmortization: row["Depreciation And Amortization"];
+        cfRows += `<tr>
+          <td class="lc">${year}</td>
+          <td class="${ocf > 0 ? 'nu' : 'nd'}">${fmt(ocf)}</td>
+          <td class="${cex < 0 ? 'nd' : ''}">${fmt(cex)}</td>
+          <td class="${fcf > 0 ? 'nu' : 'nd'}">${fmt(fcf)}</td>
+          <td>${fmt(depr)}</td>
+        </tr>`;
+      }
+
+      // ── Balance Sheet ──
+      let balRows = "";
+      for (const year in d.balance_sheet) {
+        const row = d.balance_sheet[year];
+        const ta   = isFMP ? row.totalAssets              : row["Total Assets"];
+        const tl   = isFMP ? row.totalLiabilities         : row["Total Liabilities Net Minority Interest"];
+        const eq   = isFMP ? (row.totalStockholdersEquity || row.totalEquity) : row["Stockholders Equity"];
+        const cash = isFMP ? row.cashAndCashEquivalents   : row["Cash And Cash Equivalents"];
+        const debt = isFMP ? row.totalDebt                : row["Total Debt"];
+        balRows += `<tr>
+          <td class="lc">${year}</td>
+          <td>${fmt(ta)}</td>
+          <td>${fmt(tl)}</td>
+          <td class="${eq > 0 ? 'nu' : 'nd'}">${fmt(eq)}</td>
+          <td>${fmt(cash)}</td>
+          <td>${fmt(debt)}</td>
+        </tr>`;
+      }
+
+      // ── DuPont ──
+      let dupRows = "";
+      for (const year in d.dupont_roe) {
+        const roe = d.dupont_roe[year];
+        dupRows += `<tr>
+          <td class="lc">${year}</td>
+          <td class="${roe > 0 ? 'nu' : 'nd'}">${roe !== null ? fmtPct(roe * 100) : "—"}</td>
+        </tr>`;
+      }
+
+      document.getElementById("financials-results").innerHTML = `
+        <div class="section-label">Income Statement${srcBadge}</div>
+        <div class="card" style="padding:0;overflow:auto;margin-bottom:24px">
+          <table class="data-table" style="min-width:650px">
+            <thead><tr><th>Year</th><th>Revenue</th><th>Gross Profit</th><th>EBIT</th><th>Net Income</th><th>EPS</th><th>R&D</th></tr></thead>
+            <tbody>${incomeRows || '<tr><td colspan="7" style="color:var(--muted);text-align:center">No data</td></tr>'}</tbody>
+          </table>
+        </div>
+        <div class="section-label">Cash Flow Statement</div>
+        <div class="card" style="padding:0;overflow:auto;margin-bottom:24px">
+          <table class="data-table" style="min-width:550px">
+            <thead><tr><th>Year</th><th>Operating CF</th><th>CapEx</th><th>Free Cash Flow</th><th>D&A</th></tr></thead>
+            <tbody>${cfRows || '<tr><td colspan="5" style="color:var(--muted);text-align:center">No data</td></tr>'}</tbody>
+          </table>
+        </div>
+        <div class="section-label">Balance Sheet</div>
+        <div class="card" style="padding:0;overflow:auto;margin-bottom:24px">
+          <table class="data-table" style="min-width:620px">
+            <thead><tr><th>Year</th><th>Total Assets</th><th>Total Liabilities</th><th>Equity</th><th>Cash</th><th>Total Debt</th></tr></thead>
+            <tbody>${balRows || '<tr><td colspan="6" style="color:var(--muted);text-align:center">No data</td></tr>'}</tbody>
+          </table>
+        </div>
+        <div class="section-label">DuPont ROE Analysis</div>
+        <div class="card" style="padding:0;overflow:hidden">
+          <table class="data-table">
+            <thead><tr><th>Year</th><th>Return on Equity</th></tr></thead>
+            <tbody>${dupRows || '<tr><td colspan="2" style="color:var(--muted);text-align:center">No data</td></tr>'}</tbody>
+          </table>
+        </div>`;
+    } catch (e) { setError("financials-results", e.message); }
+  }
+
+  // ── SCREENER ───────────────────────────────────────────────────────────────
+  function gv(id) {
+    const v = document.getElementById(id).value.trim();
+    return v === "" ? null : parseFloat(v);
+  }
+
+  function clearScreenerFilters() {
+    ["f-pe-min","f-pe-max","f-pb-min","f-pb-max","f-roe-min","f-roe-max",
+     "f-mc-min","f-mc-max","f-de-min","f-de-max","f-dy-min","f-dy-max",
+     "f-eps-min","f-eps-max","f-wk-min","f-wk-max"].forEach(id => {
+      document.getElementById(id).value = "";
+    });
+  }
+
+  async function runScreener() {
+    const tickers = document.getElementById("screener-tickers").value.trim();
+    const market  = document.getElementById("screener-market").value;
+    if (!tickers) { setError("screener-results", "Please enter at least one ticker."); return; }
+    setLoading("screener-results", "Scanning tickers...");
+
+    // Build query params — only include filters that have values
+    const params = new URLSearchParams({ tickers, market });
+    const filterMap = {
+      "f-pe-min":  "min_pe",   "f-pe-max":  "max_pe",
+      "f-pb-min":  "min_pb",   "f-pb-max":  "max_pb",
+      "f-de-min":  "min_de",   "f-de-max":  "max_de",
+      "f-eps-min": "min_eps",  "f-eps-max": "max_eps",
+      "f-wk-min":  "min_week_change", "f-wk-max": "max_week_change",
+    };
+
+    // ROE, dividend yield, market cap need unit conversion
+    const roeMin = gv("f-roe-min"), roeMax = gv("f-roe-max");
+    const dyMin  = gv("f-dy-min"),  dyMax  = gv("f-dy-max");
+    const mcMin  = gv("f-mc-min"),  mcMax  = gv("f-mc-max");
+
+    for (const [inputId, paramName] of Object.entries(filterMap)) {
+      const v = gv(inputId);
+      if (v !== null) params.append(paramName, v);
+    }
+
+    // ROE entered as % → convert to decimal
+    if (roeMin !== null) params.append("min_roe", roeMin / 100);
+    if (roeMax !== null) params.append("max_roe", roeMax / 100);
+
+    // Dividend yield entered as % → convert to decimal
+    if (dyMin !== null) params.append("min_dividend_yield", dyMin / 100);
+    if (dyMax !== null) params.append("max_dividend_yield", dyMax / 100);
+
+    // Market cap entered as Billions → convert to raw
+    if (mcMin !== null) params.append("min_market_cap", mcMin * 1e9);
+    if (mcMax !== null) params.append("max_market_cap", mcMax * 1e9);
+
+    try {
+      const res = await fetch(`${BASE}/screener?${params.toString()}`);
+      const d = await res.json();
+      if (d.error) { setError("screener-results", d.error); return; }
+
+      const results = d.results || [];
+
+      // Sort: passed first, then by ticker name
+      results.sort((a, b) => {
+        if (a.passed_filters && !b.passed_filters) return -1;
+        if (!a.passed_filters && b.passed_filters) return 1;
+        return a.ticker.localeCompare(b.ticker);
+      });
+
+      const rows = results.map(r => {
+        if (r.error) {
+          return `<tr class="failed">
+            <td class="lc">${r.ticker}</td>
+            <td colspan="9" style="color:var(--muted);font-family:'DM Sans',sans-serif">Error: ${r.error}</td>
+          </tr>`;
         }
+        const wk = r.week_change_pct;
+        return `<tr class="${r.passed_filters ? '' : 'failed'}">
+          <td class="lc">${r.ticker}</td>
+          <td>${r.current_price ?? "—"}</td>
+          <td>${r.pe_ratio ?? "—"}</td>
+          <td>${r.pb_ratio ?? "—"}</td>
+          <td class="${r.roe > 0 ? 'nu' : 'nd'}">${r.roe !== null && r.roe !== undefined ? fmtPct(r.roe * 100) : "—"}</td>
+          <td>${r.market_cap ? fmt(r.market_cap) : "—"}</td>
+          <td>${r.de_ratio ?? "—"}</td>
+          <td>${r.dividend_yield !== null && r.dividend_yield !== undefined ? fmtPct(r.dividend_yield * 100) : "—"}</td>
+          <td>${r.eps ?? "—"}</td>
+          <td class="${wk > 0 ? 'nu' : wk < 0 ? 'nd' : ''}">${wk !== null && wk !== undefined ? pctFmt(wk) : "—"}</td>
+          <td><span class="${r.passed_filters ? 'badge-pass' : 'badge-fail'}">${r.passed_filters ? 'PASS' : 'FAIL'}</span></td>
+        </tr>`;
+      }).join('');
 
-    except Exception as e:
-        return {"error": str(e)}
+      document.getElementById("screener-results").innerHTML = `
+        <div class="screener-summary">
+          <div class="ss-item">Scanned <strong>${d.tickers_scanned}</strong> tickers</div>
+          <div class="ss-item"><strong style="color:var(--green)">${d.passed_count}</strong> passed filters</div>
+          <div class="ss-item"><strong style="color:var(--red)">${d.tickers_scanned - d.passed_count}</strong> filtered out</div>
+          <div class="ss-item" style="color:var(--muted);font-size:0.72rem">Faded rows did not pass all filters</div>
+        </div>
+        <div class="card" style="padding:0;overflow:auto">
+          <table class="screener-table" style="min-width:900px">
+            <thead><tr>
+              <th>Ticker</th>
+              <th>Price</th>
+              <th>P/E</th>
+              <th>P/B</th>
+              <th>ROE</th>
+              <th>Mkt Cap</th>
+              <th>D/E</th>
+              <th>Div Yield</th>
+              <th>EPS</th>
+              <th>1-Wk Move</th>
+              <th>Filter</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`;
+    } catch (e) { setError("screener-results", e.message); }
+  }
+
+  // ── ADVANCED MODE ─────────────────────────────────────────────────────────
+  let advancedMode = false;
+  function toggleAdvanced() {
+    advancedMode = !advancedMode;
+    const el = document.getElementById("adv-toggle");
+    const lb = document.getElementById("adv-label");
+    el.classList.toggle("active", advancedMode);
+    lb.textContent = advancedMode ? "Advanced (FMP)" : "Standard";
+  }
+  function getAdvanced() { return advancedMode; }
+
+  // ── REVERSE DCF ───────────────────────────────────────────────────────────
+  async function runReverseDCF() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("rdcf-results", "Please enter a ticker symbol first."); return; }
+    setLoading("rdcf-results", `Solving for implied growth rate of ${ticker.toUpperCase()}...`);
+    const rf  = document.getElementById("rdcf-rf").value  || 0.04;
+    const mr  = document.getElementById("rdcf-mr").value  || 0.10;
+    const tg  = document.getElementById("rdcf-tg").value  || 0.03;
+    const yrs = document.getElementById("rdcf-yrs").value || 5;
+    try {
+      const res = await fetch(`${BASE}/reverse-dcf?ticker=${ticker}&market=${market}&risk_free_rate=${rf}&market_return=${mr}&terminal_growth_rate=${tg}&projection_years=${yrs}&advanced=${getAdvanced()}`);
+      const d = await res.json();
+      if (d.error) { setError("rdcf-results", d.error); return; }
+      const scenarios = d.scenarios || [];
+      const scenHtml = scenarios.map(s => {
+        const isImplied = s.scenario.includes("implied");
+        const vs = s.vs_current_price;
+        const vsClass = vs > 0 ? "nu" : vs < 0 ? "nd" : "";
+        return `<div class="rdcf-cell ${isImplied ? 'implied' : ''}">
+          <div class="rs-label">${s.scenario}</div>
+          <div class="rs-growth">${s.growth_rate}%</div>
+          <div class="rs-price">Intrinsic: ${s.intrinsic_per_share}</div>
+          <div class="rs-vs ${vsClass}">${vs > 0 ? '+' : ''}${vs}% vs price</div>
+        </div>`;
+      }).join('');
+      document.getElementById("rdcf-results").innerHTML = `
+        <div class="verdict-strip ${d.implied_growth_rate > 15 ? 'sell' : d.implied_growth_rate < 5 ? 'buy' : 'hold'}" style="margin-bottom:20px">
+          <div>
+            <div class="verdict-main">Implied Growth Rate: ${d.implied_growth_rate}%/yr</div>
+            <div class="verdict-sub">${d.ticker} &nbsp;·&nbsp; WACC ${d.wacc_used}% &nbsp;·&nbsp; Terminal ${d.terminal_growth_rate}% &nbsp;·&nbsp; ${d.projection_years}-yr model</div>
+          </div>
+        </div>
+        <div class="card" style="padding:16px 20px;margin-bottom:20px">
+          <div class="card-head">Interpretation</div>
+          <p style="font-size:0.88rem;line-height:1.7;color:var(--ink2)">${d.interpretation}</p>
+        </div>
+        <div class="section-label">Scenario Analysis</div>
+        <div class="rdcf-scenario">${scenHtml}</div>
+        <div class="metrics-grid">
+          <div class="metric"><div class="m-label">Current Price</div><div class="m-value">${d.current_price}</div></div>
+          <div class="metric"><div class="m-label">Implied Growth</div><div class="m-value">${d.implied_growth_rate}%</div></div>
+          <div class="metric"><div class="m-label">WACC Used</div><div class="m-value">${d.wacc_used}%</div></div>
+          <div class="metric"><div class="m-label">Data Source</div><div class="m-value">${d.data_source || "—"}</div></div>
+        </div>`;
+    } catch (e) { setError("rdcf-results", e.message); }
+  }
+
+  // ── INSIDER TRANSACTIONS ──────────────────────────────────────────────────
+  async function loadInsider() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("insider-results", "Please enter a ticker symbol first."); return; }
+    setLoading("insider-results", `Fetching insider transactions for ${ticker.toUpperCase()}...`);
+    try {
+      const res = await fetch(`${BASE}/insider-transactions?ticker=${ticker}&market=${market}&limit=20`);
+      const d = await res.json();
+      if (d.error) { setError("insider-results", d.error); return; }
+      const total = (d.buy_count || 0) + (d.sell_count || 0);
+      const buyPct = total > 0 ? (d.buy_count / total * 100).toFixed(0) : 50;
+      const sellPct = 100 - buyPct;
+      const sentCls = d.insider_sentiment === "Bullish" ? "nu" : d.insider_sentiment === "Bearish" ? "nd" : "";
+      const txRows = (d.transactions || []).map(t => {
+        const isBuy = (t.transaction_type || "").toLowerCase().includes("purchase") || (t.transaction_type || "").toLowerCase().includes("buy");
+        return `<tr>
+          <td class="lc">${t.date || "—"}</td>
+          <td>${t.insider_name || "—"}</td>
+          <td style="font-size:0.72rem;color:var(--muted)">${t.title || "—"}</td>
+          <td class="${isBuy ? 'nu' : 'nd'}">${t.transaction_type || "—"}</td>
+          <td>${t.shares ? fmt(t.shares, 0) : "—"}</td>
+          <td>${t.price ? "$" + Number(t.price).toFixed(2) : "—"}</td>
+          <td>${t.value ? fmt(t.value) : "—"}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById("insider-results").innerHTML = `
+        <div class="hero-row" style="margin-bottom:20px">
+          <div class="hero-stat main">
+            <div class="h-label">Insider Sentiment</div>
+            <div class="h-value ${sentCls}">${d.insider_sentiment || "—"}</div>
+            <div class="h-sub">${d.total_transactions} transactions analyzed</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Buy Transactions</div>
+            <div class="h-value nu">${d.buy_count || 0}</div>
+            <div class="h-sub">Total value: ${fmt(d.total_buy_value)}</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Sell Transactions</div>
+            <div class="h-value nd">${d.sell_count || 0}</div>
+            <div class="h-sub">Total value: ${fmt(d.total_sell_value)}</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Buy/Sell Ratio</div>
+            <div class="h-value">${d.buy_count && d.sell_count ? (d.buy_count / d.sell_count).toFixed(1) + "x" : "—"}</div>
+            <div class="h-sub">Buys vs Sells</div>
+          </div>
+        </div>
+        <div class="card" style="padding:16px 20px;margin-bottom:20px">
+          <div class="insider-bar">
+            <div class="buy-fill" style="width:${buyPct}%"></div>
+            <div class="sell-fill" style="width:${sellPct}%"></div>
+          </div>
+          <div class="insider-label"><span>Buys ${buyPct}%</span><span>Sells ${sellPct}%</span></div>
+        </div>
+        <div class="card" style="padding:0;overflow:auto">
+          <table class="data-table" style="min-width:700px">
+            <thead><tr><th>Date</th><th>Insider</th><th>Title</th><th>Type</th><th>Shares</th><th>Price</th><th>Value</th></tr></thead>
+            <tbody>${txRows}</tbody>
+          </table>
+        </div>`;
+    } catch (e) { setError("insider-results", e.message); }
+  }
+
+  async function loadInstitutional() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("institutional-results", "Please enter a ticker symbol first."); return; }
+    setLoading("institutional-results", `Fetching institutional holders for ${ticker.toUpperCase()}...`);
+    try {
+      const res = await fetch(`${BASE}/institutional-holders?ticker=${ticker}&market=${market}&limit=15`);
+      const d = await res.json();
+      if (d.error) { setError("institutional-results", d.error); return; }
+      const trendCls = d.institutional_trend === "Accumulating" ? "nu" : "nd";
+      const rows = (d.holders || []).map(h => {
+        const chg = h.change || 0;
+        return `<tr>
+          <td class="lc">${h.holder || "—"}</td>
+          <td>${h.shares ? fmt(h.shares, 0) : "—"}</td>
+          <td class="${chg >= 0 ? 'nu' : 'nd'}">${chg >= 0 ? '+' : ''}${h.shares ? fmt(chg, 0) : "—"}</td>
+          <td class="${chg >= 0 ? 'nu' : 'nd'}">${h.change_pct !== null ? (chg >= 0 ? '+' : '') + h.change_pct + "%" : "—"}</td>
+          <td style="color:var(--muted);font-size:0.75rem">${h.date_reported || "—"}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById("institutional-results").innerHTML = `
+        <div class="section-label">Institutional Holdings</div>
+        <div class="metrics-grid" style="margin-bottom:16px">
+          <div class="metric"><div class="m-label">Trend</div><div class="m-value ${trendCls}">${d.institutional_trend || "—"}</div></div>
+          <div class="metric"><div class="m-label">Total Shares Held</div><div class="m-value">${fmt(d.total_shares_held, 0)}</div></div>
+          <div class="metric"><div class="m-label">Net Change</div><div class="m-value ${d.net_institutional_change >= 0 ? 'nu' : 'nd'}">${d.net_institutional_change >= 0 ? '+' : ''}${fmt(d.net_institutional_change, 0)}</div></div>
+          <div class="metric"><div class="m-label">Holders Tracked</div><div class="m-value">${d.top_holders_count}</div></div>
+        </div>
+        <div class="card" style="padding:0;overflow:auto">
+          <table class="data-table" style="min-width:600px">
+            <thead><tr><th>Institution</th><th>Shares Held</th><th>Change</th><th>Change %</th><th>Reported</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`;
+    } catch (e) { setError("institutional-results", e.message); }
+  }
+
+  // ── ANALYST TARGETS ───────────────────────────────────────────────────────
+  async function loadAnalyst() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("analyst-results", "Please enter a ticker symbol first."); return; }
+    setLoading("analyst-results", `Fetching analyst targets for ${ticker.toUpperCase()}...`);
+    try {
+      const res = await fetch(`${BASE}/analyst-targets?ticker=${ticker}&market=${market}`);
+      const d = await res.json();
+      if (d.error) { setError("analyst-results", d.error); return; }
+      const ab = d.analyst_breakdown || {};
+      const total = ab.total || 1;
+      const ratingCls = (d.consensus_rating || "").toLowerCase().includes("buy") ? "nu" : (d.consensus_rating || "").toLowerCase().includes("sell") ? "nd" : "";
+      const targetRows = (d.price_targets || []).slice(0, 10).map(t => `<tr>
+        <td class="lc">${t.published_date ? t.published_date.slice(0,10) : "—"}</td>
+        <td>${t.analyst_company || "—"}</td>
+        <td style="font-size:0.78rem;color:var(--muted)">${t.analyst || "—"}</td>
+        <td class="nu">${t.price_target ? "$" + Number(t.price_target).toFixed(2) : "—"}</td>
+        <td style="font-size:0.73rem;color:var(--muted);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.news_title || "—"}</td>
+      </tr>`).join('');
+      const epsRows = (d.eps_estimates || []).slice(0, 4).map(e => `<tr>
+        <td class="lc">${e.date || "—"}</td>
+        <td>${e.estimated_eps_low ? Number(e.estimated_eps_low).toFixed(2) : "—"}</td>
+        <td class="nu">${e.estimated_eps_avg ? Number(e.estimated_eps_avg).toFixed(2) : "—"}</td>
+        <td>${e.estimated_eps_high ? Number(e.estimated_eps_high).toFixed(2) : "—"}</td>
+        <td>${e.estimated_revenue_avg ? fmt(e.estimated_revenue_avg) : "—"}</td>
+        <td style="color:var(--muted);font-size:0.75rem">${e.number_analysts_eps || "—"}</td>
+      </tr>`).join('');
+      document.getElementById("analyst-results").innerHTML = `
+        <div class="hero-row" style="margin-bottom:20px">
+          <div class="hero-stat main">
+            <div class="h-label">Consensus Rating</div>
+            <div class="h-value ${ratingCls}">${d.consensus_rating || "—"}</div>
+            <div class="h-sub">${ab.total || 0} analysts</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Avg Price Target</div>
+            <div class="h-value nu">${d.consensus_price_target ? "$" + d.consensus_price_target : "—"}</div>
+            <div class="h-sub">${d.total_price_targets} targets</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Buy / Hold / Sell</div>
+            <div class="h-value">${ab.strong_buy + ab.buy || 0} / ${ab.hold || 0} / ${ab.sell + ab.strong_sell || 0}</div>
+            <div class="h-sub">Strong Buy: ${ab.strong_buy || 0}</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Bull %</div>
+            <div class="h-value nu">${total > 0 ? (((ab.strong_buy + ab.buy) / total) * 100).toFixed(0) : "—"}%</div>
+            <div class="h-sub">Bullish analysts</div>
+          </div>
+        </div>
+        ${targetRows ? `
+        <div class="section-label">Recent Price Targets</div>
+        <div class="card" style="padding:0;overflow:auto;margin-bottom:20px">
+          <table class="data-table" style="min-width:600px">
+            <thead><tr><th>Date</th><th>Firm</th><th>Analyst</th><th>Target</th><th>Note</th></tr></thead>
+            <tbody>${targetRows}</tbody>
+          </table>
+        </div>` : ''}
+        ${epsRows ? `
+        <div class="section-label">EPS Estimates</div>
+        <div class="card" style="padding:0;overflow:auto">
+          <table class="data-table" style="min-width:500px">
+            <thead><tr><th>Period</th><th>EPS Low</th><th>EPS Avg</th><th>EPS High</th><th>Revenue Est.</th><th># Analysts</th></tr></thead>
+            <tbody>${epsRows}</tbody>
+          </table>
+        </div>` : ''}`;
+    } catch (e) { setError("analyst-results", e.message); }
+  }
+
+  // ── EARNINGS CALENDAR ─────────────────────────────────────────────────────
+  async function loadEarnings() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("earnings-results", "Please enter a ticker symbol first."); return; }
+    setLoading("earnings-results", `Fetching earnings data for ${ticker.toUpperCase()}...`);
+    try {
+      const res = await fetch(`${BASE}/earnings-calendar?ticker=${ticker}&market=${market}&limit=8`);
+      const d = await res.json();
+      if (d.error) { setError("earnings-results", d.error); return; }
+      const upcoming = d.upcoming_earnings || [];
+      const upHtml = upcoming.length ? upcoming.map(e => `
+        <div class="metric">
+          <div class="m-label">${e.date || "—"} ${e.time ? '· ' + e.time : ''}</div>
+          <div class="m-value">${e.fiscal_quarter || "—"}</div>
+          <div style="font-size:0.7rem;color:var(--muted);margin-top:3px">EPS Est: ${e.eps_estimated !== null && e.eps_estimated !== undefined ? Number(e.eps_estimated).toFixed(2) : "—"}</div>
+        </div>`).join('') : '<div style="color:var(--muted);font-size:0.82rem">No upcoming earnings scheduled.</div>';
+      const histRows = (d.earnings_history || []).map(e => {
+        const beat = e.beat === true ? '<span class="earn-beat yes">BEAT</span>' : e.beat === false ? '<span class="earn-beat no">MISS</span>' : '—';
+        const surprise = e.surprise_pct !== null && e.surprise_pct !== undefined;
+        return `<tr>
+          <td class="lc">${e.date || "—"}</td>
+          <td style="font-size:0.75rem;color:var(--muted)">${e.fiscal_quarter || "—"}</td>
+          <td>${e.eps_estimated !== null && e.eps_estimated !== undefined ? Number(e.eps_estimated).toFixed(2) : "—"}</td>
+          <td>${e.eps_actual !== null && e.eps_actual !== undefined ? Number(e.eps_actual).toFixed(2) : "—"}</td>
+          <td class="${e.surprise_pct > 0 ? 'nu' : e.surprise_pct < 0 ? 'nd' : ''}">${surprise ? (e.surprise_pct > 0 ? '+' : '') + e.surprise_pct + "%" : "—"}</td>
+          <td>${beat}</td>
+          <td style="font-size:0.75rem;color:var(--muted)">${e.time || "—"}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById("earnings-results").innerHTML = `
+        <div class="hero-row" style="margin-bottom:20px">
+          <div class="hero-stat main">
+            <div class="h-label">Beat Rate</div>
+            <div class="h-value ${d.beat_rate_pct >= 70 ? 'nu' : d.beat_rate_pct < 50 ? 'nd' : ''}">${d.beat_rate_pct !== null ? d.beat_rate_pct + "%" : "—"}</div>
+            <div class="h-sub">EPS beats in last ${d.earnings_history ? d.earnings_history.length : 0} quarters</div>
+          </div>
+          <div class="hero-stat">
+            <div class="h-label">Avg EPS Surprise</div>
+            <div class="h-value ${d.avg_eps_surprise_pct > 0 ? 'nu' : 'nd'}">${d.avg_eps_surprise_pct !== null ? (d.avg_eps_surprise_pct > 0 ? '+' : '') + d.avg_eps_surprise_pct + "%" : "—"}</div>
+            <div class="h-sub">Vs. consensus estimate</div>
+          </div>
+          <div class="hero-stat" style="grid-column:span 2">
+            <div class="h-label">Next Earnings</div>
+            <div class="h-value">${upcoming.length ? upcoming[0].date : "N/A"}</div>
+            <div class="h-sub">${upcoming.length ? (upcoming[0].time || '') + " · EPS Est: " + (upcoming[0].eps_estimated !== null ? Number(upcoming[0].eps_estimated).toFixed(2) : "—") : "No upcoming date available"}</div>
+          </div>
+        </div>
+        <div class="section-label">Upcoming Earnings</div>
+        <div class="metrics-grid" style="margin-bottom:20px">${upHtml}</div>
+        <div class="section-label">Earnings Surprise History</div>
+        <div class="card" style="padding:0;overflow:auto">
+          <table class="data-table" style="min-width:600px">
+            <thead><tr><th>Date</th><th>Quarter</th><th>Est. EPS</th><th>Actual EPS</th><th>Surprise</th><th>Result</th><th>Time</th></tr></thead>
+            <tbody>${histRows}</tbody>
+          </table>
+        </div>`;
+    } catch (e) { setError("earnings-results", e.message); }
+  }
+
+  // ── IPOs ───────────────────────────────────────────────────────────────────
+  async function loadIPOs() {
+    setLoading("ipo-results", "Fetching IPO data...");
+    try {
+      const res = await fetch(`${BASE}/ipos`);
+      const data = await res.json();
+      let rows = "";
+      for (const ipo of data) {
+        const g = ipo.gain_pct;
+        rows += `<tr>
+          <td class="lc">${ipo.name}</td>
+          <td>${ipo.ipo_date}</td>
+          <td>${fmt(ipo.ipo_price)}</td>
+          <td>${fmt(ipo.current_price)}</td>
+          <td class="${g >= 0 ? 'nu' : 'nd'}">${g !== null ? pctFmt(g) : "—"}</td>
+        </tr>`;
+      }
+      document.getElementById("ipo-results").innerHTML = `
+        <table class="data-table">
+          <thead><tr><th>Name</th><th>IPO Date</th><th>Issue Price</th><th>Current</th><th>Return</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    } catch (e) { setError("ipo-results", e.message); }
+  }
+
+  // ── COMMODITIES ────────────────────────────────────────────────────────────
+  async function loadCommodities() {
+    setLoading("commodity-results", "Fetching spot prices...");
+    try {
+      const res = await fetch(`${BASE}/commodities`);
+      const data = await res.json();
+      let rows = "";
+      for (const c of data) {
+        const chg = c.change;
+        rows += `<tr>
+          <td class="lc">${c.name}</td>
+          <td>${fmt(c.price)}</td>
+          <td class="${chg >= 0 ? 'nu' : 'nd'}">${chg !== null ? pctFmt(chg) : "—"}</td>
+        </tr>`;
+      }
+      document.getElementById("commodity-results").innerHTML = `
+        <table class="data-table">
+          <thead><tr><th>Commodity</th><th>Price</th><th>Change</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    } catch (e) { setError("commodity-results", e.message); }
+  }
+</script>
+</body>
+</html>
