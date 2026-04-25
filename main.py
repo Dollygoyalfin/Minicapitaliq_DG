@@ -7,6 +7,8 @@ import os
 import httpx
 import json
 import re
+import math
+from datetime import date as _date
 
 from fastapi.responses import FileResponse
 
@@ -21,8 +23,13 @@ app.add_middleware(
 )
 
 # ── API Keys ──────────────────────────────────────────────────────────────────
-FMP_API_KEY = os.getenv("FMP_API_KEY", "")
+FMP_API_KEY  = os.getenv("FMP_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
+if not FMP_API_KEY:
+    print("WARNING: FMP_API_KEY is not set. All FMP endpoints will return empty data.")
+if not GROQ_API_KEY:
+    print("WARNING: GROQ_API_KEY is not set. AI Verdict will not work.")
 
 # ── FMP Base URL ──────────────────────────────────────────────────────────────
 FMP_BASE = "https://financialmodelingprep.com/api/v3"
@@ -191,7 +198,8 @@ def get_valuation(
         valuation_low = valuation_high = None
         if eps:
             low_growth, high_growth = growth_rate - 0.02, growth_rate + 0.02
-            low_disc,  high_disc    = wacc + 0.02,        wacc - 0.02
+            low_disc  = wacc + 0.02
+            high_disc = max(wacc - 0.02, 0.01)  # never let discount rate go below 1%
             if low_disc  > low_growth:
                 valuation_low  = (eps * (1 + low_growth))  / (low_disc  - low_growth)
             if high_disc > high_growth:
@@ -244,6 +252,8 @@ def get_financials(
             inc_list = get_fmp_income(resolved, 5)
             cf_list  = get_fmp_cashflow(resolved, 5)
             bal_list = get_fmp_balance(resolved, 5)
+            if not inc_list:
+                return {"error": f"FMP returned no income statement data for {resolved}. Check ticker or FMP plan."}
 
             def list_to_dict(records: list, key_field: str = "calendarYear") -> dict:
                 out = {}
@@ -261,7 +271,8 @@ def get_financials(
                 net_income = r.get("netIncome") or 1
                 revenue    = r.get("revenue") or 1
                 # Balance sheet key may use date string instead of calendarYear — try both
-                bal = balance_sheet.get(yr) or balance_sheet.get(r.get("date", "")[:4]) or {}
+                date_val = r.get("date") or ""
+                bal = balance_sheet.get(yr) or balance_sheet.get(str(date_val)[:4]) or {}
                 assets = bal.get("totalAssets") or 1
                 equity = bal.get("totalStockholdersEquity") or bal.get("totalEquity") or 1
                 try:
@@ -275,19 +286,46 @@ def get_financials(
             cashflow_df = stock.cashflow
             balance_df  = stock.balance_sheet
 
-            income        = {} if income_df  is None or income_df.empty  else income_df.T.head(5).to_dict()
-            cashflow      = {} if cashflow_df is None or cashflow_df.empty else cashflow_df.T.head(5).to_dict()
-            balance_sheet = {} if balance_df  is None or balance_df.empty  else balance_df.T.head(5).to_dict()
+
+            def df_to_serializable(df, n=5):
+                """Convert yfinance DataFrame to JSON-safe dict with string year keys."""
+                if df is None or df.empty:
+                    return {}
+                out = {}
+                for col in df.columns[:n]:
+                    try:
+                        yr = str(col.year)
+                    except Exception:
+                        yr = str(col)
+                    row = {}
+                    for idx in df.index:
+                        val = df.loc[idx, col]
+                        try:
+                            v = float(val)
+                            row[idx] = None if math.isnan(v) or math.isinf(v) else v
+                        except Exception:
+                            row[idx] = None
+                    out[yr] = row
+                return out
+
+            income        = df_to_serializable(income_df)
+            cashflow      = df_to_serializable(cashflow_df)
+            balance_sheet = df_to_serializable(balance_df)
 
             roe_dupont = {}
-            for year in income:
-                net_income = income[year].get("Net Income", 1)
-                revenue    = income[year].get("Total Revenue", 1)
-                assets     = balance_sheet.get(year, {}).get("Total Assets", 1)
-                equity     = balance_sheet.get(year, {}).get("Total Stockholder Equity", 1)
-                roe_dupont[year] = (
-                    (net_income / revenue) * (revenue / assets) * (assets / equity)
-                )
+            for year, row in income.items():
+                ni  = row.get("Net Income") or 1
+                rev = row.get("Total Revenue") or 1
+                bal_yr = balance_sheet.get(year, {})
+                assets = bal_yr.get("Total Assets") or 1
+                equity = (bal_yr.get("Stockholders Equity")
+                          or bal_yr.get("Total Stockholder Equity")
+                          or bal_yr.get("Common Stock Equity") or 1)
+                try:
+                    roe_val = (ni / rev) * (rev / assets) * (assets / equity)
+                    roe_dupont[year] = 0.0 if (math.isnan(roe_val) or math.isinf(roe_val)) else roe_val
+                except (ZeroDivisionError, TypeError):
+                    roe_dupont[year] = 0.0
 
         return {
             "data_source":      "FMP" if use_fmp else "yfinance",
@@ -581,14 +619,6 @@ def get_dcf(
             ca_series[i] - cl_series[i] - cash_series[i] - cpltd_series[i]
             for i in range(n_valid)
         ]
-        capex_series = []
-        for i in range(n_valid):
-            if i + 1 < len(net_ppe_series):
-                capex_val = net_ppe_series[i] - net_ppe_series[i + 1] + depr_series[i]
-            else:
-                capex_val = depr_series[i]
-            capex_series.append(max(capex_val, 0.0))
-
         delta_nwc_series = []
         for i in range(n_valid):
             if i + 1 < len(wc_series):
@@ -607,16 +637,28 @@ def get_dcf(
         net_ppe_growth = avg_yoy_growth(net_ppe_series)
         depr_growth    = avg_yoy_growth(depr_series)
 
+        # Reassign depr_series BEFORE building capex_series so capex uses correct depr
         if all(d == 0.0 for d in depr_series) and any(p > 0 for p in net_ppe_series):
             depr_series = [n * 0.05 for n in net_ppe_series]
             depr_growth = net_ppe_growth
 
-        ca_growth      = min(ca_growth,      revenue_growth)
-        cl_growth      = min(cl_growth,      revenue_growth)
-        cash_growth    = min(cash_growth,    revenue_growth)
-        cpltd_growth   = min(cpltd_growth,   revenue_growth)
-        net_ppe_growth = min(net_ppe_growth, revenue_growth)
-        depr_growth    = min(depr_growth,    revenue_growth)
+        # Build capex_series AFTER potential depr_series reassignment
+        capex_series = []
+        for i in range(n_valid):
+            if i + 1 < len(net_ppe_series):
+                capex_val = net_ppe_series[i] - net_ppe_series[i + 1] + depr_series[i]
+            else:
+                capex_val = depr_series[i]
+            capex_series.append(max(capex_val, 0.0))
+
+        # Cap growth rates: never force below -15% even if revenue is deeply negative
+        _rev_cap = max(revenue_growth, -0.15)
+        ca_growth      = min(ca_growth,      _rev_cap)
+        cl_growth      = min(cl_growth,      _rev_cap)
+        cash_growth    = min(cash_growth,    _rev_cap)
+        cpltd_growth   = min(cpltd_growth,   _rev_cap)
+        net_ppe_growth = min(net_ppe_growth, _rev_cap)
+        depr_growth    = min(depr_growth,    _rev_cap)
 
         avg_tax_rate = sum(tax_rates) / len(tax_rates) if tax_rates else 0.25
 
@@ -755,6 +797,7 @@ def get_dcf(
             "delta_nwc": round(-term_delta_nwc, 2),
             "capex": round(-term_capex, 2),
             "fcff": round(term_fcff, 2),
+            "fcff_used_for_tv": round(max(term_fcff, 0.0), 2),
             "bs_ca": round(term_ca, 2), "bs_cl": round(term_cl, 2),
             "bs_cash": round(term_cash, 2), "bs_cpltd": round(term_cpltd, 2),
             "bs_net_ppe": round(term_net_ppe, 2),
@@ -762,7 +805,10 @@ def get_dcf(
             "bs_wc": round(term_wc, 2),
         }
 
-        terminal_value    = term_fcff / (wacc - terminal_growth_rate)
+        # Clamp terminal FCFF: a going concern shouldn't have negative terminal cash flow
+        # A negative TV from NWC spike is a modelling artefact, not economic reality
+        term_fcff_floored = max(term_fcff, 0.0)
+        terminal_value    = term_fcff_floored / (wacc - terminal_growth_rate)
         pv_terminal_value = terminal_value / ((1 + wacc) ** projection_years)
         enterprise_value  = total_pv_fcff + pv_terminal_value
 
@@ -902,8 +948,13 @@ def get_reverse_dcf(
             total_debt         = info.get("totalDebt", 0) or 0
             total_cash         = info.get("totalCash", 0) or 0
 
-            income_df = stock.financials
+            income_df   = stock.financials
             cashflow_df = stock.cashflow
+
+            if income_df is None or income_df.empty:
+                return {"error": "Income statement not available for this ticker (yfinance)."}
+            if cashflow_df is None or cashflow_df.empty:
+                return {"error": "Cash flow statement not available for this ticker (yfinance)."}
 
             def find_row(df, *kw):
                 for idx in df.index:
@@ -1068,28 +1119,43 @@ def get_insider_transactions(
                 stock = yf.Ticker(resolved)
                 holders = stock.insider_transactions
                 if holders is not None and not holders.empty:
-                    return {"source": "yfinance", "transactions": holders.to_dict(orient="records")}
+                    # Convert Timestamps to strings to avoid JSON serialization error
+                    records = []
+                    for _, row in holders.iterrows():
+                        rec = {}
+                        for k, v in row.items():
+                            try:
+                                rec[str(k)] = v.isoformat() if hasattr(v, 'isoformat') else (None if (isinstance(v, float) and math.isnan(v)) else v)
+                            except Exception:
+                                rec[str(k)] = str(v)
+                        records.append(rec)
+                    return {"source": "yfinance", "transactions": records}
             return {"error": "No insider transaction data available."}
 
         transactions = []
         for t in data:
-            ttype = t.get("transactionType") or t.get("acquistionOrDisposition") or ""
+            # FMP transactionType values: "P-Purchase", "S-Sale", "S-Sale+OE",
+            # "A-Award", "M-Exempt", "G-Gift", "F-InKind", "D-Return"
+            ttype = t.get("transactionType") or ""
+            shares = t.get("securitiesTransacted") or 0
+            price  = t.get("price") or 0
             transactions.append({
                 "date":               t.get("transactionDate") or t.get("filingDate"),
-                "insider_name":       t.get("reportingName") or t.get("reporterName"),
-                "title":              t.get("typeOfOwner") or t.get("reporterTitle"),
+                "insider_name":       t.get("reportingName"),
+                "title":              t.get("typeOfOwner"),
                 "transaction_type":   ttype,
-                "shares":             t.get("securitiesTransacted") or t.get("sharesTransacted"),
-                "price":              t.get("price"),
-                "value":              t.get("value") or (
-                    (t.get("securitiesTransacted") or 0) * (t.get("price") or 0)
-                ),
+                "shares":             shares,
+                "price":              price,
+                "value":              shares * price if (shares and price) else 0,
                 "shares_owned_after": t.get("securitiesOwned"),
             })
 
         # Summary stats
-        buys  = [t for t in transactions if "purchase" in (t.get("transaction_type") or "").lower() or "acquisition" in (t.get("transaction_type") or "").lower()]
-        sells = [t for t in transactions if "sale" in (t.get("transaction_type") or "").lower() or "disposition" in (t.get("transaction_type") or "").lower()]
+        # FMP transactionType starts with "P-" for purchase, "S-" for sale
+        buys  = [t for t in transactions if (t.get("transaction_type") or "").upper().startswith("P-")
+                 or "purchase" in (t.get("transaction_type") or "").lower()]
+        sells = [t for t in transactions if (t.get("transaction_type") or "").upper().startswith("S-")
+                 or "sale" in (t.get("transaction_type") or "").lower()]
         buy_value  = sum(t.get("value") or 0 for t in buys)
         sell_value = sum(t.get("value") or 0 for t in sells)
 
@@ -1138,8 +1204,8 @@ def get_institutional_holders(
                 "change_pct":      round(h.get("change") / h.get("shares") * 100, 2) if (h.get("shares") and h.get("shares") != 0 and h.get("change") is not None) else None,
             })
 
-        total_shares = sum(h.get("shares") or 0 for h in holders)
-        net_change   = sum(h.get("change") or 0 for h in holders)
+        total_shares = sum(float(h.get("shares") or 0) for h in holders)
+        net_change   = sum(float(h.get("change") or 0) for h in holders)
 
         return {
             "ticker":              resolved,
@@ -1177,28 +1243,34 @@ def get_analyst_targets(
         targets = []
         if isinstance(targets_data, list):
             for t in targets_data[:15]:
+                pt = t.get("priceTarget") or t.get("adjPriceTarget")
                 targets.append({
-                    "published_date": t.get("publishedDate"),
-                    "analyst_company": t.get("analystCompany"),
-                    "analyst":         t.get("analyst"),
-                    "price_target":    t.get("priceTarget"),
+                    "published_date":   t.get("publishedDate"),
+                    "analyst_company":  t.get("analystCompany"),
+                    "analyst":          t.get("analyst"),
+                    "price_target":     float(pt) if pt is not None else None,
                     "adj_price_target": t.get("adjPriceTarget"),
-                    "news_title":      t.get("newsTitle"),
+                    "news_title":       t.get("newsTitle"),
+                    "news_url":         t.get("newsURL"),
                 })
 
-        # Aggregate consensus
-        all_targets = [t.get("price_target") for t in targets if t.get("price_target")]
+        # Aggregate consensus — filter None and zero values
+        all_targets = [t["price_target"] for t in targets
+                       if t.get("price_target") is not None and t["price_target"] > 0]
         consensus_target = round(sum(all_targets) / len(all_targets), 2) if all_targets else None
 
         recommendations = []
         if isinstance(consensus_data, list):
             for r in consensus_data[:8]:
+                # FMP real field names (confirmed from FMP v3 docs):
+                # analystRatingsStrongBuy, analystRatingsbuy (lowercase b), analystRatingsHold,
+                # analystRatingsSell, analystRatingsStrongSell
                 recommendations.append({
                     "date":         r.get("date"),
-                    "strong_buy":   r.get("analystRatingsStrongBuy") or r.get("analystRatingsbuy") or 0,
-                    "buy":          r.get("analystRatingsBuy") or r.get("analystRatingsOverweight") or 0,
+                    "strong_buy":   r.get("analystRatingsStrongBuy") or 0,
+                    "buy":          r.get("analystRatingsbuy") or 0,
                     "hold":         r.get("analystRatingsHold") or 0,
-                    "sell":         r.get("analystRatingsSell") or r.get("analystRatingsUnderweight") or 0,
+                    "sell":         r.get("analystRatingsSell") or 0,
                     "strong_sell":  r.get("analystRatingsStrongSell") or 0,
                 })
 
@@ -1224,13 +1296,15 @@ def get_analyst_targets(
         eps_estimates = []
         if isinstance(estimates_data, list):
             for e in estimates_data:
+                # FMP real fields: estimatedEpsAvg (NOT estimatedEpsAverage),
+                # estimatedRevenueAvg (NOT estimatedRevenueAverage)
                 eps_estimates.append({
                     "date":              e.get("date"),
-                    "estimated_eps_avg": e.get("estimatedEpsAverage"),
+                    "estimated_eps_avg": e.get("estimatedEpsAvg") or e.get("estimatedEpsAverage"),
                     "estimated_eps_low": e.get("estimatedEpsLow"),
                     "estimated_eps_high": e.get("estimatedEpsHigh"),
-                    "estimated_revenue_avg": e.get("estimatedRevenueAverage"),
-                    "number_analysts_eps":   e.get("numberAnalystEstimatedEps"),
+                    "estimated_revenue_avg": e.get("estimatedRevenueAvg") or e.get("estimatedRevenueAverage"),
+                    "number_analysts_eps":   e.get("numberAnalystEstimatedEps") or e.get("numberAnalystsEstimatedEps"),
                 })
 
         return {
@@ -1268,14 +1342,17 @@ def get_earnings_calendar(
 
         # Historical earnings surprises
         hist_data = fmp_get(f"/historical/earning_calendar/{resolved}", {"limit": limit})
-        # Upcoming earnings — use from/to so we only get future dates
-        from datetime import date, timedelta
-        today = date.today().isoformat()
-        future = (date.today() + timedelta(days=90)).isoformat()
-        upcoming_data = fmp_get(f"/earning_calendar", {"from": today, "to": future, "symbol": resolved})
-        # Fallback: if parameterized call returns nothing, try the ticker-based endpoint
+        # FMP /earning_calendar?from=&to= returns ALL companies — filter by symbol after.
+        # Safer: use /historical/earning_calendar/{ticker} and filter by date >= today.
+        today_str = _date.today().isoformat()
+        # upcoming = entries from historical calendar with date >= today
+        upcoming_data = [e for e in hist_data if isinstance(e, dict)
+                         and (e.get("date") or "") >= today_str]
         if not upcoming_data:
-            upcoming_data = fmp_get(f"/earning_calendar/{resolved}")
+            # Try dedicated upcoming endpoint as last resort
+            raw_up = fmp_get(f"/earning_calendar/{resolved}")
+            if isinstance(raw_up, list):
+                upcoming_data = [e for e in raw_up if (e.get("date") or "") >= today_str]
 
         history = []
         if isinstance(hist_data, list):
@@ -1287,7 +1364,7 @@ def get_earnings_calendar(
                     surprise_pct = round(((actual - est) / abs(est)) * 100, 2)
                 beat = None
                 if actual is not None and est is not None:
-                    beat = actual >= est
+                    beat = float(actual) >= float(est)
 
                 history.append({
                     "date":              e.get("date"),
@@ -1357,6 +1434,13 @@ def get_screener(
 
     results = []
 
+    def in_range(val, mn, mx):
+        """Check if val falls within [mn, mx]. None bounds are ignored. None val passes."""
+        if val is None: return True
+        if mn is not None and val < mn: return False
+        if mx is not None and val > mx: return False
+        return True
+
     for raw in raw_tickers:
         resolved, use_fmp = resolve_ticker(raw, market, False)
         try:
@@ -1394,12 +1478,6 @@ def get_screener(
                             week_change = ((price_now - price_prev) / price_prev) * 100
                 except Exception:
                     pass
-
-            def in_range(val, mn, mx):
-                if val is None: return True
-                if mn is not None and val < mn: return False
-                if mx is not None and val > mx: return False
-                return True
 
             passed = all([
                 in_range(pe_ratio,       min_pe,             max_pe),
@@ -1571,8 +1649,12 @@ async def get_ai_verdict(request: VerdictRequest):
 
         # ── Step 4: Insider sentiment ─────────────────────────────────────────
         insider_data   = fmp_get(f"/insider-trading/{resolved}", {"limit": 10})
-        insider_buys   = sum(1 for t in (insider_data or []) if any(x in (t.get("transactionType") or "").lower() for x in ["purchase","acquisition","buy"]))
-        insider_sells  = sum(1 for t in (insider_data or []) if any(x in (t.get("transactionType") or "").lower() for x in ["sale","disposition","sell"]))
+        insider_buys  = sum(1 for t in (insider_data or [])
+                           if (t.get("transactionType") or "").upper().startswith("P-")
+                           or "purchase" in (t.get("transactionType") or "").lower())
+        insider_sells = sum(1 for t in (insider_data or [])
+                            if (t.get("transactionType") or "").upper().startswith("S-")
+                            or "sale" in (t.get("transactionType") or "").lower())
         insider_signal = "Bullish" if insider_buys > insider_sells else "Bearish" if insider_sells > insider_buys else "Neutral"
 
         # ── Step 5: Earnings surprise history ────────────────────────────────
@@ -1581,7 +1663,10 @@ async def get_ai_verdict(request: VerdictRequest):
         if isinstance(earn_data, list):
             for e in earn_data[:4]:
                 actual = e.get("eps"); est = e.get("epsEstimated")
-                surprise = round(((actual - est) / abs(est)) * 100, 1) if actual and est and est != 0 else None
+                try:
+                    surprise = round(((float(actual) - float(est)) / abs(float(est))) * 100, 1) if actual is not None and est is not None and float(est) != 0 else None
+                except (TypeError, ValueError, ZeroDivisionError):
+                    surprise = None
                 earn_lines.append(f"  {e.get('date')}: Actual EPS={actual}, Est={est}, Surprise={surprise}%")
         earnings_text = "\n".join(earn_lines) if earn_lines else "  No earnings history available"
 
