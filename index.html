@@ -2,8 +2,23 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
   <title>MiniTradeIQ</title>
+
+  <!-- PWA -->
+  <link rel="manifest" href="/manifest.json"/>
+  <meta name="theme-color" content="#1a1814"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="TradeIQ"/>
+  <link rel="apple-touch-icon" href="/icon-192.png"/>
+  <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png"/>
+  <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png"/>
+
+  <!-- SEO / share -->
+  <meta name="description" content="AI-powered stock valuation, DCF analysis and investment verdicts"/>
+
   <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
   <style>
     :root {
@@ -28,6 +43,9 @@
       background: var(--cream);
       color: var(--ink);
       font-family: 'DM Sans', sans-serif;
+      /* Safe area for notched phones */
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
       font-weight: 300;
       min-height: 100vh;
     }
@@ -76,6 +94,12 @@
       letter-spacing: 1.5px;
       text-transform: uppercase;
       transition: border-color 0.15s;
+    }
+    /* Prevent iOS Safari auto-zoom on focus (requires ≥16px font) */
+    @media (max-width: 768px) {
+      .ticker-input { font-size: 16px; letter-spacing: 1px; }
+      .ticker-input::placeholder { font-size: 14px; }
+      input, select { font-size: 16px !important; }
     }
     .ticker-input:focus { border-color: var(--ink); background: var(--white); }
     .ticker-input::placeholder { color: var(--muted); font-weight: 400; letter-spacing: 0.5px; text-transform: none; }
@@ -403,6 +427,46 @@
       .hero-stat.main { grid-column: 1 / -1; }
       .header-tagline { display: none; }
       .rdcf-scenario { flex-direction: column; }
+      /* Collapse search-row buttons to 2-per-row on small screens */
+      .search-row { gap: 8px; }
+      .btn-ghost { flex: 1 1 calc(50% - 4px); text-align: center; font-size: 0.78rem; padding: 9px 10px; }
+      .btn-primary { width: 100%; }
+      .adv-toggle { width: 100%; justify-content: center; }
+      .ticker-input-wrap { min-width: 100%; }
+      .market-select { flex: 1; }
+    }
+
+    /* iOS install hint banner */
+    #ios-install-hint {
+      display: none;
+      position: fixed;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: var(--ink);
+      color: var(--cream);
+      padding: 12px 18px;
+      border-radius: 4px;
+      font-size: 0.78rem;
+      z-index: 9999;
+      max-width: calc(100vw - 32px);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+      text-align: center;
+      line-height: 1.6;
+    }
+    #ios-install-hint.show { display: block; }
+    #ios-install-hint .ios-close {
+      display: inline-block; margin-left: 12px; color: var(--muted);
+      cursor: pointer; font-size: 1rem; vertical-align: middle;
+    }
+
+    /* Horizontal scroll shadow hint for tables */
+    .scroll-hint-wrap { position: relative; overflow: hidden; }
+    .scroll-hint-wrap::after {
+      content: '';
+      position: absolute; top: 0; right: 0; bottom: 0; width: 40px;
+      background: linear-gradient(to right, transparent, rgba(255,255,255,0.85));
+      pointer-events: none;
     }
 
     /* ── Advanced Mode toggle ── */
@@ -443,9 +507,75 @@
     .rdcf-cell .rs-growth { font-family: 'Playfair Display', serif; font-size: 1.2rem; font-weight: 700; color: var(--ink); }
     .rdcf-cell .rs-price { font-family: 'DM Mono', monospace; font-size: 0.8rem; color: var(--ink2); margin-top: 4px; }
     .rdcf-cell .rs-vs { font-size: 0.68rem; margin-top: 2px; }
+
+    /* ── PWA Install Banner ── */
+    #pwa-banner {
+      display: none;
+      position: fixed;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: var(--ink);
+      color: var(--cream);
+      padding: 14px 20px;
+      border-radius: 4px;
+      font-size: 0.82rem;
+      z-index: 9999;
+      gap: 14px;
+      align-items: center;
+      max-width: calc(100vw - 32px);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+    }
+    #pwa-banner.show { display: flex; }
+    #pwa-banner button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 7px 14px;
+      border-radius: 2px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #pwa-banner .pwa-dismiss {
+      background: transparent;
+      color: var(--muted);
+      padding: 7px 8px;
+      font-size: 1rem;
+    }
+
+    /* ── Offline indicator ── */
+    #offline-bar {
+      display: none;
+      background: #c8421a;
+      color: #fff;
+      text-align: center;
+      font-size: 0.75rem;
+      padding: 6px;
+      position: sticky;
+      top: 0;
+      z-index: 9998;
+    }
+    body.offline #offline-bar { display: block; }
+
+    /* ── Mobile tab scrolling ── */
+    .tab-row { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+    .tab-row::-webkit-scrollbar { display: none; }
+    .tab-row .tab { white-space: nowrap; flex-shrink: 0; }
   </style>
 </head>
 <body>
+<div id="offline-bar">⚡ You are offline — live data unavailable</div>
+<div id="pwa-banner">
+  <span>📱 Add TradeIQ to your home screen</span>
+  <button id="pwa-install-btn">Install</button>
+  <button class="pwa-dismiss" id="pwa-dismiss">✕</button>
+</div>
+<div id="ios-install-hint">
+  📱 Install TradeIQ: tap <strong>Share</strong> (□↑) then <strong>"Add to Home Screen"</strong>
+  <span class="ios-close" id="ios-hint-close">✕</span>
+</div>
 
 <header>
   <div class="header-left">
@@ -1902,6 +2032,74 @@
           <tbody>${rows}</tbody>
         </table>`;
     } catch (e) { setError("commodity-results", e.message); }
+  }
+
+  // ── SERVICE WORKER REGISTRATION ──────────────────────────────────────────
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js')
+        .then(reg => console.log('SW registered:', reg.scope))
+        .catch(err => console.warn('SW registration failed:', err));
+    });
+  }
+
+  // ── OFFLINE DETECTION ────────────────────────────────────────────────────
+  function updateOnlineStatus() {
+    document.body.classList.toggle('offline', !navigator.onLine);
+  }
+  window.addEventListener('online',  updateOnlineStatus);
+  window.addEventListener('offline', updateOnlineStatus);
+  updateOnlineStatus();
+
+  // ── PWA INSTALL PROMPT ───────────────────────────────────────────────────
+  let deferredPrompt = null;
+  const banner      = document.getElementById('pwa-banner');
+  const installBtn  = document.getElementById('pwa-install-btn');
+  const dismissBtn  = document.getElementById('pwa-dismiss');
+
+  window.addEventListener('beforeinstallprompt', e => {
+    e.preventDefault();
+    deferredPrompt = e;
+    // Only show if not dismissed before
+    if (!localStorage.getItem('pwa-dismissed')) {
+      setTimeout(() => banner.classList.add('show'), 2000);
+    }
+  });
+
+  installBtn && installBtn.addEventListener('click', async () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    const { outcome } = await deferredPrompt.userChoice;
+    console.log('PWA install outcome:', outcome);
+    deferredPrompt = null;
+    banner.classList.remove('show');
+  });
+
+  dismissBtn && dismissBtn.addEventListener('click', () => {
+    banner.classList.remove('show');
+    localStorage.setItem('pwa-dismissed', '1');
+  });
+
+  // Hide banner if already installed
+  window.addEventListener('appinstalled', () => {
+    banner.classList.remove('show');
+    console.log('TradeIQ PWA installed!');
+  });
+
+  // ── iOS INSTALL HINT ─────────────────────────────────────────────────────
+  // beforeinstallprompt never fires on iOS Safari — show a manual hint instead
+  const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  const isInStandaloneMode = window.matchMedia('(display-mode: standalone)').matches
+    || window.navigator.standalone === true;
+
+  if (isIOS && !isInStandaloneMode && !localStorage.getItem('ios-hint-dismissed')) {
+    const iosHint = document.getElementById('ios-install-hint');
+    const iosClose = document.getElementById('ios-hint-close');
+    setTimeout(() => iosHint && iosHint.classList.add('show'), 3000);
+    iosClose && iosClose.addEventListener('click', () => {
+      iosHint.classList.remove('show');
+      localStorage.setItem('ios-hint-dismissed', '1');
+    });
   }
 </script>
 </body>
