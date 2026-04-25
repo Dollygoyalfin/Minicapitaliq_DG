@@ -800,6 +800,7 @@
     setLoading("valuation-results", `Fetching ${ticker.toUpperCase()}...`);
     try {
       const res = await fetch(`${BASE}/valuation?ticker=${ticker}&market=${market}&advanced=${getAdvanced()}`);
+      if (!res.ok) { setError("valuation-results", `Server error ${res.status}`); return; }
       const d = await res.json();
       if (d.error) { setError("valuation-results", d.error); return; }
 
@@ -886,6 +887,7 @@
 
     try {
       const res = await fetch(`${BASE}/dcf?ticker=${ticker}&market=${market}&projection_years=${years}&terminal_growth_rate=${terminal}&risk_free_rate=${rf}&market_return=${mr}&margin_of_safety=${mos}&advanced=${getAdvanced()}`);
+      if (!res.ok) { setError("dcf-results", `Server error ${res.status}`); return; }
       const d = await res.json();
       if (d.error) { setError("dcf-results", d.error); return; }
 
@@ -1322,6 +1324,19 @@
   }
 
   // ── FINANCIALS ─────────────────────────────────────────────────────────────
+  // Helper: read a field from FMP or yfinance income row
+  function fldInc(row, fmpKey, yfKey) {
+    // FMP keys are camelCase, yfinance keys are "Title Case With Spaces"
+    if (row[fmpKey] !== undefined && row[fmpKey] !== null) return row[fmpKey];
+    if (row[yfKey]  !== undefined && row[yfKey]  !== null) return row[yfKey];
+    return null;
+  }
+  function fldBal(row, fmpKey, yfKey) {
+    if (row[fmpKey] !== undefined && row[fmpKey] !== null) return row[fmpKey];
+    if (row[yfKey]  !== undefined && row[yfKey]  !== null) return row[yfKey];
+    return null;
+  }
+
   async function runFinancials() {
     const ticker = getTicker(), market = getMarket();
     if (!ticker) { setError("financials-results", "Please enter a ticker symbol first."); return; }
@@ -1329,35 +1344,110 @@
     setLoading("financials-results", `Loading financials for ${ticker.toUpperCase()}...`);
     try {
       const res = await fetch(`${BASE}/financials?ticker=${ticker}&market=${market}&advanced=${getAdvanced()}`);
+      if (!res.ok) { setError("financials-results", `Server error ${res.status}`); return; }
       const d = await res.json();
       if (d.error) { setError("financials-results", d.error); return; }
       if (!d.income_statement || Object.keys(d.income_statement).length === 0) {
         setError("financials-results", "Financial data not available for this ticker."); return;
       }
+
+      const isFMP = d.data_source === "FMP";
+      const srcBadge = `<span style="font-size:0.68rem;padding:2px 8px;background:var(--cream);border:1px solid var(--line);border-radius:2px;color:var(--muted);margin-left:8px">${d.data_source || "yfinance"}</span>`;
+
+      // ── Income Statement ──
       let incomeRows = "";
       for (const year in d.income_statement) {
         const row = d.income_statement[year];
-        const ni = row["Net Income"];
-        incomeRows += `<tr><td class="lc">${year}</td><td>${fmt(row["Total Revenue"])}</td><td class="${ni > 0 ? 'nu' : 'nd'}">${fmt(ni)}</td></tr>`;
+        const rev  = isFMP ? row.revenue        : row["Total Revenue"];
+        const ni   = isFMP ? row.netIncome       : row["Net Income"];
+        const gp   = isFMP ? row.grossProfit     : row["Gross Profit"];
+        const ebit = isFMP ? row.operatingIncome : row["Operating Income"];
+        const eps  = isFMP ? row.eps             : row["Basic EPS"];
+        const rnd  = isFMP ? row.researchAndDevelopmentExpenses : row["Research And Development"];
+        incomeRows += `<tr>
+          <td class="lc">${year}</td>
+          <td>${fmt(rev)}</td>
+          <td>${fmt(gp)}</td>
+          <td>${fmt(ebit)}</td>
+          <td class="${ni > 0 ? 'nu' : ni < 0 ? 'nd' : ''}">${fmt(ni)}</td>
+          <td>${eps !== null && eps !== undefined ? Number(eps).toFixed(2) : "—"}</td>
+          <td>${fmt(rnd)}</td>
+        </tr>`;
       }
+
+      // ── Cash Flow ──
+      let cfRows = "";
+      for (const year in d.cash_flow) {
+        const row = d.cash_flow[year];
+        const ocf  = isFMP ? row.operatingCashFlow          : row["Operating Cash Flow"];
+        const cex  = isFMP ? row.capitalExpenditure         : row["Capital Expenditure"];
+        const fcf  = isFMP ? row.freeCashFlow               : row["Free Cash Flow"];
+        const depr = isFMP ? row.depreciationAndAmortization: row["Depreciation And Amortization"];
+        cfRows += `<tr>
+          <td class="lc">${year}</td>
+          <td class="${ocf > 0 ? 'nu' : 'nd'}">${fmt(ocf)}</td>
+          <td class="${cex < 0 ? 'nd' : ''}">${fmt(cex)}</td>
+          <td class="${fcf > 0 ? 'nu' : 'nd'}">${fmt(fcf)}</td>
+          <td>${fmt(depr)}</td>
+        </tr>`;
+      }
+
+      // ── Balance Sheet ──
+      let balRows = "";
+      for (const year in d.balance_sheet) {
+        const row = d.balance_sheet[year];
+        const ta   = isFMP ? row.totalAssets              : row["Total Assets"];
+        const tl   = isFMP ? row.totalLiabilities         : row["Total Liabilities Net Minority Interest"];
+        const eq   = isFMP ? (row.totalStockholdersEquity || row.totalEquity) : row["Stockholders Equity"];
+        const cash = isFMP ? row.cashAndCashEquivalents   : row["Cash And Cash Equivalents"];
+        const debt = isFMP ? row.totalDebt                : row["Total Debt"];
+        balRows += `<tr>
+          <td class="lc">${year}</td>
+          <td>${fmt(ta)}</td>
+          <td>${fmt(tl)}</td>
+          <td class="${eq > 0 ? 'nu' : 'nd'}">${fmt(eq)}</td>
+          <td>${fmt(cash)}</td>
+          <td>${fmt(debt)}</td>
+        </tr>`;
+      }
+
+      // ── DuPont ──
       let dupRows = "";
       for (const year in d.dupont_roe) {
         const roe = d.dupont_roe[year];
-        dupRows += `<tr><td class="lc">${year}</td><td class="${roe > 0 ? 'nu' : 'nd'}">${roe ? fmtPct(roe * 100) : "—"}</td></tr>`;
+        dupRows += `<tr>
+          <td class="lc">${year}</td>
+          <td class="${roe > 0 ? 'nu' : 'nd'}">${roe !== null ? fmtPct(roe * 100) : "—"}</td>
+        </tr>`;
       }
+
       document.getElementById("financials-results").innerHTML = `
-        <div class="section-label">Income Statement — 5 Years</div>
-        <div class="card" style="padding:0;overflow:hidden;margin-bottom:24px">
-          <table class="data-table">
-            <thead><tr><th>Year</th><th>Revenue</th><th>Net Income</th></tr></thead>
-            <tbody>${incomeRows}</tbody>
+        <div class="section-label">Income Statement${srcBadge}</div>
+        <div class="card" style="padding:0;overflow:auto;margin-bottom:24px">
+          <table class="data-table" style="min-width:650px">
+            <thead><tr><th>Year</th><th>Revenue</th><th>Gross Profit</th><th>EBIT</th><th>Net Income</th><th>EPS</th><th>R&D</th></tr></thead>
+            <tbody>${incomeRows || '<tr><td colspan="7" style="color:var(--muted);text-align:center">No data</td></tr>'}</tbody>
+          </table>
+        </div>
+        <div class="section-label">Cash Flow Statement</div>
+        <div class="card" style="padding:0;overflow:auto;margin-bottom:24px">
+          <table class="data-table" style="min-width:550px">
+            <thead><tr><th>Year</th><th>Operating CF</th><th>CapEx</th><th>Free Cash Flow</th><th>D&A</th></tr></thead>
+            <tbody>${cfRows || '<tr><td colspan="5" style="color:var(--muted);text-align:center">No data</td></tr>'}</tbody>
+          </table>
+        </div>
+        <div class="section-label">Balance Sheet</div>
+        <div class="card" style="padding:0;overflow:auto;margin-bottom:24px">
+          <table class="data-table" style="min-width:620px">
+            <thead><tr><th>Year</th><th>Total Assets</th><th>Total Liabilities</th><th>Equity</th><th>Cash</th><th>Total Debt</th></tr></thead>
+            <tbody>${balRows || '<tr><td colspan="6" style="color:var(--muted);text-align:center">No data</td></tr>'}</tbody>
           </table>
         </div>
         <div class="section-label">DuPont ROE Analysis</div>
         <div class="card" style="padding:0;overflow:hidden">
           <table class="data-table">
             <thead><tr><th>Year</th><th>Return on Equity</th></tr></thead>
-            <tbody>${dupRows}</tbody>
+            <tbody>${dupRows || '<tr><td colspan="2" style="color:var(--muted);text-align:center">No data</td></tr>'}</tbody>
           </table>
         </div>`;
     } catch (e) { setError("financials-results", e.message); }
