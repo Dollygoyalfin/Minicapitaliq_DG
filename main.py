@@ -11,6 +11,8 @@ import math
 from datetime import date as _date
 
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+import pathlib
 
 app = FastAPI()
 
@@ -21,6 +23,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── PWA static files (manifest, sw, icons) ───────────────────────────────────
+_STATIC_DIR = pathlib.Path(__file__).parent  # same folder as main.py
+
+@app.get("/manifest.json", include_in_schema=False)
+def serve_manifest():
+    return FileResponse(_STATIC_DIR / "manifest.json", media_type="application/manifest+json")
+
+@app.get("/sw.js", include_in_schema=False)
+def serve_sw():
+    return FileResponse(_STATIC_DIR / "sw.js", media_type="application/javascript",
+                        headers={"Service-Worker-Allowed": "/"})
+
+@app.get("/icon-192.png", include_in_schema=False)
+def serve_icon192():
+    return FileResponse(_STATIC_DIR / "icon-192.png", media_type="image/png")
+
+@app.get("/icon-512.png", include_in_schema=False)
+def serve_icon512():
+    return FileResponse(_STATIC_DIR / "icon-512.png", media_type="image/png")
 
 # ── API Keys ──────────────────────────────────────────────────────────────────
 FMP_API_KEY  = os.getenv("FMP_API_KEY", "")
