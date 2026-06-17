@@ -1,3 +1,6 @@
+import sys
+import functools
+print = functools.partial(print, flush=True)
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -61,19 +64,18 @@ FMP_BASE = "https://financialmodelingprep.com/stable"
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fmp_get(path: str, params: dict = None) -> dict | list:
-    """Generic FMP GET. Returns parsed JSON or empty list/dict on error."""
     try:
         url = f"{FMP_BASE}{path}"
         p = dict(params) if params else {}
         p["apikey"] = FMP_API_KEY
         resp = httpx.get(url, params=p, timeout=15)
+        print(f"[FMP DEBUG] {path} | status={resp.status_code} | body={resp.text[:300]!r}", flush=True)
         data = resp.json()
         if isinstance(data, dict) and ("Error Message" in data or "error" in data):
-            print(f"[FMP DEBUG] Error in response: {data}")
             return []
         return data
     except Exception as e:
-        print(f"[FMP DEBUG] Exception: {e}")
+        print(f"[FMP DEBUG] {path} | EXCEPTION: {type(e).__name__}: {e}", flush=True)
         return []
 
 
