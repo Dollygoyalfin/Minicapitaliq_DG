@@ -144,20 +144,19 @@ def resolve_ticker(ticker: str, market: str, advanced: bool = False) -> tuple[st
     """
     Returns (resolved_ticker, use_fmp).
     - India + default  → yfinance (.NS suffix)
-    - India + advanced → FMP (NO .NS — FMP uses bare ticker e.g. RELIANCE)
+    - India + advanced → FMP (KEEP .NS suffix — FMP uses TICKER.NS for NSE listings)
     - US               → FMP always
     """
     t = ticker.upper()
     if market.lower() == "india":
+        if not t.endswith(".NS"):
+            t += ".NS"
         if advanced:
-            # FMP does not support .NS suffix — strip it
-            return t.replace(".NS", ""), True
+            return t, True   # FMP: keep .NS
         else:
-            if not t.endswith(".NS"):
-                t += ".NS"
-            return t, False
+            return t, False  # yfinance: keep .NS
     else:
-        return t, True  # US always uses FMP
+        return t, True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
