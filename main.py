@@ -74,6 +74,26 @@ def fmp_get(path: str, params: dict = None) -> dict | list:
         return data
     except Exception:
         return []
+def fmp_get(path: str, params: dict = None) -> dict | list:
+    """Generic FMP GET. Returns parsed JSON or empty list/dict on error."""
+    try:
+        url = f"{FMP_BASE}{path}"
+        p = dict(params) if params else {}
+        p["apikey"] = FMP_API_KEY
+        resp = httpx.get(url, params=p, timeout=15)
+
+        # TEMP DEBUG — remove after diagnosing
+        print(f"[FMP DEBUG] URL: {url} | params: {p} | status: {resp.status_code}")
+        print(f"[FMP DEBUG] body: {resp.text[:500]}")
+
+        data = resp.json()
+        if isinstance(data, dict) and ("Error Message" in data or "error" in data):
+            print(f"[FMP DEBUG] Error in response: {data}")
+            return []
+        return data
+    except Exception as e:
+        print(f"[FMP DEBUG] Exception: {e}")
+        return []
 
 
 def get_fmp_profile(ticker: str) -> dict:
