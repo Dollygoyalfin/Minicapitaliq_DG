@@ -54,7 +54,7 @@ if not GROQ_API_KEY:
     print("WARNING: GROQ_API_KEY is not set. AI Verdict will not work.")
 
 # ── FMP Base URL ──────────────────────────────────────────────────────────────
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+FMP_BASE = "https://financialmodelingprep.com/stable"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  FMP HELPERS
@@ -68,25 +68,6 @@ def fmp_get(path: str, params: dict = None) -> dict | list:
         p["apikey"] = FMP_API_KEY
         resp = httpx.get(url, params=p, timeout=15)
         data = resp.json()
-        # FMP returns {"Error Message": "..."} on bad key / unknown ticker
-        if isinstance(data, dict) and ("Error Message" in data or "error" in data):
-            return []
-        return data
-    except Exception:
-        return []
-def fmp_get(path: str, params: dict = None) -> dict | list:
-    """Generic FMP GET. Returns parsed JSON or empty list/dict on error."""
-    try:
-        url = f"{FMP_BASE}{path}"
-        p = dict(params) if params else {}
-        p["apikey"] = FMP_API_KEY
-        resp = httpx.get(url, params=p, timeout=15)
-
-        # TEMP DEBUG — remove after diagnosing
-        print(f"[FMP DEBUG] URL: {url} | params: {p} | status: {resp.status_code}")
-        print(f"[FMP DEBUG] body: {resp.text[:500]}")
-
-        data = resp.json()
         if isinstance(data, dict) and ("Error Message" in data or "error" in data):
             print(f"[FMP DEBUG] Error in response: {data}")
             return []
@@ -97,21 +78,16 @@ def fmp_get(path: str, params: dict = None) -> dict | list:
 
 
 def get_fmp_profile(ticker: str) -> dict:
-    """Fetch stock profile + latest balance sheet from FMP, map to yfinance-style keys.
-    FMP /profile does NOT include totalDebt/totalCash — pulled from balance sheet instead.
-    """
-    data = fmp_get(f"/profile/{ticker}")
+    data = fmp_get("/profile", {"symbol": ticker})
     if not data or not isinstance(data, list) or not data[0]:
         return {}
     d = data[0]
 
-    # Pull totalDebt and totalCash from latest balance sheet
-    bal = fmp_get(f"/balance-sheet-statement/{ticker}", {"limit": 1})
+    bal = fmp_get("/balance-sheet-statement", {"symbol": ticker, "limit": 1})
     bal0 = bal[0] if isinstance(bal, list) and bal else {}
     total_debt = float(bal0.get("totalDebt") or bal0.get("longTermDebt") or 0)
     total_cash = float(bal0.get("cashAndShortTermInvestments") or bal0.get("cashAndCashEquivalents") or 0)
 
-    # sharesOutstanding: use profile value, fall back to mktCap/price derivation
     shares = d.get("sharesOutstanding")
     if not shares:
         mktcap = d.get("mktCap") or 0
@@ -143,22 +119,18 @@ def get_fmp_profile(ticker: str) -> dict:
 
 
 def get_fmp_income(ticker: str, limit: int = 6) -> list:
-    """Annual income statements from FMP."""
-    data = fmp_get(f"/income-statement/{ticker}", {"limit": limit})
+    data = fmp_get("/income-statement", {"symbol": ticker, "limit": limit})
     return data if isinstance(data, list) else []
 
 
 def get_fmp_cashflow(ticker: str, limit: int = 6) -> list:
-    """Annual cash flow statements from FMP."""
-    data = fmp_get(f"/cash-flow-statement/{ticker}", {"limit": limit})
+    data = fmp_get("/cash-flow-statement", {"symbol": ticker, "limit": limit})
     return data if isinstance(data, list) else []
 
 
 def get_fmp_balance(ticker: str, limit: int = 7) -> list:
-    """Annual balance sheets from FMP."""
-    data = fmp_get(f"/balance-sheet-statement/{ticker}", {"limit": limit})
+    data = fmp_get("/balance-sheet-statement", {"symbol": ticker, "limit": limit})
     return data if isinstance(data, list) else []
-
 
 def resolve_ticker(ticker: str, market: str, advanced: bool = False) -> tuple[str, bool]:
     """
