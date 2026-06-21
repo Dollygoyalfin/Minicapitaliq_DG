@@ -12,6 +12,7 @@ import json
 import re
 import math
 from datetime import date as _date
+from fmp_data_layer import get_company_data
 
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -358,250 +359,102 @@ def get_financials(
 #  /dcf  — yfinance for India default, FMP for US / Advanced
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Requires: from fmp_data_layer import get_company_data   (add this import to main.py)
+
 @app.get("/dcf")
 def get_dcf(
     ticker: str = Query(...),
     market: str = Query("us"),
-    advanced: bool = Query(False),
-    projection_years: int = Query(5),
-    risk_free_rate: float = Query(0.04),
-    market_return: float = Query(0.10),
-    terminal_growth_rate: float = Query(0.03),
-    margin_of_safety: float = Query(0.25),
+    source: str = Query("auto", description="Data source: auto / yfinance / fmp. Auto = yfinance for India, FMP for US."),
+    projection_years: int = Query(5, description="Number of years to project FCFF"),
+    risk_free_rate: float = Query(0.04, description="Risk-free rate (decimal)"),
+    market_return: float = Query(0.10, description="Expected market return (decimal)"),
+    terminal_growth_rate: float = Query(0.03, description="Terminal growth rate for perpetuity (decimal)"),
+    margin_of_safety: float = Query(0.25, description="Margin of safety (decimal, e.g. 0.25 = 25%)")
 ):
+    """
+    Cash-based FCFF DCF Valuation.
+
+    Data source (hybrid):
+      - India stocks default to yfinance (reliable for NSE)
+      - US stocks default to FMP (more reliable financial statements than yfinance)
+      - Pass source=fmp or source=yfinance to override
+      - Built-in caching (15 min) + retry-with-backoff to avoid
+        yfinance's "Too Many Requests" rate-limit errors
+
+    Income Statement (Revenue, OpEx):
+      - Each line has its own avg YoY growth rate from historical data
+      - Projected by compounding that rate forward
+
+    Balance Sheet lines (CA, CL, Cash, CPLTD, Net PPE, Depreciation):
+      - Each line has its own avg YoY growth rate from historical data
+      - Projected Years 1-N by compounding
+      - Terminal Year = rolling avg of previous 5 projected years
+
+    Derived each year:
+      WC    = CA - CL - Cash - CPLTD
+      ΔNWC  = WC(year) - WC(year-1)
+      CapEx = Net PPE(year) - Net PPE(year-1) + Depreciation(year)
+
+    FCFF  = NOP*(1-t) - ΔNWC - CapEx
+    TV    = FCFF_terminal / (WACC - terminal_growth_rate)
+    EV    = Σ PV(FCFF) + PV(TV)
+    Equity = EV + Cash + Investments - Debt - Minority Interest
+    """
     try:
-        resolved, use_fmp = resolve_ticker(ticker, market, advanced)
+        # ── Ticker setup + fetch via hybrid data layer ──────────────────────────
+        raw_ticker = ticker.upper()
+        if market.lower() == "india" and not raw_ticker.endswith(".NS"):
+            raw_ticker += ".NS"
 
-        # ── Pull data (FMP or yfinance) ───────────────────────────────────────
-        if use_fmp:
-            info     = get_fmp_profile(resolved)
-            inc_list = get_fmp_income(resolved, 7)
-            cf_list  = get_fmp_cashflow(resolved, 7)
-            bal_list = get_fmp_balance(resolved, 8)
+        try:
+            info, income_df, balance_df, cashflow_df, data_source = get_company_data(
+                ticker=ticker, market=market, source=source
+            )
+        except Exception as fetch_err:
+            return {"error": f"Could not fetch financial data: {fetch_err}"}
 
-            if not info:
-                return {"error": f"FMP profile returned no data for {resolved}. Check ticker symbol."}
-            if not inc_list:
-                return {"error": f"FMP income statement empty for {resolved}. Ticker may not be supported on your FMP plan."}
-            if not bal_list:
-                return {"error": f"FMP balance sheet empty for {resolved}."}
+        # ── Info fields ───────────────────────────────────────────────────────
+        current_price      = info.get("currentPrice")
+        shares_outstanding = info.get("sharesOutstanding")
+        beta               = info.get("beta", 1.0) or 1.0
+        market_cap         = info.get("marketCap")
+        total_debt         = info.get("totalDebt", 0) or 0
+        total_cash         = info.get("totalCash", 0) or 0
 
-            current_price      = info.get("currentPrice")
-            shares_outstanding = info.get("sharesOutstanding")
-            beta               = info.get("beta") or 1.0
-            market_cap         = info.get("marketCap")
-            total_debt         = info.get("totalDebt") or 0
-            total_cash         = info.get("totalCash") or 0
+        if not shares_outstanding or shares_outstanding == 0:
+            return {"error": "Shares outstanding not available for this ticker."}
 
-            if not shares_outstanding or shares_outstanding == 0:
-                return {"error": "Shares outstanding not available for this ticker."}
+        for label, df in [("Income statement", income_df),
+                           ("Cash flow statement", cashflow_df),
+                           ("Balance sheet", balance_df)]:
+            if df is None or df.empty:
+                return {"error": f"{label} not available for this ticker (source: {data_source})."}
 
-            # FMP field extractors
-            def fi(record, field, fallback=0.0):
-                v = record.get(field)
-                try:
-                    return float(v) if v is not None else fallback
-                except Exception:
-                    return fallback
+        # ── Helpers ───────────────────────────────────────────────────────────
+        def find_row(df, *keywords):
+            for idx in df.index:
+                if all(k.lower() in idx.lower() for k in keywords):
+                    return idx
+            return None
 
-            # Build series from FMP (index 0 = most recent)
-            revenue_series = []; opex_series = []; tax_rates = []; year_labels = []
-            ca_series = []; cl_series = []; cash_series = []; cpltd_series = []
-            net_ppe_series = []; depr_series = []
-
-            n = min(len(inc_list), len(cf_list), len(bal_list), 7)
-
-            for i in range(n):
-                inc = inc_list[i] if i < len(inc_list) else {}
-                cf  = cf_list[i]  if i < len(cf_list)  else {}
-                bal = bal_list[i] if i < len(bal_list) else {}
-
-                revenue = fi(inc, "revenue")
-                if revenue == 0.0:
-                    continue
-
-                # FMP: operatingExpenses = SG&A only (NOT total cost).
-                # Total operating cost = costOfRevenue + operatingExpenses.
-                # Fall back to costAndExpenses if both are zero.
-                cogs   = fi(inc, "costOfRevenue")
-                sgna   = fi(inc, "operatingExpenses")
-                opex   = (cogs + sgna) if (cogs + sgna) > 0 else fi(inc, "costAndExpenses")
-                # Last resort: derive from grossProfit
-                if opex == 0:
-                    gross = fi(inc, "grossProfit")
-                    ebit  = fi(inc, "operatingIncome") or fi(inc, "ebitda")
-                    opex  = revenue - gross + (gross - ebit) if gross and ebit else revenue * 0.7
-
-                # Tax rate
-                pretax   = fi(inc, "incomeBeforeTax")
-                tax_prov = fi(inc, "incomeTaxExpense")
-                if pretax != 0 and tax_prov != 0:
-                    yr_tax = max(0.05, min(abs(tax_prov / pretax), 0.40))
-                else:
-                    yr_tax = 0.25
-
-                ca      = fi(bal, "totalCurrentAssets")
-                cl      = fi(bal, "totalCurrentLiabilities")
-                csh     = fi(bal, "cashAndCashEquivalents")
-                cpltd   = fi(bal, "shortTermDebt") or fi(bal, "capitalLeaseObligations") or 0.0
-                net_ppe = fi(bal, "propertyPlantEquipmentNet")
-                depr    = abs(fi(cf, "depreciationAndAmortization"))
-
-                try:
-                    year_labels.append(str(inc.get("calendarYear", inc.get("date", f"Y-{i}"))))
-                except Exception:
-                    year_labels.append(f"Y-{i}")
-
-                revenue_series.append(revenue)
-                opex_series.append(opex)
-                tax_rates.append(yr_tax)
-                ca_series.append(ca)
-                cl_series.append(cl)
-                cash_series.append(csh)
-                cpltd_series.append(cpltd)
-                net_ppe_series.append(net_ppe)
-                depr_series.append(depr)
-
-            # Interest expense for WACC cost of debt
-            interest_expense = abs(fi(inc_list[0], "interestExpense")) if inc_list else 0.0
-
-        else:
-            # ── yfinance path (Indian stocks default) ─────────────────────────
-            stock = yf.Ticker(resolved)
-            info  = stock.info
-
-            current_price      = info.get("currentPrice")
-            shares_outstanding = info.get("sharesOutstanding")
-            beta               = info.get("beta", 1.0) or 1.0
-            market_cap         = info.get("marketCap")
-            total_debt         = info.get("totalDebt", 0) or 0
-            total_cash         = info.get("totalCash", 0) or 0
-
-            if not shares_outstanding or shares_outstanding == 0:
-                return {"error": "Shares outstanding not available for this ticker."}
-
-            income_df   = stock.financials
-            cashflow_df = stock.cashflow
-            balance_df  = stock.balance_sheet
-
-            for label, df in [("Income statement", income_df),
-                               ("Cash flow statement", cashflow_df),
-                               ("Balance sheet", balance_df)]:
-                if df is None or df.empty:
-                    return {"error": f"{label} not available for this ticker."}
-
-            def find_row(df, *keywords):
-                for idx in df.index:
-                    if all(k.lower() in idx.lower() for k in keywords):
-                        return idx
+        def safe_float(df, row_key, col):
+            if row_key is None:
+                return None
+            try:
+                val = df.loc[row_key].iloc[col]
+                if val is None or str(val) == "nan":
+                    return None
+                return float(val)
+            except Exception:
                 return None
 
-            def safe_float(df, row_key, col):
-                if row_key is None:
-                    return None
-                try:
-                    val = df.loc[row_key].iloc[col]
-                    if val is None or str(val) == "nan":
-                        return None
-                    return float(val)
-                except Exception:
-                    return None
-
-            revenue_row  = find_row(income_df, "total revenue") or find_row(income_df, "revenue")
-            opex_row     = (find_row(income_df, "total expenses")
-                            or find_row(income_df, "total operating expenses")
-                            or find_row(income_df, "operating expense")
-                            or find_row(income_df, "cost of revenue"))
-            pretax_row   = find_row(income_df, "pretax") or find_row(income_df, "income before tax")
-            tax_row      = find_row(income_df, "tax", "provision") or find_row(income_df, "income tax")
-            interest_row = find_row(income_df, "interest", "expense")
-            ca_row       = find_row(balance_df, "current assets")
-            cl_row       = find_row(balance_df, "current liabilities")
-            cash_row     = (find_row(balance_df, "cash and cash equivalents")
-                            or find_row(balance_df, "cash"))
-            cpltd_row    = (find_row(balance_df, "current portion", "long term")
-                            or find_row(balance_df, "current", "long term debt")
-                            or find_row(balance_df, "current portion"))
-            net_ppe_row  = (find_row(balance_df, "net ppe")
-                            or find_row(balance_df, "net property plant")
-                            or find_row(balance_df, "property plant equipment"))
-            depr_row_inc = (find_row(income_df, "reconciled depreciation")
-                            or find_row(income_df, "depreciation amortization")
-                            or find_row(income_df, "depreciation"))
-            depr_row_cf  = (find_row(cashflow_df, "depreciation amortization")
-                            or find_row(cashflow_df, "depreciation"))
-
-            if not revenue_row:
-                return {"error": "Could not find Revenue in income statement."}
-
-            n_inc   = min(len(income_df.columns), 6)
-            n_cf    = min(len(cashflow_df.columns), 6)
-            n_bal   = min(len(balance_df.columns), 7)
-            n_years = min(n_inc, n_cf, n_bal)
-
-            if n_years == 0:
-                return {"error": "Not enough historical data to compute FCFF."}
-
-            revenue_series = []; opex_series = []; tax_rates = []; year_labels = []
-            ca_series = []; cl_series = []; cash_series = []; cpltd_series = []
-            net_ppe_series = []; depr_series = []
-
-            for col in range(n_years):
-                revenue = safe_float(income_df, revenue_row, col) or 0.0
-                if revenue == 0.0:
-                    continue
-                pretax   = safe_float(income_df, pretax_row, col)
-                tax_prov = safe_float(income_df, tax_row, col)
-                if pretax and pretax != 0 and tax_prov is not None and tax_prov != 0:
-                    yr_tax = max(0.05, min(abs(tax_prov / pretax), 0.40))
-                else:
-                    yr_tax = 0.25
-                if opex_row:
-                    opex = abs(safe_float(income_df, opex_row, col) or 0.0)
-                else:
-                    ebit_row_fb = find_row(income_df, "ebit") or find_row(income_df, "operating income")
-                    ebit_val    = safe_float(income_df, ebit_row_fb, col) or 0.0
-                    opex        = abs(revenue - ebit_val)
-
-                ca      = safe_float(balance_df, ca_row, col) or 0.0
-                cl      = safe_float(balance_df, cl_row, col) or 0.0
-                csh     = safe_float(balance_df, cash_row, col) or 0.0
-                cpltd   = safe_float(balance_df, cpltd_row, col) or 0.0
-                net_ppe = safe_float(balance_df, net_ppe_row, col) or 0.0
-                depr    = abs(safe_float(income_df, depr_row_inc, col) or
-                              safe_float(cashflow_df, depr_row_cf, col) or 0.0)
-
-                try:
-                    year_labels.append(str(income_df.columns[col].year))
-                except Exception:
-                    year_labels.append(f"Y-{col}")
-
-                revenue_series.append(revenue)
-                opex_series.append(opex)
-                tax_rates.append(yr_tax)
-                ca_series.append(ca)
-                cl_series.append(cl)
-                cash_series.append(csh)
-                cpltd_series.append(cpltd)
-                net_ppe_series.append(net_ppe)
-                depr_series.append(depr)
-
-            interest_expense = abs(safe_float(income_df, interest_row, 0) or 0.0)
-
-        # ── Shared DCF Math (same for both data sources) ──────────────────────
-
-        if not revenue_series:
-            return {"error": "No valid historical revenue data found for this ticker."}
-
-        # Ensure interest_expense always defined (FMP path may skip all rows)
-        try:
-            interest_expense
-        except NameError:
-            interest_expense = 0.0
-
-        n_valid = len(revenue_series)
-
-        def avg_yoy_growth(series):
+        def avg_yoy_growth(series: list) -> float:
+            """
+            series = [most_recent, ..., oldest]
+            Average YoY growth from valid consecutive pairs.
+            Falls back to CAGR. Returns 0.0 if insufficient data.
+            """
             rates = []
             for i in range(len(series) - 1):
                 v_new, v_old = series[i], series[i + 1]
@@ -618,22 +471,158 @@ def get_dcf(
                 return (valid[0] / valid[-1]) ** (1 / n) - 1
             return 0.0
 
-        def project_line(base, growth, years):
-            g = max(min(growth, 1.0), -0.5)
+        def project_line(base: float, growth: float, years: int) -> list:
+            """Project a single line item N years forward by compounding.
+            If base is 0, returns flat zero series (can't grow from zero).
+            Caps growth at 100% per year to prevent runaway projections.
+            """
+            g = max(min(growth, 1.0), -0.5)  # cap: -50% to +100% per year
             if base == 0.0:
                 return [0.0] * years
             return [base * ((1 + g) ** y) for y in range(1, years + 1)]
 
-        def rolling_avg_terminal(projected):
+        def rolling_avg_terminal(projected: list) -> float:
+            """
+            Terminal year = rolling avg of last 5 projected values.
+            If fewer than 5 projected years exist, average all of them.
+            Returns 0.0 if list is empty.
+            """
             if not projected:
                 return 0.0
             window = projected[-5:] if len(projected) >= 5 else projected
             return sum(window) / len(window)
 
+        # ── Identify rows ─────────────────────────────────────────────────────
+        revenue_row  = find_row(income_df, "total revenue") or find_row(income_df, "revenue")
+        opex_row     = (find_row(income_df, "total expenses")
+                        or find_row(income_df, "total operating expenses")
+                        or find_row(income_df, "operating expense")
+                        or find_row(income_df, "cost of revenue"))
+        pretax_row   = find_row(income_df, "pretax") or find_row(income_df, "income before tax")
+        tax_row      = find_row(income_df, "tax", "provision") or find_row(income_df, "income tax")
+        interest_row = find_row(income_df, "interest", "expense")
+
+        # Balance sheet rows
+        ca_row      = find_row(balance_df, "current assets")
+        cl_row      = find_row(balance_df, "current liabilities")
+        cash_row    = (find_row(balance_df, "cash and cash equivalents")
+                       or find_row(balance_df, "cash"))
+        cpltd_row   = (find_row(balance_df, "current portion", "long term")
+                       or find_row(balance_df, "current", "long term debt")
+                       or find_row(balance_df, "current portion"))
+        net_ppe_row = (find_row(balance_df, "net ppe")
+                       or find_row(balance_df, "net property plant")
+                       or find_row(balance_df, "property plant equipment"))
+
+        # Depreciation — check income statement first, then cashflow
+        depr_row_inc = (find_row(income_df, "reconciled depreciation")
+                        or find_row(income_df, "depreciation amortization")
+                        or find_row(income_df, "depreciation"))
+        depr_row_cf  = (find_row(cashflow_df, "depreciation amortization")
+                        or find_row(cashflow_df, "depreciation"))
+
+        if not revenue_row:
+            return {"error": "Could not find Revenue in income statement."}
+
+        # ── Determine usable years ───────────────────────────────────────────────
+        # Collect up to 6 years of data for richer growth rate calculation
+        # Balance sheet needs col+1 for CapEx derivation, so allow 7 cols
+        n_inc   = min(len(income_df.columns), 6)
+        n_cf    = min(len(cashflow_df.columns), 6)
+        n_bal   = min(len(balance_df.columns), 7)
+        n_years = min(n_inc, n_cf, n_bal)
+
+        if n_years == 0:
+            return {"error": "Not enough historical data to compute FCFF."}
+
+        # ── Collect historical series (index 0 = most recent year) ────────────
+        # Income statement series
+        revenue_series = []
+        opex_series    = []
+        tax_rates      = []
+        year_labels    = []
+
+        # Balance sheet series (raw values per year)
+        ca_series      = []
+        cl_series      = []
+        cash_series    = []
+        cpltd_series   = []
+        net_ppe_series = []
+        depr_series    = []
+
+        for col in range(n_years):
+            revenue  = safe_float(income_df, revenue_row, col) or 0.0
+
+            # Skip years with zero/missing revenue
+            if revenue == 0.0:
+                continue
+
+            pretax   = safe_float(income_df, pretax_row, col)
+            tax_prov = safe_float(income_df, tax_row,    col)
+
+            # Effective tax rate
+            if pretax and pretax != 0 and tax_prov is not None and tax_prov != 0:
+                yr_tax = max(0.05, min(abs(tax_prov / pretax), 0.40))
+            else:
+                yr_tax = 0.25
+
+            # OpEx
+            if opex_row:
+                opex = abs(safe_float(income_df, opex_row, col) or 0.0)
+            else:
+                ebit_row_fb = find_row(income_df, "ebit") or find_row(income_df, "operating income")
+                ebit_val    = safe_float(income_df, ebit_row_fb, col) or 0.0
+                opex        = abs(revenue - ebit_val)
+
+            # Balance sheet values
+            ca      = safe_float(balance_df, ca_row,      col) or 0.0
+            cl      = safe_float(balance_df, cl_row,      col) or 0.0
+            csh     = safe_float(balance_df, cash_row,    col) or 0.0
+            cpltd   = safe_float(balance_df, cpltd_row,   col) or 0.0
+            net_ppe = safe_float(balance_df, net_ppe_row, col) or 0.0
+            depr    = abs(safe_float(income_df,   depr_row_inc, col) or
+                          safe_float(cashflow_df, depr_row_cf,  col) or 0.0)
+
+            try:
+                year_labels.append(str(income_df.columns[col].year))
+            except Exception:
+                year_labels.append(f"Y-{col}")
+
+            revenue_series.append(revenue)
+            opex_series.append(opex)
+            tax_rates.append(yr_tax)
+            ca_series.append(ca)
+            cl_series.append(cl)
+            cash_series.append(csh)
+            cpltd_series.append(cpltd)
+            net_ppe_series.append(net_ppe)
+            depr_series.append(depr)
+
+        if not revenue_series:
+            return {"error": "No valid historical revenue data found for this ticker."}
+
+        n_valid = len(revenue_series)
+
+        # ── Derive historical WC and CapEx ────────────────────────────────────
+        # WC = CA - CL - Cash - CPLTD
         wc_series = [
             ca_series[i] - cl_series[i] - cash_series[i] - cpltd_series[i]
             for i in range(n_valid)
         ]
+
+        # CapEx(i) = Net PPE(i) - Net PPE(i+1) + Depr(i)
+        # i=0 is most recent, i+1 is prior year
+        capex_series = []
+        for i in range(n_valid):
+            if i + 1 < len(net_ppe_series):
+                capex_val = net_ppe_series[i] - net_ppe_series[i + 1] + depr_series[i]
+            else:
+                # No prior year available — use depr as proxy (maintenance CapEx floor)
+                capex_val = depr_series[i]
+            capex_series.append(max(capex_val, 0.0))  # CapEx can't be negative
+
+        # ── Historical ΔNWC ───────────────────────────────────────────────────
+        # ΔNWC(i) = WC(i) - WC(i+1)  [i=0 most recent, i+1 prior year]
         delta_nwc_series = []
         for i in range(n_valid):
             if i + 1 < len(wc_series):
@@ -641,10 +630,11 @@ def get_dcf(
             else:
                 delta_nwc_series.append(0.0)
 
+        # ── Average growth rates ───────────────────────────────────────────────
         revenue_growth = avg_yoy_growth(revenue_series)
         opex_growth    = avg_yoy_growth(opex_series)
-        # Cap opex growth: use 1.5x revenue growth when positive, else cap at 30%
-        opex_growth    = min(opex_growth, max(revenue_growth * 1.5, 0.30))
+        # Soft cap on opex: can grow faster than revenue short term but not 2x+
+        opex_growth    = min(opex_growth, revenue_growth * 1.5)
         ca_growth      = avg_yoy_growth(ca_series)
         cl_growth      = avg_yoy_growth(cl_series)
         cash_growth    = avg_yoy_growth(cash_series)
@@ -652,63 +642,63 @@ def get_dcf(
         net_ppe_growth = avg_yoy_growth(net_ppe_series)
         depr_growth    = avg_yoy_growth(depr_series)
 
-        # Reassign depr_series BEFORE building capex_series so capex uses correct depr
+        # If depreciation data is missing (all zeros), estimate as % of Net PPE
+        # Must run BEFORE caps so depr_growth gets capped correctly
         if all(d == 0.0 for d in depr_series) and any(p > 0 for p in net_ppe_series):
-            depr_series = [n * 0.05 for n in net_ppe_series]
-            depr_growth = net_ppe_growth
+            avg_depr_rate = 0.05  # assume 5% depreciation rate on Net PPE
+            depr_series   = [n * avg_depr_rate for n in net_ppe_series]
+            depr_growth   = net_ppe_growth  # depr grows with PPE
 
-        # Build capex_series AFTER potential depr_series reassignment
-        capex_series = []
-        for i in range(n_valid):
-            if i + 1 < len(net_ppe_series):
-                capex_val = net_ppe_series[i] - net_ppe_series[i + 1] + depr_series[i]
-            else:
-                capex_val = depr_series[i]
-            capex_series.append(max(capex_val, 0.0))
-
-        # Cap growth rates: never force below -15% even if revenue is deeply negative
-        _rev_cap = max(revenue_growth, -0.15)
-        ca_growth      = min(ca_growth,      _rev_cap)
-        cl_growth      = min(cl_growth,      _rev_cap)
-        cash_growth    = min(cash_growth,    _rev_cap)
-        cpltd_growth   = min(cpltd_growth,   _rev_cap)
-        net_ppe_growth = min(net_ppe_growth, _rev_cap)
-        depr_growth    = min(depr_growth,    _rev_cap)
+        # Cap all BS line growth rates at revenue growth
+        # No balance sheet line can sustainably outgrow the business itself
+        ca_growth      = min(ca_growth,      revenue_growth)
+        cl_growth      = min(cl_growth,      revenue_growth)
+        cash_growth    = min(cash_growth,    revenue_growth)
+        cpltd_growth   = min(cpltd_growth,   revenue_growth)
+        net_ppe_growth = min(net_ppe_growth, revenue_growth)
+        depr_growth    = min(depr_growth,    revenue_growth)
 
         avg_tax_rate = sum(tax_rates) / len(tax_rates) if tax_rates else 0.25
 
+        # ── Build historical table — show only 5 most recent valid years ────────
+        # Year 6 data used for growth rates only, not displayed
         display_years = min(n_valid, 5)
         historical_table = []
         for i in range(display_years):
-            rev   = revenue_series[i]
-            opex  = opex_series[i]
-            capex = capex_series[i]
-            t     = tax_rates[i]
-            d_nwc = delta_nwc_series[i]
-            nop   = rev - opex
+            rev    = revenue_series[i]
+            opex   = opex_series[i]
+            capex  = capex_series[i]
+            t      = tax_rates[i]
+            d_nwc  = delta_nwc_series[i]
+
+            nop    = rev - opex
             nop_at = nop * (1 - t)
-            fcff  = nop_at - d_nwc - capex
+            fcff   = nop_at - d_nwc - capex
+
             historical_table.append({
-                "year": year_labels[i],
-                "revenue": round(rev, 2),
-                "operating_expenses": round(-opex, 2),
-                "nop": round(nop, 2),
-                "tax_rate": round(t, 4),
-                "nop_after_tax": round(nop_at, 2),
-                "delta_nwc": round(-d_nwc, 2),
-                "capex": round(-capex, 2),
-                "fcff": round(fcff, 2),
-                "bs_ca": round(ca_series[i], 2),
-                "bs_cl": round(cl_series[i], 2),
-                "bs_cash": round(cash_series[i], 2),
-                "bs_cpltd": round(cpltd_series[i], 2),
-                "bs_net_ppe": round(net_ppe_series[i], 2),
-                "bs_depreciation": round(depr_series[i], 2),
-                "bs_wc": round(wc_series[i], 2),
+                "year":               year_labels[i],
+                "revenue":            round(rev,   2),
+                "operating_expenses": round(-opex,  2),
+                "nop":                round(nop,   2),
+                "tax_rate":           round(t,     4),
+                "nop_after_tax":      round(nop_at,2),
+                "delta_nwc":          round(-d_nwc, 2),
+                "capex":              round(-capex, 2),
+                "fcff":               round(fcff,  2),
+                # Balance sheet components for transparency
+                "bs_ca":              round(ca_series[i],      2),
+                "bs_cl":              round(cl_series[i],      2),
+                "bs_cash":            round(cash_series[i],    2),
+                "bs_cpltd":           round(cpltd_series[i],   2),
+                "bs_net_ppe":         round(net_ppe_series[i], 2),
+                "bs_depreciation":    round(depr_series[i],    2),
+                "bs_wc":              round(wc_series[i],      2),
             })
 
-        # WACC
+        # ── WACC ──────────────────────────────────────────────────────────────
         cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
+
+        interest_expense = abs(safe_float(income_df, interest_row, 0) or 0.0)
         if total_debt > 0 and interest_expense > 0:
             cost_of_debt = max(0.03, min(interest_expense / total_debt, 0.15))
         else:
@@ -717,6 +707,7 @@ def get_dcf(
         equity_val    = market_cap if market_cap else 1
         debt_val      = total_debt if total_debt else equity_val * 0.2
         total_capital = equity_val + debt_val
+
         wacc = (
             (equity_val / total_capital) * cost_of_equity +
             (debt_val   / total_capital) * cost_of_debt * (1 - avg_tax_rate)
@@ -725,10 +716,15 @@ def get_dcf(
         if wacc <= terminal_growth_rate:
             return {"error": f"WACC ({wacc:.2%}) must be greater than terminal growth rate ({terminal_growth_rate:.2%})."}
 
-        # Projections
-        base_ca = ca_series[0]; base_cl = cl_series[0]; base_cash = cash_series[0]
-        base_cpltd = cpltd_series[0]; base_net_ppe = net_ppe_series[0]
-        base_depr = depr_series[0]; base_rev = revenue_series[0]; base_opex = opex_series[0]
+        # ── Project Balance Sheet lines Years 1-N ─────────────────────────────
+        base_ca      = ca_series[0]
+        base_cl      = cl_series[0]
+        base_cash    = cash_series[0]
+        base_cpltd   = cpltd_series[0]
+        base_net_ppe = net_ppe_series[0]
+        base_depr    = depr_series[0]
+        base_rev     = revenue_series[0]
+        base_opex    = opex_series[0]
 
         proj_ca_list      = project_line(base_ca,      ca_growth,      projection_years)
         proj_cl_list      = project_line(base_cl,      cl_growth,      projection_years)
@@ -739,12 +735,14 @@ def get_dcf(
         proj_rev_list     = project_line(base_rev,     revenue_growth, projection_years)
         proj_opex_list    = project_line(base_opex,    opex_growth,    projection_years)
 
+        # ── Build projection table ────────────────────────────────────────────
         projection_table = []
-        pv_fcffs = []
-        prev_wc = wc_series[0]
+        pv_fcffs         = []
+        prev_wc          = wc_series[0]   # base WC = most recent historical year
 
         for year in range(projection_years):
-            idx = year
+            idx = year  # 0-indexed
+
             proj_ca      = proj_ca_list[idx]
             proj_cl      = proj_cl_list[idx]
             proj_csh     = proj_cash_list[idx]
@@ -754,39 +752,51 @@ def get_dcf(
             proj_rev     = proj_rev_list[idx]
             proj_opex    = proj_opex_list[idx]
 
-            proj_wc        = proj_ca - proj_cl - proj_csh - proj_cpltd
+            # WC derived from projected BS lines
+            proj_wc = proj_ca - proj_cl - proj_csh - proj_cpltd
+
+            # ΔNWC = WC(this year) - WC(prior year)
             proj_delta_nwc = proj_wc - prev_wc
             prev_wc        = proj_wc
 
-            prior_net_ppe = proj_net_ppe_list[idx - 1] if idx > 0 else base_net_ppe
-            proj_capex    = max(proj_net_ppe - prior_net_ppe + proj_depr, proj_depr)
+            # CapEx = Net PPE(this year) - Net PPE(prior year) + Depreciation(this year)
+            prior_net_ppe  = proj_net_ppe_list[idx - 1] if idx > 0 else base_net_ppe
+            proj_capex     = max(proj_net_ppe - prior_net_ppe + proj_depr, proj_depr)
 
             proj_nop    = proj_rev - proj_opex
             proj_nop_at = proj_nop * (1 - avg_tax_rate)
             proj_fcff   = proj_nop_at - proj_delta_nwc - proj_capex
+
             pv = proj_fcff / ((1 + wacc) ** (year + 1))
 
             projection_table.append({
-                "year": f"Year {year + 1}",
-                "revenue": round(proj_rev, 2),
-                "operating_expenses": round(-proj_opex, 2),
-                "nop": round(proj_nop, 2),
-                "tax_rate": round(avg_tax_rate, 4),
-                "nop_after_tax": round(proj_nop_at, 2),
-                "delta_nwc": round(-proj_delta_nwc, 2),
-                "capex": round(-proj_capex, 2),
-                "fcff": round(proj_fcff, 2),
-                "pv_fcff": round(pv, 2),
-                "bs_ca": round(proj_ca, 2), "bs_cl": round(proj_cl, 2),
-                "bs_cash": round(proj_csh, 2), "bs_cpltd": round(proj_cpltd, 2),
-                "bs_net_ppe": round(proj_net_ppe, 2),
-                "bs_depreciation": round(proj_depr, 2),
-                "bs_wc": round(proj_wc, 2),
+                "year":               f"Year {year + 1}",
+                "revenue":            round(proj_rev,         2),
+                "operating_expenses": round(-proj_opex,        2),
+                "nop":                round(proj_nop,         2),
+                "tax_rate":           round(avg_tax_rate,     4),
+                "nop_after_tax":      round(proj_nop_at,      2),
+                "delta_nwc":          round(-proj_delta_nwc,   2),
+                "capex":              round(-proj_capex,        2),
+                "fcff":               round(proj_fcff,         2),
+                "pv_fcff":            round(pv,                2),
+                # Projected BS components
+                "bs_ca":              round(proj_ca,           2),
+                "bs_cl":              round(proj_cl,           2),
+                "bs_cash":            round(proj_csh,          2),
+                "bs_cpltd":           round(proj_cpltd,        2),
+                "bs_net_ppe":         round(proj_net_ppe,      2),
+                "bs_depreciation":    round(proj_depr,         2),
+                "bs_wc":              round(proj_wc,           2),
             })
+
             pv_fcffs.append(round(pv, 2))
 
         total_pv_fcff = sum(pv_fcffs)
 
+        # ── Terminal Year ─────────────────────────────────────────────────────────
+        # Revenue & OpEx: grow at terminal_growth_rate from last projected year
+        # BS lines: rolling avg of last 5 projected years (mean-reverting)
         term_rev     = proj_rev_list[-1]  * (1 + terminal_growth_rate)
         term_opex    = proj_opex_list[-1] * (1 + terminal_growth_rate)
         term_ca      = rolling_avg_terminal(proj_ca_list)
@@ -795,48 +805,71 @@ def get_dcf(
         term_cpltd   = rolling_avg_terminal(proj_cpltd_list)
         term_net_ppe = rolling_avg_terminal(proj_net_ppe_list)
         term_depr    = rolling_avg_terminal(proj_depr_list)
-        term_wc      = term_ca - term_cl - term_cash - term_cpltd
-        term_delta_nwc = term_wc - prev_wc
-        term_capex   = max(term_net_ppe - proj_net_ppe_list[-1] + term_depr, term_depr)
-        term_nop     = term_rev - term_opex
-        term_nop_at  = term_nop * (1 - avg_tax_rate)
-        term_fcff    = term_nop_at - term_delta_nwc - term_capex
+
+        # WC and CapEx from terminal BS
+        term_wc_raw    = term_ca - term_cl - term_cash - term_cpltd
+        # Terminal WC should not be lower than last projected year WC for a going concern
+        # If rolling avg pulls it down, use last projected WC grown at terminal_growth_rate
+        last_proj_wc   = proj_ca_list[-1] - proj_cl_list[-1] - proj_cash_list[-1] - proj_cpltd_list[-1]
+        term_wc        = max(term_wc_raw, last_proj_wc * (1 + terminal_growth_rate))
+        term_delta_nwc = term_wc - prev_wc   # prev_wc = WC at end of last projected year
+        # CapEx floor = depreciation (minimum maintenance CapEx)
+        term_capex     = max(term_net_ppe - proj_net_ppe_list[-1] + term_depr, term_depr)
+
+        term_nop    = term_rev - term_opex
+        term_nop_at = term_nop * (1 - avg_tax_rate)
+        term_fcff   = term_nop_at - term_delta_nwc - term_capex
 
         terminal_year = {
-            "year": f"Year {projection_years + 1} (Terminal)",
-            "revenue": round(term_rev, 2),
-            "operating_expenses": round(-term_opex, 2),
-            "nop": round(term_nop, 2),
-            "tax_rate": round(avg_tax_rate, 4),
-            "nop_after_tax": round(term_nop_at, 2),
-            "delta_nwc": round(-term_delta_nwc, 2),
-            "capex": round(-term_capex, 2),
-            "fcff": round(term_fcff, 2),
-            "fcff_used_for_tv": round(max(term_fcff, 0.0), 2),
-            "bs_ca": round(term_ca, 2), "bs_cl": round(term_cl, 2),
-            "bs_cash": round(term_cash, 2), "bs_cpltd": round(term_cpltd, 2),
-            "bs_net_ppe": round(term_net_ppe, 2),
-            "bs_depreciation": round(term_depr, 2),
-            "bs_wc": round(term_wc, 2),
+            "year":               f"Year {projection_years + 1} (Terminal)",
+            "revenue":            round(term_rev,         2),
+            "operating_expenses": round(-term_opex,        2),
+            "nop":                round(term_nop,         2),
+            "tax_rate":           round(avg_tax_rate,     4),
+            "nop_after_tax":      round(term_nop_at,      2),
+            "delta_nwc":          round(-term_delta_nwc,   2),
+            "capex":              round(-term_capex,        2),
+            "fcff":               round(term_fcff,         2),
+            "bs_ca":              round(term_ca,           2),
+            "bs_cl":              round(term_cl,           2),
+            "bs_cash":            round(term_cash,         2),
+            "bs_cpltd":           round(term_cpltd,        2),
+            "bs_net_ppe":         round(term_net_ppe,      2),
+            "bs_depreciation":    round(term_depr,         2),
+            "bs_wc":              round(term_wc,           2),
         }
 
-        # Clamp terminal FCFF: a going concern shouldn't have negative terminal cash flow
-        # A negative TV from NWC spike is a modelling artefact, not economic reality
-        term_fcff_floored = max(term_fcff, 0.0)
-        terminal_value    = term_fcff_floored / (wacc - terminal_growth_rate)
+        # Terminal Value = FCFF_terminal / (WACC - g)
+        terminal_value    = term_fcff / (wacc - terminal_growth_rate)
         pv_terminal_value = terminal_value / ((1 + wacc) ** projection_years)
-        enterprise_value  = total_pv_fcff + pv_terminal_value
 
-        if use_fmp:
-            investments = 0.0
-            minority_interest = 0.0
-        else:
-            investments_row   = (find_row(balance_df, "long term investments") or find_row(balance_df, "investments"))
-            minority_row      = find_row(balance_df, "minority interest")
-            investments       = safe_float(balance_df, investments_row, 0) or 0.0
-            minority_interest = safe_float(balance_df, minority_row, 0) or 0.0
+        # ── Enterprise & Equity Value ─────────────────────────────────────────
+        enterprise_value = total_pv_fcff + pv_terminal_value
 
-        equity_value_dcf          = enterprise_value + total_cash + investments - total_debt - minority_interest
+        investments_row   = (find_row(balance_df, "long term investments")
+                             or find_row(balance_df, "investments"))
+        minority_row      = (find_row(balance_df, "minority interest")
+                             or find_row(balance_df, "noncontrolling interest"))
+        investments_raw   = safe_float(balance_df, investments_row, 0) or 0.0
+        minority_interest = safe_float(balance_df, minority_row,    0) or 0.0
+
+        # Avoid double-counting: only add investments if different from total_cash
+        # yfinance sometimes returns same value for both
+        investments = 0.0 if abs(investments_raw - total_cash) < 1e6 else investments_raw
+
+        # Minority interest sanity check — cap at 20% of enterprise value to avoid bad rows
+        max_minority = abs(enterprise_value) * 0.20
+        minority_interest = min(abs(minority_interest), max_minority)
+
+        equity_value_dcf = (
+            enterprise_value
+            + total_cash
+            + investments
+            - total_debt
+            - minority_interest
+        )
+
+        # ── Intrinsic Value ───────────────────────────────────────────────────
         intrinsic_value_per_share = equity_value_dcf / shares_outstanding
         intrinsic_value_with_mos  = intrinsic_value_per_share * (1 - margin_of_safety)
 
@@ -851,44 +884,58 @@ def get_dcf(
             else None
         )
 
+        # ── Response ──────────────────────────────────────────────────────────
         return {
-            "ticker": resolved, "market": market,
-            "data_source": "FMP" if use_fmp else "yfinance",
+            "ticker":        raw_ticker,
+            "market":        market,
+            "data_source":   data_source,
             "current_price": current_price,
+
+            # Growth rates used
             "derived_growth_rates": {
-                "revenue_growth": round(revenue_growth, 4),
-                "opex_growth":    round(opex_growth, 4),
-                "ca_growth":      round(ca_growth, 4),
-                "cl_growth":      round(cl_growth, 4),
-                "cash_growth":    round(cash_growth, 4),
-                "cpltd_growth":   round(cpltd_growth, 4),
-                "net_ppe_growth": round(net_ppe_growth, 4),
-                "depr_growth":    round(depr_growth, 4),
+                "revenue_growth":  round(revenue_growth,  4),
+                "opex_growth":     round(opex_growth,     4),
+                "ca_growth":       round(ca_growth,       4),
+                "cl_growth":       round(cl_growth,       4),
+                "cash_growth":     round(cash_growth,     4),
+                "cpltd_growth":    round(cpltd_growth,    4),
+                "net_ppe_growth":  round(net_ppe_growth,  4),
+                "depr_growth":     round(depr_growth,     4),
                 "terminal_growth": terminal_growth_rate,
             },
+
+            # Model assumptions
             "historical_years_used": display_years,
-            "avg_tax_rate_used":     round(avg_tax_rate, 4),
-            "wacc":                  round(wacc, 4),
-            "cost_of_equity":        round(cost_of_equity, 4),
-            "cost_of_debt":          round(cost_of_debt, 4),
+            "avg_tax_rate_used":     round(avg_tax_rate,    4),
+            "wacc":                  round(wacc,            4),
+            "cost_of_equity":        round(cost_of_equity,  4),
+            "cost_of_debt":          round(cost_of_debt,    4),
             "beta_used":             beta,
             "projection_years":      projection_years,
-            "historical_table":      historical_table,
-            "projection_table":      projection_table,
-            "terminal_year":         terminal_year,
-            "pv_of_fcffs":           pv_fcffs,
-            "total_pv_fcff":         round(total_pv_fcff, 2),
-            "terminal_value":        round(terminal_value, 2),
-            "pv_terminal_value":     round(pv_terminal_value, 2),
-            "total_cash":            total_cash,
-            "investments":           round(investments, 2),
-            "total_debt":            total_debt,
-            "minority_interest":     round(minority_interest, 2),
-            "shares_outstanding":    shares_outstanding,
-            "enterprise_value":                     round(enterprise_value, 2),
-            "equity_value_dcf":                     round(equity_value_dcf, 2),
+
+            # Full model tables
+            "historical_table": historical_table,
+            "projection_table": projection_table,
+            "terminal_year":    terminal_year,
+
+            # Summary
+            "pv_of_fcffs":       pv_fcffs,
+            "total_pv_fcff":     round(total_pv_fcff,     2),
+            "terminal_value":    round(terminal_value,    2),
+            "pv_terminal_value": round(pv_terminal_value, 2),
+
+            # Equity bridge
+            "total_cash":         total_cash,
+            "investments":        round(investments,       2),
+            "total_debt":         total_debt,
+            "minority_interest":  round(minority_interest, 2),
+            "shares_outstanding": shares_outstanding,
+
+            # Output
+            "enterprise_value":                     round(enterprise_value,          2),
+            "equity_value_dcf":                     round(equity_value_dcf,          2),
             "intrinsic_value_per_share":             round(intrinsic_value_per_share, 2),
-            "intrinsic_value_with_margin_of_safety": round(intrinsic_value_with_mos, 2),
+            "intrinsic_value_with_margin_of_safety": round(intrinsic_value_with_mos,  2),
             "margin_of_safety_used":                 margin_of_safety,
             "upside_downside_pct":                   round(upside_pct, 2) if upside_pct is not None else None,
             "verdict":                               verdict,
