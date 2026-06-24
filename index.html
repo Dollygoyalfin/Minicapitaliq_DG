@@ -681,6 +681,7 @@
   <div class="tab" onclick="switchTab('dcf',this)">DCF Valuation</div>
   <div class="tab" onclick="switchTab('financials',this)">Financials</div>
   <div class="tab" onclick="switchTab('screener',this)">Screener</div>
+  <div class="tab" onclick="switchTab('convergence',this)">🎯 Convergence</div>
   <div class="tab" onclick="switchTab('verdict',this)">⚡ AI Verdict</div>
   <div class="tab" onclick="switchTab('reverse-dcf',this)">Reverse DCF</div>
   <div class="tab" onclick="switchTab('insider',this)">Insider</div>
@@ -990,6 +991,7 @@
     if (name === "ipos") loadIPOs();
     if (name === "commodities") loadCommodities();
     if (name === "verdict") updateVerdictStatus();
+    if (name === "convergence" && getTicker()) runConvergence();
   }
 
   function setLoading(id, msg="Loading...") {
