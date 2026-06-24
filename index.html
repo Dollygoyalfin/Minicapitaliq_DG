@@ -329,6 +329,75 @@
     .sens-cell.bear .s-value { color: var(--red); }
     .sens-cell.base .s-value { color: var(--ink); }
     .sens-cell.bull .s-value { color: var(--green); }
+    /* ── Convergence Engine ── */
+    .convergence-hero {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
+      background: var(--line); border: 1px solid var(--line);
+      border-radius: 3px; overflow: hidden; margin-bottom: 24px;
+    }
+    @media (max-width: 700px) { .convergence-hero { grid-template-columns: 1fr; } }
+    .conv-hero-cell { background: var(--white); padding: 24px 28px; }
+    .conv-hero-cell.dark { background: var(--ink); }
+    .conv-hero-cell.dark .ch-label { color: rgba(255,255,255,0.45); }
+    .conv-hero-cell.dark .ch-value { color: var(--white); }
+    .conv-hero-cell.dark .ch-sub   { color: rgba(255,255,255,0.4); }
+    .ch-label { font-size:0.62rem;font-weight:600;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:8px; }
+    .ch-value { font-family:'Playfair Display',serif;font-size:2.2rem;font-weight:900;color:var(--ink);line-height:1;margin-bottom:6px; }
+    .ch-sub   { font-size:0.72rem;color:var(--muted); }
+
+    .confidence-bar-wrap { margin: 20px 0; }
+    .confidence-bar-label { display:flex;justify-content:space-between;align-items:center;margin-bottom:8px; }
+    .confidence-bar-label span { font-size:0.72rem;color:var(--muted);font-weight:500; }
+    .confidence-bar-label strong { font-size:1rem;font-weight:700;color:var(--ink); }
+    .confidence-bar-track { height:10px;background:var(--line);border-radius:5px;overflow:hidden; }
+    .confidence-bar-fill  { height:100%;border-radius:5px;transition:width 0.8s ease; }
+
+    .model-row {
+      display: grid; grid-template-columns: 2fr 1.2fr 1.2fr 1fr 0.8fr;
+      gap: 0; border-bottom: 1px solid var(--line);
+      align-items: center;
+    }
+    .model-row:last-child { border-bottom: none; }
+    .model-row.header { background: var(--cream); }
+    .model-row .mr-cell { padding: 14px 16px; font-size: 0.82rem; }
+    .model-row.header .mr-cell { font-size:0.6rem;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:var(--muted); }
+    .model-row .mr-cell.name { font-weight:500;color:var(--ink); }
+    .model-row .mr-cell.mono { font-family:'DM Mono',monospace; }
+
+    .signal-pill {
+      display:inline-block;padding:3px 10px;border-radius:12px;
+      font-size:0.65rem;font-weight:600;letter-spacing:0.3px;white-space:nowrap;
+    }
+    .signal-pill.strong-buy  { background:var(--green-light);color:var(--green); }
+    .signal-pill.buy         { background:#e8f5ed;color:#2d7a4f; }
+    .signal-pill.hold        { background:var(--blue-light);color:var(--blue); }
+    .signal-pill.sell        { background:#fdf0ee;color:#c0421a; }
+    .signal-pill.strong-sell { background:var(--red-light);color:var(--red); }
+    .signal-pill.na          { background:var(--cream);color:var(--muted); }
+
+    .value-band {
+      display:flex;align-items:center;gap:8px;padding:16px 0;
+    }
+    .band-label { font-size:0.62rem;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:var(--muted);width:40px; }
+    .band-bar   { flex:1;height:6px;border-radius:3px; }
+    .band-bar.bear { background:var(--red); }
+    .band-bar.base { background:var(--ink); }
+    .band-bar.bull { background:var(--green); }
+    .band-value { font-family:'DM Mono',monospace;font-size:0.85rem;font-weight:500;width:80px;text-align:right; }
+
+    .buy-zone-strip {
+      display:flex;align-items:center;justify-content:space-between;
+      padding:16px 20px;border-radius:3px;margin-bottom:20px;
+      border: 1px solid var(--line); gap:16px; flex-wrap:wrap;
+    }
+    .buy-zone-strip.active   { background:var(--green-light);border-color:#a7d9bc; }
+    .buy-zone-strip.inactive { background:var(--cream); }
+    .bz-label { font-size:0.62rem;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:var(--muted);margin-bottom:4px; }
+    .bz-value { font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:var(--ink); }
+    .bz-status { font-size:0.78rem;font-weight:500; }
+    .bz-status.active   { color:var(--green); }
+    .bz-status.inactive { color:var(--muted); }
+
 
     /* ── AI Verdict ── */
     .verdict-card {
@@ -765,6 +834,14 @@
     </div>
   </div>
 </div>
+<!-- CONVERGENCE ENGINE TAB -->
+<div id="tab-convergence" class="tab-content">
+  <div class="container">
+    <div id="convergence-results">
+      <div class="state-empty"><span class="icon">🎯</span>Enter a ticker above and click <strong>Analyze</strong> to run the Convergence Engine.</div>
+    </div>
+  </div>
+</div>
 
 <!-- AI VERDICT TAB -->
 <div id="tab-verdict" class="tab-content">
@@ -1183,6 +1260,189 @@
         </div>
       `;
     } catch (e) { setError("dcf-results", e.message); }
+  }
+
+  // ── CONVERGENCE ENGINE ───────────────────────────────────────────────────
+  async function runConvergence() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("convergence-results", "Please enter a ticker symbol first."); return; }
+    switchTab("convergence", document.querySelector(".tab-row .tab:nth-child(5)"));
+    setLoading("convergence-results", `Running 5 valuation models for ${ticker.toUpperCase()}...`);
+
+    const rf  = document.getElementById("dcf-rf").value      || (market === "india" ? 0.07 : 0.04);
+    const mr  = document.getElementById("dcf-mr").value      || (market === "india" ? 0.13 : 0.10);
+    const tg  = document.getElementById("dcf-terminal").value || (market === "india" ? 0.05 : 0.03);
+    const mos = document.getElementById("dcf-mos").value      || 0.25;
+
+    try {
+      const res = await fetch(
+        `${BASE}/convergence?ticker=${ticker}&market=${market}` +
+        `&risk_free_rate=${rf}&market_return=${mr}&terminal_growth_rate=${tg}&margin_of_safety=${mos}`
+      );
+      const d = await res.json();
+      if (d.error) { setError("convergence-results", d.error); return; }
+
+      const c   = d.consensus || {};
+      const bz  = d.buy_zone  || {};
+      const vr  = d.value_range || {};
+      const models = d.models || {};
+      const conf = c.confidence_pct || 0;
+
+      // Confidence bar color
+      const barColor = conf >= 80 ? 'var(--green)' : conf >= 60 ? '#f59e0b' : 'var(--red)';
+
+      // Signal class
+      function sigClass(sig) {
+        if (!sig) return 'na';
+        const s = sig.toLowerCase();
+        if (s.includes('strong buy'))  return 'strong-buy';
+        if (s.includes('buy'))         return 'buy';
+        if (s.includes('strong sell')) return 'strong-sell';
+        if (s.includes('sell'))        return 'sell';
+        return 'hold';
+      }
+
+      // Build model rows
+      const modelOrder = ['dcf', 'epv', 'graham', 'relative', 'historical_pe'];
+      const modelRows = modelOrder.map(key => {
+        const m = models[key] || {};
+        const iv  = m.intrinsic_value;
+        const up  = m.upside_pct;
+        const sig = m.signal || 'N/A';
+        const err = m.error;
+        return `<div class="model-row">
+          <div class="mr-cell name">${m.method || key}</div>
+          <div class="mr-cell mono">${iv != null ? (d.current_price > 1000 ? '₹' : '$') + iv.toLocaleString() : err ? '⚠ Error' : '—'}</div>
+          <div class="mr-cell mono ${up != null ? (up > 0 ? 'nu' : 'nd') : ''}">${up != null ? (up > 0 ? '+' : '') + up.toFixed(1) + '%' : '—'}</div>
+          <div class="mr-cell"><span class="signal-pill ${sigClass(sig)}">${sig}</span></div>
+          <div class="mr-cell" style="font-size:0.72rem;color:var(--muted)">${m.confidence || '—'}</div>
+        </div>`;
+      }).join('');
+
+      // Value range bars — normalize widths
+      const allVals = [vr.bear, vr.base, vr.bull].filter(v => v != null);
+      const maxVal  = allVals.length ? Math.max(...allVals) : 1;
+      const bearW   = vr.bear ? Math.round(vr.bear / maxVal * 100) : 0;
+      const baseW   = vr.base ? Math.round(vr.base / maxVal * 100) : 0;
+      const bullW   = vr.bull ? Math.round(vr.bull / maxVal * 100) : 0;
+
+      const curr = d.current_price;
+      const symbol = curr > 1000 ? '₹' : '$';
+
+      document.getElementById("convergence-results").innerHTML = `
+        <!-- Hero -->
+        <div class="convergence-hero">
+          <div class="conv-hero-cell dark">
+            <div class="ch-label">Consensus Intrinsic Value</div>
+            <div class="ch-value">${symbol}${c.intrinsic_value ? Number(c.intrinsic_value).toLocaleString() : '—'}</div>
+            <div class="ch-sub">Trimmed mean of ${c.models_used || 0} models &nbsp;·&nbsp; ${c.direction || '—'}</div>
+          </div>
+          <div class="conv-hero-cell">
+            <div class="ch-label">Convergence Signal</div>
+            <div class="ch-value" style="font-size:1.4rem;color:${sigClass(c.convergence_signal).includes('buy') ? 'var(--green)' : sigClass(c.convergence_signal).includes('sell') ? 'var(--red)' : 'var(--blue)'}">${c.convergence_signal || '—'}</div>
+            <div class="ch-sub">Current Price: ${symbol}${curr ? curr.toLocaleString() : '—'} &nbsp;·&nbsp; Upside: ${c.upside_pct != null ? (c.upside_pct > 0 ? '+' : '') + c.upside_pct.toFixed(1) + '%' : '—'}</div>
+          </div>
+        </div>
+
+        <!-- Confidence bar -->
+        <div class="card" style="padding:22px 26px;margin-bottom:20px">
+          <div class="card-head">Model Agreement — Confidence Score</div>
+          <div class="confidence-bar-wrap">
+            <div class="confidence-bar-label">
+              <span>${c.buy_signals || 0} of ${c.models_used || 0} models signal ${c.direction || 'Neutral'}</span>
+              <strong>${conf}% Agreement</strong>
+            </div>
+            <div class="confidence-bar-track">
+              <div class="confidence-bar-fill" style="width:${conf}%;background:${barColor}"></div>
+            </div>
+          </div>
+          <div style="display:flex;gap:20px;font-size:0.75rem;color:var(--muted);margin-top:12px">
+            <span>🟢 Buy signals: <strong style="color:var(--ink)">${c.buy_signals || 0}</strong></span>
+            <span>🔴 Sell signals: <strong style="color:var(--ink)">${c.sell_signals || 0}</strong></span>
+            <span>📊 Models used: <strong style="color:var(--ink)">${c.models_used || 0}</strong></span>
+          </div>
+        </div>
+
+        <!-- Buy Zone -->
+        <div class="buy-zone-strip ${bz.at_buy_zone ? 'active' : 'inactive'}">
+          <div>
+            <div class="bz-label">Buy Zone (${Math.round((1-(bz.mos_used||0.25))*100)}% MOS)</div>
+            <div class="bz-value">${symbol}${bz.price ? Number(bz.price).toLocaleString() : '—'}</div>
+          </div>
+          <div>
+            <div class="bz-label">Status</div>
+            <div class="bz-status ${bz.at_buy_zone ? 'active' : 'inactive'}">${bz.status || '—'}</div>
+          </div>
+          <div>
+            <div class="bz-label">Current Price</div>
+            <div class="bz-value">${symbol}${curr ? curr.toLocaleString() : '—'}</div>
+          </div>
+        </div>
+
+        <!-- Value Range -->
+        <div class="card" style="padding:22px 26px;margin-bottom:20px">
+          <div class="card-head">Valuation Range — Bear · Base · Bull</div>
+          <div class="value-band">
+            <div class="band-label" style="color:var(--red)">Bear</div>
+            <div class="band-bar bear" style="width:${bearW}%"></div>
+            <div class="band-value nd">${symbol}${vr.bear ? Number(vr.bear).toLocaleString() : '—'}</div>
+          </div>
+          <div class="value-band">
+            <div class="band-label">Base</div>
+            <div class="band-bar base" style="width:${baseW}%"></div>
+            <div class="band-value">${symbol}${vr.base ? Number(vr.base).toLocaleString() : '—'}</div>
+          </div>
+          <div class="value-band">
+            <div class="band-label" style="color:var(--green)">Bull</div>
+            <div class="band-bar bull" style="width:${bullW}%"></div>
+            <div class="band-value nu">${symbol}${vr.bull ? Number(vr.bull).toLocaleString() : '—'}</div>
+          </div>
+          <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line);font-size:0.72rem;color:var(--muted)">
+            Bear = lowest model value &nbsp;·&nbsp; Base = consensus (trimmed mean) &nbsp;·&nbsp; Bull = highest model value
+          </div>
+        </div>
+
+        <!-- Model breakdown table -->
+        <div class="section-label">All 5 Valuation Models</div>
+        <div class="card" style="padding:0;overflow:auto;margin-bottom:20px">
+          <div class="model-row header">
+            <div class="mr-cell">Method</div>
+            <div class="mr-cell">Intrinsic Value</div>
+            <div class="mr-cell">Upside / Down</div>
+            <div class="mr-cell">Signal</div>
+            <div class="mr-cell">Confidence</div>
+          </div>
+          ${modelRows}
+        </div>
+
+        <!-- Assumptions -->
+        <div class="section-label" style="cursor:pointer;user-select:none" onclick="toggleConvAssumptions()">
+          Model Assumptions
+          <span id="conv-assume-icon" style="font-size:0.7rem;color:var(--muted);margin-left:8px">▼ show</span>
+        </div>
+        <div id="conv-assumptions" style="display:none">
+          <div class="metrics-grid">
+            <div class="metric"><div class="m-label">WACC</div><div class="m-value">${fmtPct((d.assumptions?.wacc||0)*100)}</div></div>
+            <div class="metric"><div class="m-label">Cost of Equity</div><div class="m-value">${fmtPct((d.assumptions?.cost_of_equity||0)*100)}</div></div>
+            <div class="metric"><div class="m-label">Cost of Debt</div><div class="m-value">${fmtPct((d.assumptions?.cost_of_debt||0)*100)}</div></div>
+            <div class="metric"><div class="m-label">Avg Tax Rate</div><div class="m-value">${fmtPct((d.assumptions?.avg_tax_rate||0)*100)}</div></div>
+            <div class="metric"><div class="m-label">Beta</div><div class="m-value">${d.assumptions?.beta || '—'}</div></div>
+            <div class="metric"><div class="m-label">Terminal Growth</div><div class="m-value">${fmtPct((d.assumptions?.terminal_growth||0)*100)}</div></div>
+            <div class="metric"><div class="m-label">Data Source</div><div class="m-value" style="font-size:0.72rem">${d.data_source || '—'}</div></div>
+            <div class="metric"><div class="m-label">Sector</div><div class="m-value" style="font-size:0.72rem">${d.sector || '—'}</div></div>
+          </div>
+        </div>
+      `;
+    } catch(e) { setError("convergence-results", e.message); }
+  }
+
+  function toggleConvAssumptions() {
+    const el   = document.getElementById("conv-assumptions");
+    const icon = document.getElementById("conv-assume-icon");
+    if (!el) return;
+    const hidden = el.style.display === "none";
+    el.style.display = hidden ? "block" : "none";
+    icon.textContent = hidden ? "▲ hide" : "▼ show";
   }
 
   function updateVerdictStatus() {
