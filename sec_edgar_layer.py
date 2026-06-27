@@ -27,7 +27,7 @@ import pandas as pd
 # SEC REQUIRES a descriptive User-Agent with contact info, or it blocks you.
 # Replace with your real email before production.
 SEC_HEADERS = {
-    "User-Agent": "MiniTradeIQ contact@minitradeiq.com",
+    "User-Agent": "yllodwrites04@gmail.com",
     "Accept-Encoding": "gzip, deflate",
     "Host": "data.sec.gov",
 }
@@ -47,7 +47,7 @@ def _load_ticker_cik_map():
     if _TICKER_CIK_MAP:
         return _TICKER_CIK_MAP
 
-    headers = {"User-Agent": "MiniTradeIQ contact@minitradeiq.com"}
+    headers = {"User-Agent": "yllodwrites04@gmail.com"}
     with httpx.Client(timeout=20.0) as client:
         resp = client.get(SEC_TICKERS_URL, headers=headers)
     if resp.status_code != 200:
