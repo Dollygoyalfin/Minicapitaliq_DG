@@ -34,6 +34,29 @@ SEC_HEADERS = {
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_FACTS_URL   = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+
+# SIC code ranges → sector (maps SEC's industry classification to our sectors)
+def _sic_to_sector(sic: str) -> str:
+    try:
+        code = int(sic)
+    except (ValueError, TypeError):
+        return "Unknown"
+    if 100   <= code <= 999:   return "Basic Materials"      # Agriculture
+    if 1000  <= code <= 1499:  return "Energy"               # Mining
+    if 1500  <= code <= 1799:  return "Industrials"          # Construction
+    if 2000  <= code <= 2199:  return "Consumer Defensive"   # Food
+    if 2200  <= code <= 2799:  return "Consumer Cyclical"    # Textiles/Apparel
+    if 2800  <= code <= 2899:  return "Basic Materials"      # Chemicals
+    if 2900  <= code <= 2999:  return "Energy"               # Petroleum
+    if 3000  <= code <= 3999:  return "Industrials"          # Manufacturing
+    if 4000  <= code <= 4899:  return "Industrials"          # Transport/Comms
+    if 4900  <= code <= 4999:  return "Utilities"            # Utilities
+    if 5000  <= code <= 5199:  return "Consumer Cyclical"    # Wholesale
+    if 5200  <= code <= 5999:  return "Consumer Cyclical"    # Retail
+    if 6000  <= code <= 6799:  return "Financial Services"   # Finance
+    if 7000  <= code <= 8999:  return "Technology"           # Services/Tech
+    return "Unknown"
 
 # ── Ticker → CIK cache (loaded once, reused) ──────────────────────────────────
 _TICKER_CIK_MAP: dict = {}
@@ -105,49 +128,53 @@ def _fetch_company_facts(cik: str) -> dict:
 def _get_concept_annual(facts: dict, *tags, unit: str = "USD") -> dict:
     """
     Extract annual (FY) values for the first matching XBRL tag.
-    Returns {fiscal_year: value} dict, most recent first.
+    Returns {year: value} dict keyed by the PERIOD END YEAR (reliable),
+    not the 'fy' filing-year field (unreliable — a 10-K tags multiple
+    years of comparatives with the same fy).
     Tries multiple tag names since companies use different ones.
     """
     us_gaap = facts.get("facts", {}).get("us-gaap", {})
+    from datetime import datetime
 
     for tag in tags:
         if tag not in us_gaap:
             continue
         units = us_gaap[tag].get("units", {})
-        # Find the right unit (USD, shares, etc.)
         unit_data = units.get(unit) or (list(units.values())[0] if units else [])
 
         annual = {}
         for item in unit_data:
-            # Only annual data: form 10-K, fp FY, and a full-year period
-            form = item.get("form", "")
-            fp   = item.get("fp", "")
-            fy   = item.get("fy")
-            val  = item.get("val")
+            form  = item.get("form", "")
+            val   = item.get("val")
             start = item.get("start")
             end   = item.get("end")
 
-            if form != "10-K" or fy is None or val is None:
+            if form != "10-K" or val is None or not end:
                 continue
 
-            # For flow items (revenue), ensure it's a ~full year period
+            # Period must be a full year (~365 days) — skip quarterly chunks
             if start and end:
                 try:
-                    from datetime import datetime
                     d0 = datetime.fromisoformat(start)
                     d1 = datetime.fromisoformat(end)
                     days = (d1 - d0).days
-                    if days < 300:   # skip quarterly chunks
+                    if days < 300 or days > 400:
                         continue
                 except Exception:
-                    pass
+                    continue
+            else:
+                continue
 
-            # Keep the latest filing's value for each fiscal year
-            if fy not in annual:
-                annual[fy] = val
+            # Key by the period END YEAR — this is the actual data year
+            try:
+                period_year = datetime.fromisoformat(end).year
+            except Exception:
+                continue
+
+            # Keep the value; later filings overwrite earlier (latest restatement wins)
+            annual[period_year] = val
 
         if annual:
-            # Return sorted most-recent-first
             return dict(sorted(annual.items(), key=lambda x: x[0], reverse=True))
 
     return {}
@@ -155,10 +182,12 @@ def _get_concept_annual(facts: dict, *tags, unit: str = "USD") -> dict:
 
 def _get_concept_instant(facts: dict, *tags, unit: str = "USD") -> dict:
     """
-    Extract instantaneous (balance sheet) values — point-in-time, not period.
-    Returns {fiscal_year: value} most recent first.
+    Extract instantaneous (balance sheet) values — point-in-time.
+    Keyed by the period END YEAR (reliable), not the fy field.
+    Returns {year: value} most recent first.
     """
     us_gaap = facts.get("facts", {}).get("us-gaap", {})
+    from datetime import datetime
 
     for tag in tags:
         if tag not in us_gaap:
@@ -169,13 +198,16 @@ def _get_concept_instant(facts: dict, *tags, unit: str = "USD") -> dict:
         annual = {}
         for item in unit_data:
             form = item.get("form", "")
-            fy   = item.get("fy")
             val  = item.get("val")
-            if form != "10-K" or fy is None or val is None:
+            end  = item.get("end")
+            if form != "10-K" or val is None or not end:
                 continue
-            # For balance sheet, take period-end value
-            if fy not in annual:
-                annual[fy] = val
+            try:
+                period_year = datetime.fromisoformat(end).year
+            except Exception:
+                continue
+            # Latest filing wins for each year-end
+            annual[period_year] = val
 
         if annual:
             return dict(sorted(annual.items(), key=lambda x: x[0], reverse=True))
@@ -204,7 +236,10 @@ def _build_dataframes(facts: dict):
         "RevenueFromContractWithCustomerIncludingAssessedTax",
     )
     cost_revenue = _get_concept_annual(facts, "CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold")
-    opex_total   = _get_concept_annual(facts, "OperatingExpenses", "CostsAndExpenses")
+    # CostsAndExpenses = TOTAL costs incl COGS + OpEx (what we want for NOP).
+    # OperatingExpenses alone EXCLUDES COGS for most companies.
+    costs_and_expenses = _get_concept_annual(facts, "CostsAndExpenses")
+    operating_expenses = _get_concept_annual(facts, "OperatingExpenses")
     operating_income = _get_concept_annual(facts, "OperatingIncomeLoss")
     pretax       = _get_concept_annual(facts, "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments")
     tax_expense  = _get_concept_annual(facts, "IncomeTaxExpenseBenefit")
@@ -218,7 +253,7 @@ def _build_dataframes(facts: dict):
     cash                = _get_concept_instant(facts, "CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents")
     short_term_debt     = _get_concept_instant(facts, "LongTermDebtCurrent", "DebtCurrent")
     net_ppe             = _get_concept_instant(facts, "PropertyPlantAndEquipmentNet")
-    total_debt_lt       = _get_concept_instant(facts, "LongTermDebtNoncurrent", "LongTermDebt")
+    long_term_debt      = _get_concept_instant(facts, "LongTermDebtNoncurrent", "LongTermDebt")
     total_equity        = _get_concept_instant(facts, "StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")
     long_term_inv       = _get_concept_instant(facts, "LongTermInvestments")
     minority_interest   = _get_concept_instant(facts, "MinorityInterest")
@@ -237,13 +272,30 @@ def _build_dataframes(facts: dict):
     def row(concept_dict):
         return [concept_dict.get(y) for y in years]
 
+    # ── Build "Total Expenses" = total costs including COGS ────────────────────
+    # Priority:
+    #   1. CostsAndExpenses (already total incl COGS + OpEx)
+    #   2. CostOfRevenue + OperatingExpenses (sum them)
+    #   3. Revenue - OperatingIncome (derive from EBIT)
+    total_expenses_row = []
+    for y in years:
+        if costs_and_expenses.get(y) is not None:
+            total_expenses_row.append(costs_and_expenses[y])
+        elif cost_revenue.get(y) is not None or operating_expenses.get(y) is not None:
+            cogs = cost_revenue.get(y, 0) or 0
+            opex = operating_expenses.get(y, 0) or 0
+            total_expenses_row.append(cogs + opex)
+        elif revenue.get(y) is not None and operating_income.get(y) is not None:
+            # Total Expenses = Revenue - Operating Income (EBIT)
+            total_expenses_row.append(revenue[y] - operating_income[y])
+        else:
+            total_expenses_row.append(None)
+
     # Income statement DataFrame (index names match find_row searches)
     income_data = {
         "Total Revenue":           row(revenue),
         "Cost Of Revenue":         row(cost_revenue),
-        "Total Expenses":          row(opex_total) if opex_total else [
-            (cost_revenue.get(y, 0) or 0) for y in years
-        ],
+        "Total Expenses":          total_expenses_row,
         "Operating Income":        row(operating_income),
         "EBIT":                    row(operating_income),
         "Pretax Income":           row(pretax),
@@ -254,6 +306,13 @@ def _build_dataframes(facts: dict):
     }
     income_df = pd.DataFrame(income_data, index=col_labels).T
 
+    # ── Total Debt = Long Term Debt + Current/Short Term Debt ──────────────────
+    total_debt_row = []
+    for y in years:
+        ltd = long_term_debt.get(y, 0) or 0
+        std = short_term_debt.get(y, 0) or 0
+        total_debt_row.append(ltd + std if (ltd or std) else None)
+
     # Balance sheet DataFrame
     balance_data = {
         "Total Current Assets":              row(current_assets),
@@ -263,7 +322,7 @@ def _build_dataframes(facts: dict):
         "Net PPE":                           row(net_ppe),
         "Long Term Investments":             row(long_term_inv),
         "Minority Interest":                 row(minority_interest),
-        "Total Debt":                        row(total_debt_lt),
+        "Total Debt":                        total_debt_row,
         "Total Stockholders Equity":         row(total_equity),
     }
     balance_df = pd.DataFrame(balance_data, index=col_labels).T
@@ -312,6 +371,20 @@ def get_sec_company_data(ticker: str):
     # Shares outstanding from SEC (dei taxonomy)
     shares = _get_shares_outstanding(facts)
 
+    # Sector from SEC submissions (SIC code) — needed for Relative Valuation
+    sector = "Unknown"
+    try:
+        sub_url = SEC_SUBMISSIONS_URL.format(cik=cik)
+        time.sleep(0.12)
+        with httpx.Client(timeout=20.0) as client:
+            sub_resp = client.get(sub_url, headers=SEC_HEADERS)
+        if sub_resp.status_code == 200:
+            sub_data = sub_resp.json()
+            sic      = sub_data.get("sic", "")
+            sector   = _sic_to_sector(sic)
+    except Exception:
+        pass
+
     info = {
         # Financial fields from SEC
         "longName":           company_title(ticker),
@@ -329,8 +402,8 @@ def get_sec_company_data(ticker: str):
         "priceToBook":        None,
         "bookValue":          (equity_latest / shares) if (shares and equity_latest) else None,
         "returnOnEquity":     (latest(income_df, "Net Income") / equity_latest) if (equity_latest and latest(income_df, "Net Income")) else None,
-        "sector":             "Unknown",
-        "industry":           "Unknown",
+        "sector":             sector,
+        "industry":           sector,
         "_data_source":       "sec_edgar",
         "_cik":               cik,
     }
@@ -371,52 +444,63 @@ def _get_shares_outstanding(facts: dict):
 
 def _enrich_with_price(ticker: str, info: dict) -> dict:
     """
-    SEC has no live price. Pull current price, beta, market cap, sector
-    from yfinance quote (a SINGLE lightweight call, not the heavy
-    financials calls). Falls back gracefully if yfinance is rate-limited.
+    SEC has no live price. Pull current price + market cap from yfinance
+    fast_info — a lightweight, cached call that rarely rate-limits (it does
+    NOT hit the heavy /quoteSummary endpoint that .info uses).
+
+    We deliberately AVOID t.info here since that's the heavy call that gets
+    rate-limited. Beta defaults to 1.0 if unavailable; sector stays Unknown.
+    Price/PE are derived from fast_info + SEC-derived EPS.
     """
     try:
         import yfinance as yf
         t = yf.Ticker(ticker)
-        fast = getattr(t, "fast_info", None)
+
+        # fast_info is a lightweight object (NOT a dict) — use getattr only
+        fast = t.fast_info
 
         price = None
-        if fast:
-            price = getattr(fast, "last_price", None) or fast.get("lastPrice") if hasattr(fast, "get") else getattr(fast, "last_price", None)
+        for attr in ("last_price", "lastPrice", "regular_market_price"):
+            try:
+                v = getattr(fast, attr, None)
+                if v:
+                    price = float(v)
+                    break
+            except Exception:
+                continue
 
         if price:
-            info["currentPrice"]       = float(price)
-            info["regularMarketPrice"] = float(price)
+            info["currentPrice"]       = price
+            info["regularMarketPrice"] = price
+
+            # Market cap from fast_info
             try:
-                info["marketCap"] = float(getattr(fast, "market_cap", None) or 0) or None
+                mc = getattr(fast, "market_cap", None)
+                if mc:
+                    info["marketCap"] = float(mc)
             except Exception:
                 pass
 
-        # Beta and sector need full .info — only fetch if price succeeded
-        # (keeps it to one extra call, and only when not already rate-limited)
-        if price:
-            try:
-                full = t.info
-                info["beta"]           = full.get("beta", info.get("beta"))
-                info["sector"]         = full.get("sector", "Unknown")
-                info["industry"]       = full.get("industry", "Unknown")
-                info["trailingPE"]     = full.get("trailingPE", info.get("trailingPE"))
-                info["priceToBook"]    = full.get("priceToBook", info.get("priceToBook"))
-                if not info.get("marketCap"):
-                    info["marketCap"]  = full.get("marketCap")
-                if not info.get("sharesOutstanding"):
-                    info["sharesOutstanding"] = full.get("sharesOutstanding")
-            except Exception:
-                pass
+            # Derive market cap from price × shares if not available
+            if not info.get("marketCap") and info.get("sharesOutstanding"):
+                info["marketCap"] = price * info["sharesOutstanding"]
 
-        # Derive PE from price and EPS if not set
-        if info.get("currentPrice") and info.get("trailingEps") and not info.get("trailingPE"):
-            try:
-                info["trailingPE"] = info["currentPrice"] / info["trailingEps"]
-            except Exception:
-                pass
+            # Derive trailing P/E from price and SEC-derived EPS
+            if info.get("trailingEps") and info["trailingEps"] > 0:
+                info["trailingPE"] = price / info["trailingEps"]
+
+            # Derive Price/Book from price and SEC-derived book value
+            if info.get("bookValue") and info["bookValue"] > 0:
+                info["priceToBook"] = price / info["bookValue"]
+
+        # Beta: default to 1.0 (avoids the heavy .info call).
+        # A more accurate beta can be computed from price history later.
+        if info.get("beta") is None:
+            info["beta"] = 1.0
+
     except Exception:
-        # yfinance failed entirely — financials still work, price is None
-        pass
+        # yfinance failed entirely — financials still work; default beta
+        if info.get("beta") is None:
+            info["beta"] = 1.0
 
     return info
