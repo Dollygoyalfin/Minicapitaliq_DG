@@ -1,4 +1,20 @@
 # Requires: from fmp_data_layer import get_company_data  (add to main.py imports)
+# Requires: from fmp_data_layer import _cache_get, _cache_set, _with_retry
+from fmp_data_layer import _cache_get, _cache_set, _with_retry
+
+# Set yfinance to use a persistent session with headers to reduce rate limiting
+try:
+    import yfinance as yf
+    import requests
+    _yf_session = requests.Session()
+    _yf_session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    yf.utils._session = _yf_session
+except Exception:
+    pass
 
 # ── Sector P/E medians (hardcoded, update quarterly) ──────────────────────────
 SECTOR_PE_MEDIANS = {
@@ -323,16 +339,28 @@ def get_convergence(
         # ─────────────────────────────────────────────────────────────────────
         # METHOD 5 — HISTORICAL P/E MEAN REVERSION
         # Fair Value = EPS × 5-year average P/E
+        # Uses cache to avoid re-hitting yfinance
         # ─────────────────────────────────────────────────────────────────────
         try:
-            import yfinance as yf
             hist_pe_value = None
             avg_hist_pe   = None
             hist_pe_years = 0
 
-            stock_yf = yf.Ticker(raw_ticker)
-            # Get annual EPS history and price history to derive historical P/E
-            hist_price = stock_yf.history(period="5y", interval="1mo")
+            # Use cached price history to avoid extra yfinance calls
+            import yfinance as yf
+            hist_cache_key = f"hist_price:{raw_ticker}"
+            hist_price = _cache_get(hist_cache_key)
+            if hist_price is None:
+                try:
+                    stock_yf   = yf.Ticker(raw_ticker)
+                    hist_price = _with_retry(
+                        lambda: stock_yf.history(period="5y", interval="1mo"),
+                        max_retries=3, base_delay=2.0
+                    )
+                    if hist_price is not None and not hist_price.empty:
+                        _cache_set(hist_cache_key, hist_price)
+                except Exception:
+                    hist_price = None
 
             if hist_price is not None and not hist_price.empty:
                 # Get trailing EPS for each year from financials
