@@ -29,7 +29,6 @@ import pandas as pd
 SEC_HEADERS = {
     "User-Agent": "yllodwrites04@gmail.com",
     "Accept-Encoding": "gzip, deflate",
-    "Host": "data.sec.gov",
 }
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -65,27 +64,53 @@ _CIK_CACHE_TTL = 86400  # 24 hours — financials change quarterly at most
 
 
 def _load_ticker_cik_map():
-    """Load and cache the SEC's ticker→CIK mapping (one-time)."""
+    """Load and cache the SEC's ticker→CIK mapping (one-time, persisted to disk)."""
     global _TICKER_CIK_MAP
     if _TICKER_CIK_MAP:
         return _TICKER_CIK_MAP
 
-    headers = {"User-Agent": "yllodwrites04@gmail.com"}
-    with httpx.Client(timeout=20.0) as client:
-        resp = client.get(SEC_TICKERS_URL, headers=headers)
-    if resp.status_code != 200:
-        raise RuntimeError(f"SEC ticker map fetch failed: {resp.status_code}")
+    # Try loading from disk cache first (avoids re-fetching the 10MB file)
+    import os, json
+    cache_file = "/tmp/sec_ticker_cik_map.json"
+    try:
+        if os.path.exists(cache_file):
+            age = time.time() - os.path.getmtime(cache_file)
+            if age < 7 * 86400:  # 7 days
+                with open(cache_file, "r") as f:
+                    _TICKER_CIK_MAP = json.load(f)
+                if _TICKER_CIK_MAP:
+                    return _TICKER_CIK_MAP
+    except Exception:
+        pass
 
-    data = resp.json()
-    # Format: {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}, ...}
-    for entry in data.values():
-        ticker = entry.get("ticker", "").upper()
-        cik    = entry.get("cik_str")
-        title  = entry.get("title", "")
-        if ticker and cik:
-            _TICKER_CIK_MAP[ticker] = {"cik": cik, "title": title}
+    headers = {"User-Agent": SEC_HEADERS["User-Agent"]}
+    last_err = None
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                time.sleep(2 ** attempt)  # 2s, 4s backoff
+            with httpx.Client(timeout=20.0) as client:
+                resp = client.get(SEC_TICKERS_URL, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                for entry in data.values():
+                    ticker = entry.get("ticker", "").upper()
+                    cik    = entry.get("cik_str")
+                    title  = entry.get("title", "")
+                    if ticker and cik:
+                        _TICKER_CIK_MAP[ticker] = {"cik": cik, "title": title}
+                # Persist to disk
+                try:
+                    with open(cache_file, "w") as f:
+                        json.dump(_TICKER_CIK_MAP, f)
+                except Exception:
+                    pass
+                return _TICKER_CIK_MAP
+            last_err = f"HTTP {resp.status_code}"
+        except Exception as e:
+            last_err = str(e)
 
-    return _TICKER_CIK_MAP
+    raise RuntimeError(f"SEC ticker map fetch failed: {last_err}")
 
 
 def ticker_to_cik(ticker: str) -> str | None:
