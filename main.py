@@ -13,6 +13,7 @@ import re
 import math
 from datetime import date as _date
 from fmp_data_layer import get_company_data
+from fmp_data_layer import _cache_get, _cache_set, _with_retry   # for convergence
 
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -365,7 +366,7 @@ def get_financials(
 def get_dcf(
     ticker: str = Query(...),
     market: str = Query("us"),
-    source: str = Query("auto", description="Data source: auto / yfinance / fmp. Auto = yfinance for India, FMP for US."),
+    source: str = Query("auto", description="Data source: auto / yfinance / fmp / sec"),   # ← this line is new,
     projection_years: int = Query(5, description="Number of years to project FCFF"),
     risk_free_rate: float = Query(0.04, description="Risk-free rate (decimal)"),
     market_return: float = Query(0.10, description="Expected market return (decimal)"),
