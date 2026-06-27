@@ -31,7 +31,7 @@ FMP_BASE = "https://financialmodelingprep.com/stable"
 # window. This is the #1 fix for yfinance's "Too Many Requests" error, since
 # DCF + Financials + Screener can all request the same ticker back-to-back.
 _CACHE: dict = {}
-_CACHE_TTL_SECONDS = 900  # 15 minutes
+_CACHE_TTL_SECONDS = 1800  # 30 minutes
 
 
 def _cache_get(key: str):
@@ -53,6 +53,9 @@ def _with_retry(func, max_retries: int = 3, base_delay: float = 1.5):
     last_err = None
     for attempt in range(max_retries):
         try:
+            # Small base delay to be polite to Yahoo's servers
+            if attempt > 0:
+                time.sleep(base_delay * (2 ** (attempt - 1)))  # 1.5s, 3s, 6s
             return func()
         except Exception as e:
             last_err = e
@@ -61,9 +64,10 @@ def _with_retry(func, max_retries: int = 3, base_delay: float = 1.5):
                 "too many requests" in msg
                 or "429" in msg
                 or "rate limit" in msg
+                or "json" in msg  # yfinance sometimes returns JSON errors on rate limit
+                or "connection" in msg
             )
             if is_rate_limit and attempt < max_retries - 1:
-                time.sleep(base_delay * (2 ** attempt))  # 1.5s, 3s, 6s
                 continue
             raise
     raise last_err
@@ -302,35 +306,54 @@ def _fetch_from_fmp(ticker: str):
 
 def get_company_data(ticker: str, market: str = "us", source: str = "auto"):
     """
-    Returns (info, income_df, balance_df, cashflow_df) in yfinance-compatible shape.
+    Returns (info, income_df, balance_df, cashflow_df, data_source_label).
 
     source:
-        "auto"     -> yfinance for India, FMP for US
+        "auto"     -> India: yfinance | US: SEC EDGAR (free, official, no blocking)
         "yfinance" -> force yfinance
-        "fmp"      -> force FMP, falls back to yfinance if FMP fails/errors
+        "fmp"      -> force FMP, falls back to yfinance
+        "sec"      -> force SEC EDGAR (US only)
     """
     raw_ticker = ticker.upper()
     is_india   = market.lower() == "india"
 
-    if is_india and not raw_ticker.endswith(".NS") and source != "fmp":
+    if is_india and not raw_ticker.endswith(".NS") and source not in ("fmp", "sec"):
         raw_ticker += ".NS"
 
     resolved_source = source
     if source == "auto":
-        resolved_source = "yfinance" if is_india else "fmp"
+        # India stays on yfinance (works well for NSE).
+        # US defaults to SEC EDGAR — free, official, no rate-limit blocking.
+        resolved_source = "yfinance" if is_india else "sec"
 
+    # ── SEC EDGAR (US financials) ─────────────────────────────────────────────
+    if resolved_source == "sec":
+        try:
+            from sec_edgar_layer import get_sec_company_data
+            info, inc, bal, cf = get_sec_company_data(raw_ticker.replace(".NS", ""))
+            return (info, inc, bal, cf, "sec_edgar")
+        except Exception as sec_err:
+            # Fallback chain: SEC -> FMP -> yfinance
+            try:
+                return (*_fetch_from_fmp(raw_ticker.replace(".NS", "")), f"fmp (sec fallback)")
+            except Exception:
+                try:
+                    return (*_fetch_from_yfinance(raw_ticker), "yfinance (sec+fmp fallback)")
+                except Exception as yf_err:
+                    raise RuntimeError(f"All sources failed. SEC: {sec_err} | yfinance: {yf_err}")
+
+    # ── FMP ───────────────────────────────────────────────────────────────────
     if resolved_source == "fmp":
         try:
-            return (*_fetch_from_fmp(raw_ticker), "fmp")
+            return (*_fetch_from_fmp(raw_ticker.replace(".NS", "")), "fmp")
         except Exception as fmp_err:
-            # Fallback to yfinance if FMP fails for any reason
             try:
                 yf_ticker = raw_ticker if raw_ticker.endswith(".NS") or not is_india else raw_ticker
                 if is_india and not yf_ticker.endswith(".NS"):
                     yf_ticker += ".NS"
-                return (*_fetch_from_yfinance(yf_ticker), f"yfinance (fmp fallback: {fmp_err})")
+                return (*_fetch_from_yfinance(yf_ticker), f"yfinance (fmp fallback)")
             except Exception as yf_err:
                 raise RuntimeError(f"Both FMP and yfinance failed. FMP: {fmp_err} | yfinance: {yf_err}")
 
-    # resolved_source == "yfinance"
+    # ── yfinance (default for India) ──────────────────────────────────────────
     return (*_fetch_from_yfinance(raw_ticker), "yfinance")
