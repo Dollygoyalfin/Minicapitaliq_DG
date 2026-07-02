@@ -6,3 +6,5 @@ yfinance
 httpx
 aiofiles
 pandas
+psycopg2-binary
+pdfplumber
