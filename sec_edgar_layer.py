@@ -27,7 +27,7 @@ import pandas as pd
 # SEC REQUIRES a descriptive User-Agent with contact info, or it blocks you.
 # Replace with your real email before production.
 SEC_HEADERS = {
-    "User-Agent": "yllodwrites04@gmail.com",
+    "User-Agent": "MiniTradeIQ youremail@example.com",
     "Accept-Encoding": "gzip, deflate",
 }
 
