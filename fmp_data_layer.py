@@ -308,10 +308,16 @@ def get_company_data(ticker: str, market: str = "us", source: str = "auto"):
     """
     Returns (info, income_df, balance_df, cashflow_df, data_source_label).
 
+    READ ORDER (this is the key to eliminating rate limits):
+      1. YOUR STORE (Postgres) — instant, no rate limits, fundamentals
+         + live price fetched separately (small fast call)
+      2. If not in store → live fetch (SEC/yfinance/FMP) as fallback
+
     source:
-        "auto"     -> India: yfinance | US: SEC EDGAR (free, official, no blocking)
-        "yfinance" -> force yfinance
-        "fmp"      -> force FMP, falls back to yfinance
+        "auto"     -> store first, then India: yfinance | US: SEC EDGAR
+        "store"    -> force store only (error if not present)
+        "yfinance" -> force yfinance (bypass store)
+        "fmp"      -> force FMP
         "sec"      -> force SEC EDGAR (US only)
     """
     raw_ticker = ticker.upper()
@@ -320,10 +326,35 @@ def get_company_data(ticker: str, market: str = "us", source: str = "auto"):
     if is_india and not raw_ticker.endswith(".NS") and source not in ("fmp", "sec"):
         raw_ticker += ".NS"
 
+    # ── STORE FIRST (unless a specific live source is forced) ─────────────────
+    if source in ("auto", "store"):
+        try:
+            from data_store import get_from_store, get_live_price
+            stored = get_from_store(ticker, market)
+            if stored:
+                info, inc, bal, cf = stored
+                # Fetch ONLY the live price (small, fast, rarely rate-limited)
+                live_price = get_live_price(ticker, market)
+                if live_price:
+                    info["currentPrice"]       = live_price
+                    info["regularMarketPrice"] = live_price
+                    # Derive market cap, PE, PB from live price + stored fundamentals
+                    if info.get("sharesOutstanding"):
+                        info["marketCap"] = live_price * info["sharesOutstanding"]
+                    if info.get("trailingEps") and info["trailingEps"] > 0:
+                        info["trailingPE"] = live_price / info["trailingEps"]
+                    if info.get("bookValue") and info["bookValue"] > 0:
+                        info["priceToBook"] = live_price / info["bookValue"]
+                return (info, inc, bal, cf, info.get("_data_source", "store"))
+        except Exception:
+            # Store unavailable (e.g. DATABASE_URL not set) — fall through to live
+            pass
+
+        if source == "store":
+            raise RuntimeError(f"{ticker} not found in data store.")
+
     resolved_source = source
     if source == "auto":
-        # India stays on yfinance (works well for NSE).
-        # US defaults to SEC EDGAR — free, official, no rate-limit blocking.
         resolved_source = "yfinance" if is_india else "sec"
 
     # ── SEC EDGAR (US financials) ─────────────────────────────────────────────
@@ -333,9 +364,8 @@ def get_company_data(ticker: str, market: str = "us", source: str = "auto"):
             info, inc, bal, cf = get_sec_company_data(raw_ticker.replace(".NS", ""))
             return (info, inc, bal, cf, "sec_edgar")
         except Exception as sec_err:
-            # Fallback chain: SEC -> FMP -> yfinance
             try:
-                return (*_fetch_from_fmp(raw_ticker.replace(".NS", "")), f"fmp (sec fallback)")
+                return (*_fetch_from_fmp(raw_ticker.replace(".NS", "")), "fmp (sec fallback)")
             except Exception:
                 try:
                     return (*_fetch_from_yfinance(raw_ticker), "yfinance (sec+fmp fallback)")
@@ -351,7 +381,7 @@ def get_company_data(ticker: str, market: str = "us", source: str = "auto"):
                 yf_ticker = raw_ticker if raw_ticker.endswith(".NS") or not is_india else raw_ticker
                 if is_india and not yf_ticker.endswith(".NS"):
                     yf_ticker += ".NS"
-                return (*_fetch_from_yfinance(yf_ticker), f"yfinance (fmp fallback)")
+                return (*_fetch_from_yfinance(yf_ticker), "yfinance (fmp fallback)")
             except Exception as yf_err:
                 raise RuntimeError(f"Both FMP and yfinance failed. FMP: {fmp_err} | yfinance: {yf_err}")
 
