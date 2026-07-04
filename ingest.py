@@ -16,8 +16,13 @@ makes a request. Users read from the store instantly. Rate limits during
 ingestion don't matter because no user is waiting.
 """
 
+import os
 import sys
 import time
+
+# Ingestion mode: skip live-price enrichment (prices are fetched at
+# request-time, not stored) — avoids pointless yfinance calls during backfill
+os.environ["MINITRADEIQ_INGEST"] = "1"
 from fmp_data_layer import get_company_data
 from data_store import init_db, upsert_company, upsert_statements
 
