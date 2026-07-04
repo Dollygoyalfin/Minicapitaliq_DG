@@ -2,7 +2,7 @@ fastapi
 uvicorn[standard]
 pydantic
 requests
-yfinance
+yfinance>=1.5
 httpx
 aiofiles
 pandas
