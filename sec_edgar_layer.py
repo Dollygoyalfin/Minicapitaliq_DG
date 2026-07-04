@@ -477,6 +477,13 @@ def _enrich_with_price(ticker: str, info: dict) -> dict:
     rate-limited. Beta defaults to 1.0 if unavailable; sector stays Unknown.
     Price/PE are derived from fast_info + SEC-derived EPS.
     """
+    import os as _os
+    if _os.environ.get("MINITRADEIQ_INGEST"):
+        # Background ingestion: financials only, no live price needed
+        if info.get("beta") is None:
+            info["beta"] = 1.0
+        return info
+
     try:
         import yfinance as yf
         t = yf.Ticker(ticker)
@@ -527,5 +534,22 @@ def _enrich_with_price(ticker: str, info: dict) -> dict:
         # yfinance failed entirely — financials still work; default beta
         if info.get("beta") is None:
             info["beta"] = 1.0
+
+    # ── Stooq fallback: if yfinance gave no price, try Stooq (free CSV) ──────
+    if not info.get("currentPrice"):
+        try:
+            from fmp_data_layer import get_stooq_price
+            sp = get_stooq_price(ticker, "us")
+            if sp:
+                info["currentPrice"]       = sp
+                info["regularMarketPrice"] = sp
+                if info.get("sharesOutstanding"):
+                    info["marketCap"] = sp * info["sharesOutstanding"]
+                if info.get("trailingEps") and info["trailingEps"] > 0:
+                    info["trailingPE"] = sp / info["trailingEps"]
+                if info.get("bookValue") and info["bookValue"] > 0:
+                    info["priceToBook"] = sp / info["bookValue"]
+        except Exception:
+            pass
 
     return info
