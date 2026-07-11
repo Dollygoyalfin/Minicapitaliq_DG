@@ -35,11 +35,20 @@ from datetime import datetime
 
 
 def _conn():
-    """Get a database connection from the DATABASE_URL env var."""
+    """Get a database connection from the DATABASE_URL env var.
+    Sets a generous statement timeout — Supabase free-tier instances can
+    stall briefly and the pooler's default timeout is short."""
     db_url = os.environ.get("DATABASE_URL", "")
     if not db_url:
         raise RuntimeError("DATABASE_URL environment variable not set.")
-    return psycopg2.connect(db_url)
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '60s'")
+        conn.commit()
+    except Exception:
+        pass
+    return conn
 
 
 # ── Schema ──────────────────────────────────────────────────────────────────────
@@ -107,17 +116,45 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_cashflow_ticker ON cash_flows(ticker);
     CREATE INDEX IF NOT EXISTS idx_companies_market ON companies(market);
     """
-    with _conn() as conn:
+    conn = _conn()
+    conn.autocommit = True   # DDL statements commit individually
+    try:
         with conn.cursor() as cur:
-            cur.execute(ddl)
-        conn.commit()
+            # Raise the session timeout in case the project is resuming
+            cur.execute("SET statement_timeout = '120s'")
+            # Execute each statement separately — more robust through poolers
+            for stmt in ddl.split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    cur.execute(stmt + ";")
+    finally:
+        conn.close()
     print("✅ Database tables created.")
+
+
+def _retry_db(fn, attempts: int = 3):
+    """Run a DB operation; on a dropped/closed connection, retry once with a
+    fresh connection (Supabase pooler occasionally recycles sessions)."""
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            last = e
+            if i < attempts - 1:
+                import time as _t
+                _t.sleep(2)
+    raise last
 
 
 # ── Ingestion — write data into the store ──────────────────────────────────────
 
 def upsert_company(info: dict, ticker: str, market: str, data_source: str):
     """Insert or update a company's slow-changing metadata."""
+    return _retry_db(lambda: _upsert_company_inner(info, ticker, market, data_source))
+
+
+def _upsert_company_inner(info: dict, ticker: str, market: str, data_source: str):
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -152,6 +189,11 @@ def upsert_company(info: dict, ticker: str, market: str, data_source: str):
 def upsert_statements(ticker: str, income_df: pd.DataFrame,
                       balance_df: pd.DataFrame, cashflow_df: pd.DataFrame):
     """Write income, balance, cashflow rows for each fiscal year."""
+    return _retry_db(lambda: _upsert_statements_inner(ticker, income_df, balance_df, cashflow_df))
+
+
+def _upsert_statements_inner(ticker: str, income_df: pd.DataFrame,
+                             balance_df: pd.DataFrame, cashflow_df: pd.DataFrame):
 
     def gv(df, row_name, col):
         try:
@@ -364,6 +406,15 @@ def get_live_price(ticker: str, market: str = "us"):
                     return float(v)
             except Exception:
                 continue
+    except Exception:
+        pass
+
+    # Stooq fallback for US (free, no auth)
+    try:
+        from fmp_data_layer import get_stooq_price
+        sp = get_stooq_price(ticker, market)
+        if sp:
+            return sp
     except Exception:
         pass
     return None
