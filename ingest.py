@@ -45,6 +45,58 @@ INDIA_UNIVERSE = [
 ]
 
 
+def fetch_us_universe() -> list:
+    """
+    S&P 500 constituents. Primary: Wikipedia table (stable, no key).
+    Falls back to the hardcoded starter list on any failure.
+    """
+    try:
+        import httpx, re
+        resp = httpx.get(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=30.0,
+            follow_redirects=True,
+        )
+        # Tickers sit in the first table as <a ...>SYMBOL</a> within rows;
+        # simplest robust extraction: symbols linked to NYSE/Nasdaq quote pages
+        syms = re.findall(r'data-sort-value="([A-Z.\-]{1,6})"', resp.text)
+        if not syms:
+            syms = re.findall(
+                r'https?://www\.nyse\.com/quote/\w+:([A-Z.\-]{1,6})"', resp.text
+            ) + re.findall(
+                r'nasdaq\.com/market-activity/stocks/([a-zA-Z.\-]{1,6})"', resp.text
+            )
+        syms = sorted({s.upper().replace(".", "-") for s in syms if s})
+        if len(syms) >= 400:
+            print(f"  Universe: {len(syms)} S&P 500 tickers from Wikipedia")
+            return syms
+    except Exception as e:
+        print(f"  Universe fetch failed ({e}) — using starter list")
+    return US_UNIVERSE
+
+
+def fetch_india_universe() -> list:
+    """
+    Nifty 500 constituents from NSE's official index CSV (via the same
+    cookie-handshake session the pipeline already uses).
+    Falls back to the starter list.
+    """
+    try:
+        import csv, io
+        from india_data_pipeline import _nse_get
+        resp = _nse_get(
+            "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+        )
+        rows = list(csv.DictReader(io.StringIO(resp.text)))
+        syms = [r["Symbol"].strip().upper() for r in rows if r.get("Symbol")]
+        if len(syms) >= 300:
+            print(f"  Universe: {len(syms)} Nifty 500 tickers from NSE")
+            return syms
+    except Exception as e:
+        print(f"  Universe fetch failed ({e}) — using starter list")
+    return INDIA_UNIVERSE
+
+
 def ingest_one(ticker: str, market: str):
     """Fetch one company's data and write it to the store."""
     try:
@@ -129,7 +181,22 @@ if __name__ == "__main__":
         backfill(INDIA_UNIVERSE, "india")
     elif cmd == "backfill_india_own":
         backfill_india_own(INDIA_UNIVERSE)
+    elif cmd == "one":
+        # Re-ingest a single ticker: python ingest.py one MARUTI [india|us]
+        tkr = sys.argv[2] if len(sys.argv) > 2 else None
+        mkt = sys.argv[3] if len(sys.argv) > 3 else "india"
+        if not tkr:
+            print("Usage: python ingest.py one TICKER [india|us]")
+        elif mkt == "india":
+            from india_data_pipeline import ingest_india_own
+            ingest_india_own(tkr)
+        else:
+            ingest_one(tkr, mkt)
+    elif cmd == "backfill_us_full":
+        backfill(fetch_us_universe(), "us")
+    elif cmd == "backfill_india_full":
+        backfill_india_own(fetch_india_universe())
     elif cmd == "refresh":
         refresh_all()
     else:
-        print("Usage: python ingest.py [init|backfill_us|backfill_india|backfill_india_own|refresh]")
+        print("Usage: python ingest.py [init|one TICKER MARKET|backfill_us|backfill_india|backfill_india_own|backfill_us_full|backfill_india_full|refresh]")
