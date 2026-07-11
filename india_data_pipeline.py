@@ -1,28 +1,22 @@
 """
-MiniTradeIQ — Own Indian Financials Pipeline
-=============================================
-Your own data source for Indian stocks, replacing yfinance dependence.
+MiniTradeIQ — Own Indian Financials Pipeline (v2 — XBRL)
+=========================================================
+NSE publishes every financial-results filing with a structured Ind-AS
+XBRL file (confirmed via live response). This pipeline:
 
-Architecture (mirrors the SEC EDGAR approach for US):
-  1. INCOME STATEMENT  → NSE's structured financial-results API (clean JSON)
-  2. BALANCE SHEET +
-     CASH FLOW         → annual results PDF → text → Groq LLM extraction
-  3. Both written to YOUR Postgres store via data_store.py
+  1. Lists annual filings per symbol  (corporates-financial-results API)
+  2. Picks the Consolidated filing per fiscal year (Standalone fallback)
+  3. Downloads each year's XBRL XML and extracts P&L + Balance Sheet +
+     Cash Flow facts directly — no PDF parsing, no unit guessing
+     (XBRL values are absolute rupees)
+  4. Falls back to results-PDF + Groq extraction ONLY if XBRL lacks
+     balance-sheet facts
+  5. Writes everything to your Postgres store
 
-Run via ingest.py — this is a BACKGROUND ingestion source, not a live
-user-request path. Users always read from the store.
+This is the India equivalent of the SEC EDGAR pipeline.
 
-Requirements (add to requirements.txt):
-    httpx
-    pdfplumber
-
-Env vars:
-    GROQ_API_KEY   (already set for AI Verdict)
-
-NOTE: NSE requires browser-like headers + a cookie handshake (visit the
-homepage first). Field names in NSE responses occasionally change — the
-parsers below try multiple candidate keys and log what they find, so the
-first live run tells you exactly what (if anything) to adjust.
+Requirements: httpx, pdfplumber (fallback only)
+Env: GROQ_API_KEY (fallback only)
 """
 
 import os
@@ -31,12 +25,10 @@ import re
 import json
 import time
 import httpx
+import xml.etree.ElementTree as ET
+from datetime import datetime, date
 
-# ── NSE session handling ────────────────────────────────────────────────────────
-# NSE blocks plain programmatic requests. The standard technique:
-# 1) create a client with full browser headers
-# 2) GET the homepage once to receive cookies
-# 3) then call the JSON APIs with those cookies
+# ── NSE session handling (unchanged — proven working) ──────────────────────────
 
 NSE_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -49,18 +41,15 @@ NSE_HEADERS = {
 
 _nse_client = None
 _nse_client_time = 0
-_NSE_SESSION_TTL = 300  # refresh cookies every 5 minutes
+_NSE_SESSION_TTL = 300
 
 
 def _nse():
-    """Get an NSE client with valid cookies (handshake with homepage)."""
     global _nse_client, _nse_client_time
     now = time.time()
     if _nse_client is not None and (now - _nse_client_time) < _NSE_SESSION_TTL:
         return _nse_client
-
-    client = httpx.Client(timeout=25.0, headers=NSE_HEADERS, follow_redirects=True)
-    # Cookie handshake — required before API calls work
+    client = httpx.Client(timeout=30.0, headers=NSE_HEADERS, follow_redirects=True)
     client.get("https://www.nseindia.com")
     time.sleep(0.5)
     _nse_client = client
@@ -68,357 +57,562 @@ def _nse():
     return client
 
 
-def _nse_get_json(url: str, retries: int = 3):
+def _nse_get(url: str, retries: int = 3):
     last_err = None
     for attempt in range(retries):
         try:
             if attempt > 0:
                 time.sleep(2 * attempt)
-                # force a fresh cookie handshake on retry
                 global _nse_client
                 _nse_client = None
-            client = _nse()
-            resp = client.get(url)
+            resp = _nse().get(url)
             if resp.status_code == 200:
-                return resp.json()
+                return resp
             last_err = f"HTTP {resp.status_code}"
         except Exception as e:
             last_err = str(e)
     raise RuntimeError(f"NSE request failed after {retries} tries: {last_err} — {url}")
 
 
-# ── 1) INCOME STATEMENT — NSE structured financial results ─────────────────────
-
-def _num(v):
-    """NSE returns numbers as strings with commas / '-' for nil."""
-    if v is None:
-        return None
-    s = str(v).replace(",", "").strip()
-    if s in ("", "-", "--", "NA", "N.A."):
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
+def _nse_get_json(url: str, retries: int = 3):
+    return _nse_get(url, retries).json()
 
 
-def fetch_nse_income_statements(symbol: str, period: str = "Annual") -> list:
+# ── 1) List annual filings, pick best per fiscal year ──────────────────────────
+
+def fetch_annual_filings(symbol: str) -> dict:
     """
-    Fetch structured P&L results from NSE for a symbol.
-    Returns a list of dicts (most recent first):
-      { fiscal_year, revenue, total_expenses, pretax_income,
-        tax_provision, net_income, eps, audited, period_end }
-
-    NSE results are in ₹ LAKHS for most filers — we convert to absolute ₹
-    (multiply by 1e5) so units match the rest of the store.
+    Returns {fiscal_year: {"xbrl": url, "consolidated": bool, "to_date": "31-Mar-2024"}}
+    Prefers Consolidated over Standalone for each year.
     """
     url = (f"https://www.nseindia.com/api/corporates-financial-results"
-           f"?index=equities&symbol={symbol}&period={period}")
+           f"?index=equities&symbol={symbol}&period=Annual")
     data = _nse_get_json(url)
-
     rows = data if isinstance(data, list) else data.get("data", [])
-    results = []
 
+    # NSE occasionally returns an empty list on a stale session — one retry
+    # with a forced fresh cookie handshake
+    if not rows:
+        global _nse_client
+        _nse_client = None
+        time.sleep(2)
+        data = _nse_get_json(url)
+        rows = data if isinstance(data, list) else data.get("data", [])
+
+    by_fy: dict = {}
     for r in rows:
-        # NSE field names vary across result vintages — try candidates
-        def g(*keys):
-            for k in keys:
-                if k in r and r[k] not in (None, "", "-"):
-                    return r[k]
-            return None
-
-        income   = _num(g("income", "totalIncome", "re_total_income", "ti"))
-        expend   = _num(g("expenditure", "totalExpenditure", "re_total_expenditure", "te"))
-        pbt      = _num(g("proLossBefTax", "profitBeforeTax", "re_pro_loss_bef_tax", "pbt"))
-        tax      = _num(g("tax", "taxExpense", "re_tax", "taxAmt"))
-        pat      = _num(g("proLossAftTax", "reProLossAftTax", "profitAfterTax",
-                          "re_pro_loss_aft_tax", "pat", "netProfitLoss"))
-        eps      = _num(g("eps", "basicEPS", "re_basic_eps", "epsAfterExtraOrdinary"))
-        to_date  = g("toDate", "to_date", "reToDate", "period_ended", "relatingTo")
-        audited  = g("audited", "re_audited", "auditedUnaudited")
-
-        # Derive tax if missing
-        if tax is None and pbt is not None and pat is not None:
-            tax = pbt - pat
-
-        # Fiscal year from the period-end date (e.g. "31-Mar-2025" → 2025)
-        fy = None
-        if to_date:
-            m = re.search(r"(\d{4})", str(to_date))
-            if m:
-                fy = int(m.group(1))
-
-        if fy is None or income is None:
+        xbrl = r.get("xbrl")
+        to_date = r.get("toDate", "")
+        if not xbrl or not to_date:
             continue
-
-        LAKH = 1e5  # NSE results are reported in lakhs
-        results.append({
-            "fiscal_year":    fy,
-            "revenue":        income * LAKH,
-            "total_expenses": expend * LAKH if expend is not None else None,
-            "pretax_income":  pbt * LAKH if pbt is not None else None,
-            "tax_provision":  tax * LAKH if tax is not None else None,
-            "net_income":     pat * LAKH if pat is not None else None,
-            "eps":            eps,   # per-share, no scaling
-            "period_end":     to_date,
-            "audited":        audited,
-        })
-
-    # Deduplicate by fiscal year (keep first = most recent filing per FY)
-    seen, unique = set(), []
-    for r in sorted(results, key=lambda x: x["fiscal_year"], reverse=True):
-        if r["fiscal_year"] not in seen:
-            seen.add(r["fiscal_year"])
-            unique.append(r)
-    return unique
+        m = re.search(r"(\d{4})", to_date)
+        if not m:
+            continue
+        fy = int(m.group(1))
+        is_cons = str(r.get("consolidated", "")).strip().lower() == "consolidated"
+        fmt     = str(r.get("format", "")).strip().lower()
+        existing = by_fy.get(fy)
+        if existing is None or (is_cons and not existing["consolidated"]):
+            by_fy[fy] = {"xbrl": xbrl, "consolidated": is_cons,
+                         "to_date": to_date, "format": fmt}
+    return by_fy
 
 
-# ── 2) BALANCE SHEET + CASH FLOW — results PDF → Groq extraction ────────────────
+# ── 2) XBRL parsing ─────────────────────────────────────────────────────────────
+
+def _local(tag: str) -> str:
+    """Strip XML namespace: '{ns}RevenueFromOperations' → 'revenuefromoperations'."""
+    return tag.split("}")[-1].lower()
+
+
+def _parse_date(s: str):
+    s = (s or "").strip()
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_xbrl(xml_bytes: bytes, period_end: date) -> dict:
+    """
+    Extract facts from an Ind-AS XBRL instance.
+
+    NSE quirk (confirmed on live RIL FY24 filing): ALL duration contexts carry
+    Q4 dates (e.g. 2024-01-01 -> 2024-03-31), even the cumulative full-year
+    one. Naming encodes the truth: OneD = single quarter, FourD = four
+    quarters cumulative = the ANNUAL figures. Date-span filtering therefore
+    fails. Instead we pick, among contexts ending at period_end, the one with
+    the MOST numeric facts — the cumulative annual context is always the
+    richest (RIL: FourD=144 facts vs OneD=54 vs segment contexts=1).
+    Same max-facts rule selects the primary instant (balance sheet) context.
+    """
+    from collections import Counter
+    root = ET.fromstring(xml_bytes)
+
+    # ── Contexts: id -> (start, end, instant) ────────────────────────────────
+    contexts: dict = {}
+    for el in root.iter():
+        if _local(el.tag) != "context":
+            continue
+        cid = el.get("id")
+        start = end = instant = None
+        for child in el.iter():
+            lc = _local(child.tag)
+            if lc == "startdate":
+                start = _parse_date(child.text)
+            elif lc == "enddate":
+                end = _parse_date(child.text)
+            elif lc == "instant":
+                instant = _parse_date(child.text)
+        contexts[cid] = (start, end, instant)
+
+    # ── Numeric fact census per context ──────────────────────────────────────
+    counts: Counter = Counter()
+    fact_els = []
+    for el in root.iter():
+        ctx = el.get("contextRef")
+        if ctx is None or el.text is None:
+            continue
+        txt = el.text.strip()
+        if txt in ("", "-"):
+            continue
+        try:
+            float(txt)
+        except ValueError:
+            continue
+        counts[ctx] += 1
+        fact_els.append(el)
+
+    # ── Primary contexts: most facts among those anchored at period_end ─────
+    dur_candidates  = [cid for cid, (s, e, i) in contexts.items() if e == period_end]
+    inst_candidates = [cid for cid, (s, e, i) in contexts.items() if i == period_end]
+
+    primary_dur  = max(dur_candidates,  key=lambda c: counts.get(c, 0), default=None)
+    primary_inst = max(inst_candidates, key=lambda c: counts.get(c, 0), default=None)
+    keep = {c for c in (primary_dur, primary_inst) if c is not None}
+
+    # ── Facts from the primary contexts only ─────────────────────────────────
+    facts: dict = {}
+    for el in fact_els:
+        if el.get("contextRef") not in keep:
+            continue
+        name = _local(el.tag)
+        if name not in facts:
+            facts[name] = float(el.text.strip())
+
+    return facts
+
+
+def _pick(facts: dict, *candidates, contains: str = None):
+    """Find a fact by exact candidate names (lowercased), else substring."""
+    for c in candidates:
+        v = facts.get(c.lower())
+        if v is not None:
+            return v
+    if contains:
+        needle = contains.lower()
+        for k, v in facts.items():
+            if needle in k:
+                return v
+    return None
+
+
+def extract_financials_from_xbrl(xml_bytes: bytes, period_end: date) -> dict:
+    """Map raw XBRL facts → our store schema fields (absolute rupees)."""
+    f = parse_xbrl(xml_bytes, period_end)
+
+    revenue = _pick(f, "RevenueFromOperations", contains="revenuefromoperations")
+    total_income = _pick(f, "Income", "TotalIncome")
+    if revenue is None:
+        revenue = total_income
+
+    expenses = _pick(f, "Expenses", "TotalExpenses", contains="totalexpense")
+    pbt      = _pick(f, "ProfitBeforeTax", "ProfitLossBeforeTax",
+                     contains="profitbeforetax")
+    tax      = _pick(f, "TaxExpense", "TotalTaxExpenses", contains="taxexpense")
+    pat      = _pick(f, "ProfitLossForPeriod", "ProfitLossForThePeriod",
+                     "NetProfitLossForThePeriod", contains="profitlossforperiod")
+    eps      = _pick(f, "BasicEarningsLossPerShareFromContinuingOperations",
+                     "BasicEarningsLossPerShareFromContinuingAndDiscontinuedOperations",
+                     contains="basicearnings")
+    depr     = _pick(f, "DepreciationDepletionAndAmortisationExpense",
+                     contains="depreciation")
+    fincost  = _pick(f, "FinanceCosts", contains="financecost")
+
+    if tax is None and pbt is not None and pat is not None:
+        tax = pbt - pat
+
+    # Balance sheet (instant facts, present in annual/half-yearly filings)
+    curr_assets = _pick(f, "CurrentAssets", "TotalCurrentAssets",
+                        contains="currentassets")
+    curr_liab   = _pick(f, "CurrentLiabilities", "TotalCurrentLiabilities",
+                        contains="currentliabilities")
+    cash        = _pick(f, "CashAndCashEquivalents", contains="cashandcashequivalents")
+    ppe         = _pick(f, "PropertyPlantAndEquipment", contains="propertyplantandequipment")
+    equity      = _pick(f, "Equity", "EquityAttributableToOwnersOfParent",
+                        contains="equityattributable")
+    # Borrowings: careful — "noncurrentborrowings" CONTAINS the substring
+    # "currentborrowings", so current must exclude "non" explicitly
+    borrow_nc  = _pick(f, "NonCurrentBorrowings", "LongTermBorrowings",
+                       "BorrowingsNonCurrent", contains="noncurrentborrowings")
+    borrow_cur = _pick(f, "CurrentBorrowings", "ShortTermBorrowings",
+                       "BorrowingsCurrent")
+    if borrow_cur is None:
+        for k, v in f.items():
+            if "borrowings" in k and "noncurrent" not in k and "current" in k:
+                borrow_cur = v
+                break
+    # Some filings report a single combined "borrowings" figure
+    if borrow_cur is None and borrow_nc is None:
+        borrow_nc = _pick(f, "Borrowings")
+    minority    = _pick(f, "NonControllingInterests", contains="noncontrolling")
+    investments = _pick(f, "NonCurrentInvestments", contains="noncurrentinvestments")
+
+    total_debt = None
+    if borrow_cur is not None or borrow_nc is not None:
+        total_debt = (borrow_cur or 0) + (borrow_nc or 0)
+
+    # Cash flow (present in annual filings)
+    ocf   = _pick(f, "NetCashFlowsFromUsedInOperatingActivities",
+                  contains="operatingactivities")
+    capex = _pick(f, "PurchaseOfPropertyPlantAndEquipment",
+                  contains="purchaseofproperty")
+
+    return {
+        # P&L
+        "revenue":          revenue,
+        "total_expenses":   expenses,
+        "pretax_income":    pbt,
+        "tax_provision":    tax,
+        "net_income":       pat,
+        "eps":              eps,
+        "depreciation":     depr,
+        "interest_expense": fincost,
+        # Balance sheet
+        "current_assets":      curr_assets,
+        "current_liabilities": curr_liab,
+        "cash":                cash,
+        "net_ppe":             ppe,
+        "total_equity":        equity,
+        "cpltd":               borrow_cur,
+        "total_debt":          total_debt,
+        "minority_interest":   minority,
+        "long_term_investments": investments,
+        # Cash flow
+        "operating_cash_flow": ocf,
+        "capex":               abs(capex) if capex is not None else None,
+        # Diagnostics
+        "_facts_found": len(f),
+    }
+
+
+# ── 3) PDF + Groq fallback (only if XBRL lacked balance sheet) ─────────────────
 
 def fetch_latest_results_pdf_url(symbol: str) -> str | None:
-    """
-    Find the latest annual/half-yearly financial-results PDF from NSE
-    corporate announcements (these contain the balance sheet).
-    """
     url = (f"https://www.nseindia.com/api/corporate-announcements"
            f"?index=equities&symbol={symbol}")
     try:
         data = _nse_get_json(url)
     except Exception:
         return None
-
     rows = data if isinstance(data, list) else data.get("data", [])
     for r in rows:
         desc = (str(r.get("desc", "")) + " " + str(r.get("attchmntText", ""))).lower()
         attach = r.get("attchmntFile") or r.get("attachmentFile") or r.get("pdfLink")
-        if not attach:
-            continue
-        if "financial result" in desc or "financial results" in desc:
-            if str(attach).lower().endswith(".pdf"):
-                return attach
+        if attach and "financial result" in desc and str(attach).lower().endswith(".pdf"):
+            return attach
     return None
 
 
-def extract_pdf_text(pdf_url: str, max_pages: int = 12) -> str:
-    """Download a results PDF and extract text from the first N pages."""
-    import pdfplumber
-    client = _nse()
-    resp = client.get(pdf_url)
-    if resp.status_code != 200:
-        raise RuntimeError(f"PDF download failed: HTTP {resp.status_code}")
-
-    text_parts = []
-    with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-        for page in pdf.pages[:max_pages]:
-            t = page.extract_text() or ""
-            text_parts.append(t)
-    return "\n".join(text_parts)
-
-
-def _focus_balance_sheet_section(full_text: str, window: int = 9000) -> str:
-    """Trim the PDF text to the region around the balance sheet to keep
-    the LLM prompt small and focused."""
-    lower = full_text.lower()
-    for marker in ("statement of assets and liabilities", "balance sheet", "assets"):
-        idx = lower.find(marker)
-        if idx != -1:
-            start = max(0, idx - 500)
-            return full_text[start:start + window]
-    return full_text[:window]
-
-
-GROQ_EXTRACT_PROMPT = """You are a precise financial data extractor. Below is text
-extracted from an Indian listed company's financial results PDF (SEBI format).
-Extract the MOST RECENT period's standalone-or-consolidated (prefer consolidated)
-balance sheet and cash flow figures.
-
-IMPORTANT:
-- Figures in these PDFs are usually in ₹ lakhs or ₹ crores — detect which from
-  the document header and return ALL monetary values converted to ABSOLUTE RUPEES
-  (lakh = ×100000, crore = ×10000000).
-- If a value is genuinely not present, use null. Do NOT guess.
-- Respond with ONLY a JSON object, no markdown, no commentary.
-
-{{
-  "unit_detected": "lakhs | crores | rupees",
-  "fiscal_year": <4-digit year of period end>,
-  "current_assets": <number|null>,
-  "current_liabilities": <number|null>,
-  "cash_and_equivalents": <number|null>,
-  "current_portion_lt_debt": <number|null>,
-  "net_ppe": <number|null>,
-  "long_term_investments": <number|null>,
-  "minority_interest": <number|null>,
-  "total_debt": <number|null>,
-  "total_equity": <number|null>,
-  "depreciation": <number|null>,
-  "capex": <number|null>,
-  "operating_cash_flow": <number|null>
-}}
-
-DOCUMENT TEXT:
-{doc}"""
-
-
-def groq_extract_balance_sheet(pdf_text: str) -> dict | None:
-    """Send the balance-sheet section to Groq and parse structured JSON back."""
-    api_key = os.environ.get("GROQ_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY not set — needed for PDF extraction.")
-
-    focused = _focus_balance_sheet_section(pdf_text)
-    prompt  = GROQ_EXTRACT_PROMPT.format(doc=focused)
-
-    with httpx.Client(timeout=60.0) as client:
-        resp = client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Content-Type":  "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "max_tokens": 800,
-                "temperature": 0.0,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": "You extract financial data. Respond with valid JSON only."},
-                    {"role": "user",   "content": prompt},
-                ],
-            },
-        )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Groq extraction failed: {resp.status_code} {resp.text[:200]}")
-
-    text = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+def _pdf_groq_balance_sheet(symbol: str) -> dict | None:
+    """Fallback: extract BS from the latest results PDF via Groq."""
     try:
-        parsed = json.loads(text)
+        import pdfplumber
+        pdf_url = fetch_latest_results_pdf_url(symbol)
+        if not pdf_url:
+            return None
+        resp = _nse_get(pdf_url)
+        text_parts = []
+        with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+            for page in pdf.pages[:12]:
+                text_parts.append(page.extract_text() or "")
+        full_text = "\n".join(text_parts)
+
+        lower = full_text.lower()
+        for marker in ("statement of assets and liabilities", "balance sheet", "assets"):
+            idx = lower.find(marker)
+            if idx != -1:
+                full_text = full_text[max(0, idx - 500):idx + 9000]
+                break
+        else:
+            full_text = full_text[:9000]
+
+        api_key = os.environ.get("GROQ_API_KEY", "")
+        if not api_key:
+            return None
+
+        prompt = f"""Extract the most recent period's balance sheet from this Indian
+financial results document. Values may be in lakhs or crores — detect from the
+header and convert ALL monetary values to ABSOLUTE RUPEES (lakh=x1e5, crore=x1e7).
+Use null when absent. Respond with ONLY JSON:
+{{"fiscal_year": <year>, "current_assets": n, "current_liabilities": n,
+"cash": n, "cpltd": n, "net_ppe": n, "long_term_investments": n,
+"minority_interest": n, "total_debt": n, "total_equity": n,
+"depreciation": n, "capex": n, "operating_cash_flow": n}}
+
+DOCUMENT:
+{full_text}"""
+
+        with httpx.Client(timeout=60.0) as client:
+            r = client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {api_key}"},
+                json={"model": "llama-3.3-70b-versatile",
+                      "max_tokens": 600, "temperature": 0.0,
+                      "response_format": {"type": "json_object"},
+                      "messages": [
+                          {"role": "system", "content": "Respond with valid JSON only."},
+                          {"role": "user",   "content": prompt}]},
+            )
+        if r.status_code != 200:
+            return None
+        parsed = json.loads(r.json()["choices"][0]["message"]["content"])
+        ca = parsed.get("current_assets")
+        if ca is not None and (ca < 0 or ca > 1e16):
+            return None
+        return parsed
     except Exception:
         return None
 
-    # Sanity checks — reject obviously broken extractions rather than
-    # poisoning the store with garbage
-    ca, cl = parsed.get("current_assets"), parsed.get("current_liabilities")
-    if ca is not None and (ca < 0 or ca > 1e16):
-        return None
-    if cl is not None and (cl < 0 or cl > 1e16):
-        return None
-    return parsed
 
+# ── 4) Full ingestion for one symbol ────────────────────────────────────────────
 
-# ── 3) Full ingestion for one Indian company ────────────────────────────────────
-
-def ingest_india_own(ticker: str, include_balance_sheet: bool = True) -> bool:
-    """
-    Full own-pipeline ingestion for one NSE symbol:
-      P&L from NSE structured API + BS/CF from results PDF via Groq.
-    Writes to the Postgres store. Returns True on success.
-    """
+def ingest_india_own(ticker: str) -> bool:
     from data_store import upsert_company, upsert_statements
     import pandas as pd
 
     symbol = ticker.upper().replace(".NS", "")
     store_ticker = symbol + ".NS"
 
-    # ── Income statements (structured, multiple years) ─────────────────────────
-    income_rows = fetch_nse_income_statements(symbol, period="Annual")
-    if not income_rows:
-        print(f"  ⚠ {symbol}: no NSE results found")
+    filings = fetch_annual_filings(symbol)
+    if not filings:
+        print(f"  ⚠ {symbol}: no annual filings found on NSE")
         return False
 
-    years = [r["fiscal_year"] for r in income_rows][:6]
-    col_labels = [str(y) for y in years]
-    by_year = {r["fiscal_year"]: r for r in income_rows}
+    years = sorted(filings.keys(), reverse=True)[:6]
+    yearly: dict = {}
 
-    def irow(field):
-        return [by_year.get(y, {}).get(field) for y in years]
+    # Filings up to FY2022 use a legacy XBRL taxonomy our parser doesn't
+    # cover (confirmed: RELIANCE/TCS/INFY all yield 2 facts pre-FY2023).
+    # NSE's "format" field can't distinguish them (legacy filings are also
+    # marked "New"), so we cut over by year. Skipped years are filled from
+    # the yfinance merge below.
+    LEGACY_XBRL_CUTOFF = 2022
+
+    for fy in years:
+        info_f = filings[fy]
+        if fy <= LEGACY_XBRL_CUTOFF:
+            print(f"  FY{fy}: legacy taxonomy, skipping XBRL (yfinance will fill)")
+            continue
+        period_end = _parse_date(info_f["to_date"])
+        try:
+            resp = _nse_get(info_f["xbrl"])
+            data = extract_financials_from_xbrl(resp.content, period_end)
+            if data.get("revenue"):
+                yearly[fy] = data
+                bs_flag = "BS ok" if data.get("current_assets") else "BS missing"
+                print(f"  FY{fy}: rev={data['revenue']:.3e} "
+                      f"({data['_facts_found']} facts, {bs_flag}, "
+                      f"{'cons' if info_f['consolidated'] else 'standalone'})")
+            else:
+                print(f"  ⚠ FY{fy}: XBRL parsed but no revenue fact "
+                      f"({data['_facts_found']} facts)")
+        except Exception as e:
+            print(f"  ⚠ FY{fy}: XBRL failed ({e})")
+        time.sleep(1.0)
+
+    if not yearly:
+        print(f"  ❌ {symbol}: no usable years")
+        return False
+
+    # ── Fill older years from yfinance (XBRL years keep priority) ───────────
+    if len(yearly) < 5:
+        try:
+            import yfinance as yf
+
+            def _yfv(df, col_i, *keywords):
+                if df is None or df.empty:
+                    return None
+                for idx in df.index:
+                    low = idx.lower()
+                    if all(k in low for k in keywords):
+                        try:
+                            v = df.loc[idx].iloc[col_i]
+                            return None if (v is None or str(v) == "nan") else float(v)
+                        except Exception:
+                            return None
+                return None
+
+            inc = bal = cf = None
+            for attempt in range(3):
+                if attempt > 0:
+                    time.sleep(6 * attempt)   # 6s, 12s — let Yahoo cool off
+                t   = yf.Ticker(store_ticker)
+                inc, bal, cf = t.financials, t.balance_sheet, t.cashflow
+                if inc is not None and not inc.empty:
+                    break
+            if inc is None or inc.empty:
+                print(f"  yfinance merge: empty response (throttled) — "
+                      f"rerun backfill later to fill older years")
+            added = []
+            if inc is not None and not inc.empty:
+                for i, col in enumerate(inc.columns):
+                    try:
+                        fy = int(col.year)
+                    except Exception:
+                        continue
+                    if fy in yearly or len(yearly) >= 6:
+                        continue
+                    rev = _yfv(inc, i, "total revenue")
+                    if not rev:
+                        continue
+                    yearly[fy] = {
+                        "revenue":            rev,
+                        "total_expenses":     _yfv(inc, i, "total expenses"),
+                        "pretax_income":      _yfv(inc, i, "pretax"),
+                        "tax_provision":      _yfv(inc, i, "tax", "provision"),
+                        "net_income":         _yfv(inc, i, "net income"),
+                        "eps":                None,
+                        "depreciation":       _yfv(inc, i, "reconciled", "depreciation")
+                                              or _yfv(cf, i, "depreciation"),
+                        "interest_expense":   _yfv(inc, i, "interest", "expense"),
+                        "current_assets":     _yfv(bal, i, "current assets"),
+                        "current_liabilities": _yfv(bal, i, "current liabilities"),
+                        "cash":               _yfv(bal, i, "cash", "equivalents"),
+                        "net_ppe":            _yfv(bal, i, "net ppe"),
+                        "total_equity":       _yfv(bal, i, "stockholders equity"),
+                        "cpltd":              _yfv(bal, i, "current", "long term debt")
+                                              or _yfv(bal, i, "current debt"),
+                        "total_debt":         _yfv(bal, i, "total debt"),
+                        "minority_interest":  _yfv(bal, i, "minority interest"),
+                        "long_term_investments": _yfv(bal, i, "long term", "investment"),
+                        "operating_cash_flow": _yfv(cf, i, "operating cash flow"),
+                        "capex":              abs(_yfv(cf, i, "capital expenditure") or 0) or None,
+                        "_facts_found":       0,
+                    }
+                    added.append(fy)
+            if added:
+                print(f"  yfinance merge: added FY{sorted(added, reverse=True)}")
+        except Exception as e:
+            print(f"  yfinance merge skipped ({e})")
+
+    got_years = sorted(yearly.keys(), reverse=True)
+    cols = [str(y) for y in got_years]
+
+    def row(field):
+        return [yearly[y].get(field) for y in got_years]
 
     income_df = pd.DataFrame({
-        "Total Revenue":           irow("revenue"),
-        "Total Expenses":          irow("total_expenses"),
-        "Pretax Income":           irow("pretax_income"),
-        "Tax Provision":           irow("tax_provision"),
-        "Net Income":              irow("net_income"),
-        # Not available from NSE structured results — filled from PDF below
-        "Operating Income":        [None] * len(years),
-        "EBIT":                    [None] * len(years),
-        "Interest Expense":        [None] * len(years),
-        "Reconciled Depreciation": [None] * len(years),
-    }, index=col_labels).T
+        "Total Revenue":           row("revenue"),
+        "Total Expenses":          row("total_expenses"),
+        "Pretax Income":           row("pretax_income"),
+        "Tax Provision":           row("tax_provision"),
+        "Net Income":              row("net_income"),
+        "Interest Expense":        row("interest_expense"),
+        "Reconciled Depreciation": row("depreciation"),
+        "Operating Income":        [None] * len(got_years),
+        "EBIT":                    [None] * len(got_years),
+    }, index=cols).T
 
-    # ── Balance sheet + cash flow from latest results PDF ──────────────────────
-    bs = None
-    if include_balance_sheet:
-        try:
-            pdf_url = fetch_latest_results_pdf_url(symbol)
-            if pdf_url:
-                pdf_text = extract_pdf_text(pdf_url)
-                bs = groq_extract_balance_sheet(pdf_text)
-                if bs:
-                    print(f"  📄 {symbol}: PDF extracted (unit: {bs.get('unit_detected')})")
-        except Exception as e:
-            print(f"  ⚠ {symbol}: PDF extraction failed ({e}) — storing P&L only")
+    # If the latest year lacks BS facts, try the PDF+Groq fallback for it
+    latest = got_years[0]
+    if not yearly[latest].get("current_assets"):
+        print(f"  {symbol}: latest XBRL lacks BS — trying PDF fallback...")
+        bs = _pdf_groq_balance_sheet(symbol)
+        if bs:
+            for k in ("current_assets", "current_liabilities", "cash", "cpltd",
+                      "net_ppe", "long_term_investments", "minority_interest",
+                      "total_debt", "total_equity", "depreciation", "capex",
+                      "operating_cash_flow"):
+                if yearly[latest].get(k) is None and bs.get(k) is not None:
+                    yearly[latest][k] = bs[k]
+            print(f"  PDF fallback merged")
 
-    bs_year = str((bs or {}).get("fiscal_year") or years[0])
     balance_df = pd.DataFrame({
-        "Total Current Assets":              [(bs or {}).get("current_assets")],
-        "Total Current Liabilities":         [(bs or {}).get("current_liabilities")],
-        "Cash And Cash Equivalents":         [(bs or {}).get("cash_and_equivalents")],
-        "Current Portion Of Long Term Debt": [(bs or {}).get("current_portion_lt_debt")],
-        "Net PPE":                           [(bs or {}).get("net_ppe")],
-        "Long Term Investments":             [(bs or {}).get("long_term_investments")],
-        "Minority Interest":                 [(bs or {}).get("minority_interest")],
-        "Total Debt":                        [(bs or {}).get("total_debt")],
-        "Total Stockholders Equity":         [(bs or {}).get("total_equity")],
-    }, index=[bs_year]).T
+        "Total Current Assets":              row("current_assets"),
+        "Total Current Liabilities":         row("current_liabilities"),
+        "Cash And Cash Equivalents":         row("cash"),
+        "Current Portion Of Long Term Debt": row("cpltd"),
+        "Net PPE":                           row("net_ppe"),
+        "Long Term Investments":             row("long_term_investments"),
+        "Minority Interest":                 row("minority_interest"),
+        "Total Debt":                        row("total_debt"),
+        "Total Stockholders Equity":         row("total_equity"),
+    }, index=cols).T
 
     cashflow_df = pd.DataFrame({
-        "Depreciation Amortization": [(bs or {}).get("depreciation")],
-        "Capital Expenditure":       [(bs or {}).get("capex")],
-        "Operating Cash Flow":       [(bs or {}).get("operating_cash_flow")],
-    }, index=[bs_year]).T
+        "Depreciation Amortization": row("depreciation"),
+        "Capital Expenditure":       row("capex"),
+        "Operating Cash Flow":       row("operating_cash_flow"),
+    }, index=cols).T
 
-    # ── Company info ────────────────────────────────────────────────────────────
-    latest = income_rows[0]
-    equity = (bs or {}).get("total_equity")
+    # ── Company info ────────────────────────────────────────────────────────
+    L = yearly[latest]
     info = {
         "longName":          symbol,
-        "sector":            "Unknown",       # can enrich later
+        "sector":            "Unknown",
         "industry":          "Unknown",
-        "sharesOutstanding": None,            # derive: PAT / EPS if both present
+        "sharesOutstanding": None,
         "beta":              1.0,
-        "totalDebt":         (bs or {}).get("total_debt"),
-        "totalCash":         (bs or {}).get("cash_and_equivalents"),
+        "totalDebt":         L.get("total_debt"),
+        "totalCash":         L.get("cash"),
         "bookValue":         None,
-        "trailingEps":       latest.get("eps"),
+        "trailingEps":       L.get("eps"),
         "_cik":              None,
     }
-    if latest.get("net_income") and latest.get("eps"):
+    if L.get("net_income") and L.get("eps"):
         try:
-            shares = latest["net_income"] / latest["eps"]
-            if 1e5 < shares < 1e12:  # sanity band
+            shares = L["net_income"] / L["eps"]
+            if 1e5 < shares < 1e12:
                 info["sharesOutstanding"] = shares
-                if equity:
-                    info["bookValue"] = equity / shares
+                if L.get("total_equity"):
+                    info["bookValue"] = L["total_equity"] / shares
         except ZeroDivisionError:
             pass
 
-    upsert_company(info, store_ticker, "india", "nse_own_pipeline")
+    src = "nse_xbrl_pipeline" if all(
+        yearly[y].get("_facts_found", 0) > 0 for y in got_years
+    ) else "nse_xbrl+yfinance"
+    upsert_company(info, store_ticker, "india", src)
     upsert_statements(store_ticker, income_df, balance_df, cashflow_df)
-    print(f"  ✅ {symbol}: stored via own pipeline ({len(years)} yrs P&L"
-          f"{', BS ✓' if bs else ', BS ✗'})")
+    print(f"  ✅ {symbol}: stored ({len(got_years)} yrs via NSE XBRL)")
     return True
 
 
-# ── Quick standalone test ───────────────────────────────────────────────────────
+# ── Standalone test ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
     sym = sys.argv[1] if len(sys.argv) > 1 else "RELIANCE"
-    print(f"Testing NSE structured results for {sym}...")
-    rows = fetch_nse_income_statements(sym)
-    for r in rows[:6]:
-        print(f"  FY{r['fiscal_year']}: revenue={r['revenue']:.0f} "
-              f"PAT={r['net_income'] or 0:.0f} EPS={r['eps']}")
-    print(f"\nLooking for results PDF...")
-    url = fetch_latest_results_pdf_url(sym)
-    print(f"  PDF: {url}")
+    print(f"Fetching annual filings for {sym}...")
+    filings = fetch_annual_filings(sym)
+    print(f"  Years found: {sorted(filings.keys(), reverse=True)}")
+    for fy in sorted(filings.keys(), reverse=True)[:3]:
+        fi = filings[fy]
+        print(f"\nFY{fy} ({'Consolidated' if fi['consolidated'] else 'Standalone'}) — downloading XBRL...")
+        resp = _nse_get(fi["xbrl"])
+        d = extract_financials_from_xbrl(resp.content, _parse_date(fi["to_date"]))
+        print(f"  facts found:  {d['_facts_found']}")
+        print(f"  revenue:      {d['revenue']}")
+        print(f"  expenses:     {d['total_expenses']}")
+        print(f"  PBT:          {d['pretax_income']}")
+        print(f"  PAT:          {d['net_income']}")
+        print(f"  EPS:          {d['eps']}")
+        print(f"  curr assets:  {d['current_assets']}")
+        print(f"  curr liab:    {d['current_liabilities']}")
+        print(f"  net PPE:      {d['net_ppe']}")
+        print(f"  total debt:   {d['total_debt']}")
+        print(f"  capex:        {d['capex']}")
+        time.sleep(1.0)
