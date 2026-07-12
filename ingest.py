@@ -163,11 +163,21 @@ def refresh_all():
             companies = cur.fetchall()
 
     print(f"Refreshing {len(companies)} companies...")
+    ok = 0
     for ticker, market in companies:
         clean_ticker = ticker.replace(".NS", "")
-        ingest_one(clean_ticker, market)
+        try:
+            if market == "india":
+                from india_data_pipeline import ingest_india_own
+                if ingest_india_own(clean_ticker):
+                    ok += 1
+            else:
+                if ingest_one(clean_ticker, market):
+                    ok += 1
+        except Exception as e:
+            print(f"  ❌ {clean_ticker}: {e}")
         time.sleep(1.5 if market == "us" else 3.0)
-    print("✅ Refresh complete.")
+    print(f"✅ Refresh complete: {ok}/{len(companies)}.")
 
 
 if __name__ == "__main__":
