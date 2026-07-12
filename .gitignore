@@ -1,3 +1,4 @@
-__pycache__/ 
-*.pyc 
-Python 3.14/ 
+__pycache__/
+*.pyc
+Python 3.14/
+node_modules/
