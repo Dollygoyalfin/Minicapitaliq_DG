@@ -118,6 +118,51 @@ def fetch_annual_filings(symbol: str) -> dict:
     return by_fy
 
 
+# ── 1b) Sector classification from NSE quote API ───────────────────────────────
+
+# NSE macro-sector → our SECTOR_PE_MEDIANS keys
+_NSE_SECTOR_MAP = {
+    "financial services":          "Financial Services",
+    "information technology":      "Technology",
+    "fast moving consumer goods":  "Consumer Defensive",
+    "consumer discretionary":      "Consumer Cyclical",
+    "consumer services":           "Consumer Cyclical",
+    "healthcare":                  "Healthcare",
+    "energy":                      "Energy",
+    "oil gas & consumable fuels":  "Energy",
+    "commodities":                 "Basic Materials",
+    "metals & mining":             "Basic Materials",
+    "chemicals":                   "Basic Materials",
+    "industrials":                 "Industrials",
+    "capital goods":               "Industrials",
+    "construction":                "Industrials",
+    "services":                    "Industrials",
+    "diversified":                 "Industrials",
+    "telecommunication":           "Communication Services",
+    "utilities":                   "Utilities",
+    "power":                       "Utilities",
+    "realty":                      "Real Estate",
+}
+
+
+def fetch_nse_sector(symbol: str) -> tuple:
+    """Returns (mapped_sector, raw_industry) from NSE's quote API.
+    Falls back to ("Unknown", "Unknown") on any failure."""
+    try:
+        data = _nse_get_json(
+            f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
+        )
+        info = data.get("industryInfo", {}) or {}
+        raw_industry = (info.get("industry") or info.get("basicIndustry")
+                        or "Unknown")
+        for key in (info.get("macro"), info.get("sector"), info.get("industry")):
+            if key and key.strip().lower() in _NSE_SECTOR_MAP:
+                return _NSE_SECTOR_MAP[key.strip().lower()], raw_industry
+        return "Unknown", raw_industry
+    except Exception:
+        return "Unknown", "Unknown"
+
+
 # ── 2) XBRL parsing ─────────────────────────────────────────────────────────────
 
 def _local(tag: str) -> str:
@@ -485,7 +530,8 @@ def ingest_india_own(ticker: str) -> bool:
                         "pretax_income":      _yfv(inc, i, "pretax"),
                         "tax_provision":      _yfv(inc, i, "tax", "provision"),
                         "net_income":         _yfv(inc, i, "net income"),
-                        "eps":                None,
+                        "eps":                _yfv(inc, i, "basic eps")
+                                              or _yfv(inc, i, "diluted eps"),
                         "depreciation":       _yfv(inc, i, "reconciled", "depreciation")
                                               or _yfv(cf, i, "depreciation"),
                         "interest_expense":   _yfv(inc, i, "interest", "expense"),
@@ -561,27 +607,51 @@ def ingest_india_own(ticker: str) -> bool:
 
     # ── Company info ────────────────────────────────────────────────────────
     L = yearly[latest]
+
+    # EPS/shares derivation: the latest year is often a yfinance-merged one
+    # whose EPS may be missing — scan newest→oldest for the first year that
+    # has BOTH eps and net_income, and derive shares from that year.
+    eps_best = None
+    shares   = None
+    for y in got_years:
+        ye = yearly[y]
+        if ye.get("eps") and ye.get("net_income"):
+            try:
+                cand = ye["net_income"] / ye["eps"]
+                if 1e5 < abs(cand) < 1e12:
+                    eps_best = ye["eps"]
+                    shares   = cand
+                    break
+            except ZeroDivisionError:
+                continue
+    if eps_best is None:
+        # keep the newest EPS even if shares couldn't be derived
+        for y in got_years:
+            if yearly[y].get("eps"):
+                eps_best = yearly[y]["eps"]
+                break
+
+    sector, industry = fetch_nse_sector(symbol)
     info = {
         "longName":          symbol,
-        "sector":            "Unknown",
-        "industry":          "Unknown",
-        "sharesOutstanding": None,
+        "sector":            sector,
+        "industry":          industry,
+        "sharesOutstanding": shares,
         "beta":              1.0,
         "totalDebt":         L.get("total_debt"),
         "totalCash":         L.get("cash"),
         "bookValue":         None,
-        "trailingEps":       L.get("eps"),
+        "trailingEps":       eps_best,
         "_cik":              None,
     }
-    if L.get("net_income") and L.get("eps"):
-        try:
-            shares = L["net_income"] / L["eps"]
-            if 1e5 < shares < 1e12:
-                info["sharesOutstanding"] = shares
-                if L.get("total_equity"):
-                    info["bookValue"] = L["total_equity"] / shares
-        except ZeroDivisionError:
-            pass
+    if shares:
+        eq = None
+        for y in got_years:
+            if yearly[y].get("total_equity"):
+                eq = yearly[y]["total_equity"]
+                break
+        if eq:
+            info["bookValue"] = eq / shares
 
     src = "nse_xbrl_pipeline" if all(
         yearly[y].get("_facts_found", 0) > 0 for y in got_years
