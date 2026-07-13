@@ -1,1 +1,47 @@
-commit
+name: Full Universe Backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Which universe to backfill"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - us
+          - india
+          - both
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill US (S&P 500)
+        if: ${{ inputs.target == 'us' || inputs.target == 'both' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          FMP_API_KEY:  ${{ secrets.FMP_API_KEY }}
+        run: python ingest.py backfill_us_full
+
+      - name: Backfill India (Nifty 500)
+        if: ${{ inputs.target == 'india' || inputs.target == 'both' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          FMP_API_KEY:  ${{ secrets.FMP_API_KEY }}
+        run: python ingest.py backfill_india_full
