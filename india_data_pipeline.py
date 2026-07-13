@@ -142,12 +142,54 @@ _NSE_SECTOR_MAP = {
     "utilities":                   "Utilities",
     "power":                       "Utilities",
     "realty":                      "Real Estate",
+    # ── full NSE Nifty-500 CSV industry labels ──
+    "automobile and auto components":      "Consumer Cyclical",
+    "consumer durables":                   "Consumer Cyclical",
+    "construction materials":              "Basic Materials",
+    "forest materials":                    "Basic Materials",
+    "media entertainment & publication":   "Communication Services",
+    "textiles":                            "Consumer Cyclical",
 }
 
 
+_SECTOR_CSV_CACHE = None
+
+
+def _load_sector_map() -> dict:
+    """symbol -> Industry for all Nifty 500 names, from NSE's index CSV.
+    One request covers every company; cached for the process lifetime."""
+    global _SECTOR_CSV_CACHE
+    if _SECTOR_CSV_CACHE is not None:
+        return _SECTOR_CSV_CACHE
+    m = {}
+    try:
+        import csv as _csv, io as _io
+        resp = _nse_get(
+            "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+        )
+        for r in _csv.DictReader(_io.StringIO(resp.text)):
+            sym = (r.get("Symbol") or "").strip().upper()
+            ind = (r.get("Industry") or "").strip()
+            if sym and ind:
+                m[sym] = ind
+        print(f"  sector map loaded: {len(m)} symbols from Nifty 500 CSV")
+    except Exception as e:
+        print(f"  sector map load failed ({e})")
+    _SECTOR_CSV_CACHE = m
+    return m
+
+
 def fetch_nse_sector(symbol: str) -> tuple:
-    """Returns (mapped_sector, raw_industry) from NSE's quote API.
-    Falls back to ("Unknown", "Unknown") on any failure."""
+    """Returns (mapped_sector, raw_industry).
+    Primary: Nifty-500 CSV Industry column (one cached request for all).
+    Fallback: per-symbol quote API. ("Unknown","Unknown") if both fail."""
+    # ── CSV primary ─────────────────────────────────────────────────────────
+    ind = _load_sector_map().get(symbol.upper())
+    if ind:
+        mapped = _NSE_SECTOR_MAP.get(ind.strip().lower(), "Unknown")
+        return mapped, ind
+
+    # ── Quote-API fallback ──────────────────────────────────────────────────
     try:
         data = _nse_get_json(
             f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
