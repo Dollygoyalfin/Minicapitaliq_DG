@@ -47,32 +47,34 @@ INDIA_UNIVERSE = [
 
 def fetch_us_universe() -> list:
     """
-    S&P 500 constituents. Primary: Wikipedia table (stable, no key).
-    Falls back to the hardcoded starter list on any failure.
+    S&P 500 constituents from the maintained datasets CSV on GitHub
+    (tested live: 503 symbols, includes GICS Sector). Dots in class-share
+    tickers (BRK.B) are converted to dashes for SEC's ticker map.
+    Falls back to the hardcoded starter list on failure.
     """
+    global US_SECTOR_MAP
     try:
-        import httpx, re
+        import httpx, csv, io
         resp = httpx.get(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=30.0,
-            follow_redirects=True,
+            "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
+            timeout=30.0, follow_redirects=True,
         )
-        # Tickers sit in the first table as <a ...>SYMBOL</a> within rows;
-        # simplest robust extraction: symbols linked to NYSE/Nasdaq quote pages
-        syms = re.findall(r'data-sort-value="([A-Z.\-]{1,6})"', resp.text)
-        if not syms:
-            syms = re.findall(
-                r'https?://www\.nyse\.com/quote/\w+:([A-Z.\-]{1,6})"', resp.text
-            ) + re.findall(
-                r'nasdaq\.com/market-activity/stocks/([a-zA-Z.\-]{1,6})"', resp.text
-            )
-        syms = sorted({s.upper().replace(".", "-") for s in syms if s})
+        rows = list(csv.DictReader(io.StringIO(resp.text)))
+        syms, US_SECTOR_MAP = [], {}
+        for r in rows:
+            s = (r.get("Symbol") or "").strip().upper().replace(".", "-")
+            if s:
+                syms.append(s)
+                US_SECTOR_MAP[s] = (r.get("GICS Sector") or "").strip()
         if len(syms) >= 400:
-            print(f"  Universe: {len(syms)} S&P 500 tickers from Wikipedia")
+            print(f"  Universe: {len(syms)} S&P 500 tickers (constituents CSV)")
             return syms
     except Exception as e:
         print(f"  Universe fetch failed ({e}) — using starter list")
     return US_UNIVERSE
+
+
+US_SECTOR_MAP: dict = {}   # ticker -> GICS Sector, filled by fetch_us_universe
 
 
 def fetch_india_universe() -> list:
@@ -112,6 +114,25 @@ def ingest_one(ticker: str, market: str):
         if market == "india" and not raw_ticker.endswith(".NS"):
             raw_ticker += ".NS"
 
+        # Enrich US sector from constituents CSV when SEC SIC mapping failed
+        if market == "us" and info.get("sector") in (None, "Unknown"):
+            gics = US_SECTOR_MAP.get(raw_ticker)
+            if gics:
+                _g2s = {
+                    "information technology": "Technology",
+                    "health care": "Healthcare",
+                    "financials": "Financial Services",
+                    "consumer discretionary": "Consumer Cyclical",
+                    "consumer staples": "Consumer Defensive",
+                    "communication services": "Communication Services",
+                    "industrials": "Industrials",
+                    "energy": "Energy",
+                    "materials": "Basic Materials",
+                    "utilities": "Utilities",
+                    "real estate": "Real Estate",
+                }
+                info["sector"] = _g2s.get(gics.lower(), gics)
+                info["industry"] = info.get("industry") or gics
         upsert_company(info, raw_ticker, market, data_source)
         upsert_statements(raw_ticker, income_df, balance_df, cashflow_df)
         print(f"  ✅ {ticker}: stored ({data_source})")
