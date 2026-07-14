@@ -27,7 +27,7 @@ import pandas as pd
 # SEC REQUIRES a descriptive User-Agent with contact info, or it blocks you.
 # Replace with your real email before production.
 SEC_HEADERS = {
-    "User-Agent": "yllodwrites04@gmail.com",
+    "User-Agent": "MiniTradeIQ youremail@example.com",
     "Accept-Encoding": "gzip, deflate",
 }
 
@@ -453,7 +453,7 @@ def _get_shares_outstanding(facts: dict):
                     if item.get("val"):
                         return float(item["val"])
 
-    # Fallback to us-gaap
+    # Fallback 1: us-gaap instant share counts
     us_gaap = facts.get("facts", {}).get("us-gaap", {})
     for tag in ["CommonStockSharesOutstanding", "CommonStockSharesIssued"]:
         if tag in us_gaap:
@@ -464,6 +464,18 @@ def _get_shares_outstanding(facts: dict):
                 for item in latest:
                     if item.get("val"):
                         return float(item["val"])
+
+    # Fallback 2: weighted-average shares (every filer reports this; handles
+    # dual-class companies like META where dei share counts don't resolve)
+    for tag in ["WeightedAverageNumberOfSharesOutstandingBasic",
+                "WeightedAverageNumberOfDilutedSharesOutstanding"]:
+        if tag in us_gaap:
+            units = us_gaap[tag].get("units", {})
+            shares_data = units.get("shares", [])
+            annual = [x for x in shares_data if x.get("form") == "10-K" and x.get("val")]
+            if annual:
+                latest = sorted(annual, key=lambda x: x.get("end", ""), reverse=True)
+                return float(latest[0]["val"])
     return None
 
 
