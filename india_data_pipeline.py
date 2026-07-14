@@ -80,13 +80,19 @@ def _nse_get_json(url: str, retries: int = 3):
 
 # ── 1) List annual filings, pick best per fiscal year ──────────────────────────
 
+def _q(symbol: str) -> str:
+    """URL-encode a symbol — NSE names like M&M break query strings raw."""
+    from urllib.parse import quote
+    return quote(symbol, safe="")
+
+
 def fetch_annual_filings(symbol: str) -> dict:
     """
     Returns {fiscal_year: {"xbrl": url, "consolidated": bool, "to_date": "31-Mar-2024"}}
     Prefers Consolidated over Standalone for each year.
     """
     url = (f"https://www.nseindia.com/api/corporates-financial-results"
-           f"?index=equities&symbol={symbol}&period=Annual")
+           f"?index=equities&symbol={_q(symbol)}&period=Annual")
     data = _nse_get_json(url)
     rows = data if isinstance(data, list) else data.get("data", [])
 
@@ -192,7 +198,7 @@ def fetch_nse_sector(symbol: str) -> tuple:
     # ── Quote-API fallback ──────────────────────────────────────────────────
     try:
         data = _nse_get_json(
-            f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
+            f"https://www.nseindia.com/api/quote-equity?symbol={_q(symbol)}"
         )
         info = data.get("industryInfo", {}) or {}
         raw_industry = (info.get("industry") or info.get("basicIndustry")
@@ -399,7 +405,7 @@ def extract_financials_from_xbrl(xml_bytes: bytes, period_end: date) -> dict:
 
 def fetch_latest_results_pdf_url(symbol: str) -> str | None:
     url = (f"https://www.nseindia.com/api/corporate-announcements"
-           f"?index=equities&symbol={symbol}")
+           f"?index=equities&symbol={_q(symbol)}")
     try:
         data = _nse_get_json(url)
     except Exception:
