@@ -130,6 +130,8 @@ def company_title(ticker: str) -> str:
 
 # ── Fetch company facts (all XBRL data in one call) ────────────────────────────
 
+_FACTS_CACHE_MAX = 3   # companyfacts JSONs are multi-MB — keep RAM bounded
+
 def _fetch_company_facts(cik: str) -> dict:
     cache_key = f"sec_facts:{cik}"
     cached = _CIK_CACHE.get(cache_key)
@@ -144,6 +146,11 @@ def _fetch_company_facts(cik: str) -> dict:
         raise RuntimeError(f"SEC companyfacts failed for CIK {cik}: {resp.status_code}")
 
     data = resp.json()
+    # Evict oldest entries beyond the cap (prevents unbounded RAM growth
+    # on small servers — each cached facts dict can be tens of MB)
+    while len(_CIK_CACHE) >= _FACTS_CACHE_MAX:
+        oldest = min(_CIK_CACHE, key=lambda k: _CIK_CACHE[k]["time"])
+        del _CIK_CACHE[oldest]
     _CIK_CACHE[cache_key] = {"data": data, "time": time.time()}
     return data
 
