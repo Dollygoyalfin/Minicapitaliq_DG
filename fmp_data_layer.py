@@ -41,8 +41,18 @@ def _cache_get(key: str):
     return None
 
 
+_CACHE_MAX_ENTRIES = 200
+
 def _cache_set(key: str, data):
-    _CACHE[key] = {"data": data, "time": time.time()}
+    now = time.time()
+    # Purge expired entries; if still over cap, evict oldest
+    expired = [k for k, v in _CACHE.items() if (now - v["time"]) >= _CACHE_TTL_SECONDS]
+    for k in expired:
+        del _CACHE[k]
+    while len(_CACHE) >= _CACHE_MAX_ENTRIES:
+        oldest = min(_CACHE, key=lambda k: _CACHE[k]["time"])
+        del _CACHE[oldest]
+    _CACHE[key] = {"data": data, "time": now}
 
 
 def _with_retry(func, max_retries: int = 3, base_delay: float = 1.5):
@@ -303,6 +313,30 @@ def _fetch_from_fmp(ticker: str):
 
 
 # ── Public entry point ──────────────────────────────────────────────────────────
+
+def get_stooq_price(ticker: str, market: str = "us"):
+    """
+    Free price fallback via Stooq CSV (no auth, no key). US tickers only —
+    format 'aapl.us'. Returns float close price or None.
+    """
+    if market.lower() == "india":
+        return None  # Stooq NSE coverage is unreliable — India stays on yfinance
+    sym = ticker.lower().replace(".ns", "") + ".us"
+    url = f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(url)
+        if resp.status_code != 200:
+            return None
+        lines = resp.text.strip().split("\n")
+        if len(lines) < 2:
+            return None
+        parts = lines[1].split(",")
+        close = float(parts[6])
+        return close if close > 0 else None
+    except Exception:
+        return None
+
 
 def get_company_data(ticker: str, market: str = "us", source: str = "auto"):
     """
