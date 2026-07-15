@@ -492,8 +492,8 @@ def ingest_india_own(ticker: str) -> bool:
 
     filings = fetch_annual_filings(symbol)
     if not filings:
-        print(f"  ⚠ {symbol}: no annual filings found on NSE")
-        return False
+        print(f"  ⚠ {symbol}: no NSE annual filings (new listing?) — trying yfinance only")
+        filings = {}
 
     years = sorted(filings.keys(), reverse=True)[:6]
     yearly: dict = {}
@@ -527,11 +527,8 @@ def ingest_india_own(ticker: str) -> bool:
             print(f"  ⚠ FY{fy}: XBRL failed ({e})")
         time.sleep(1.0)
 
-    if not yearly:
-        print(f"  ❌ {symbol}: no usable years")
-        return False
-
-    # ── Fill older years from yfinance (XBRL years keep priority) ───────────
+    # ── Fill years from yfinance (XBRL years keep priority; for new
+    #    listings with zero XBRL this becomes the sole source) ───────────────
     if len(yearly) < 5:
         try:
             import yfinance as yf
@@ -602,6 +599,10 @@ def ingest_india_own(ticker: str) -> bool:
                 print(f"  yfinance merge: added FY{sorted(added, reverse=True)}")
         except Exception as e:
             print(f"  yfinance merge skipped ({e})")
+
+    if not yearly:
+        print(f"  ❌ {symbol}: no usable years from XBRL or yfinance")
+        return False
 
     got_years = sorted(yearly.keys(), reverse=True)
     cols = [str(y) for y in got_years]
@@ -701,9 +702,13 @@ def ingest_india_own(ticker: str) -> bool:
         if eq:
             info["bookValue"] = eq / shares
 
-    src = "nse_xbrl_pipeline" if all(
-        yearly[y].get("_facts_found", 0) > 0 for y in got_years
-    ) else "nse_xbrl+yfinance"
+    xbrl_years = sum(1 for y in got_years if yearly[y].get("_facts_found", 0) > 0)
+    if xbrl_years == len(got_years):
+        src = "nse_xbrl_pipeline"
+    elif xbrl_years > 0:
+        src = "nse_xbrl+yfinance"
+    else:
+        src = "yfinance (no NSE XBRL yet)"
     upsert_company(info, store_ticker, "india", src)
     upsert_statements(store_ticker, income_df, balance_df, cashflow_df)
     print(f"  ✅ {symbol}: stored ({len(got_years)} yrs via NSE XBRL)")
