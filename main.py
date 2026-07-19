@@ -183,190 +183,186 @@ def serve_frontend():
 #  /valuation  — yfinance for India default, FMP for US / Advanced
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── STORE-FIRST /valuation and /financials (drop-in) ──────────────────────────
+# Replace main.py lines for BOTH old blocks (get_valuation + get_financials)
+# with this file's contents. Response shapes preserved for the frontend.
+# Requires (already imported in main.py): get_company_data, math, Query
+
 @app.get("/valuation")
 def get_valuation(
     ticker: str = Query(...),
     market: str = Query("us"),
-    advanced: bool = Query(False, description="Use FMP for Indian stocks too"),
+    advanced: bool = Query(False),          # kept for URL compatibility
+    source: str = Query("auto"),
     risk_free_rate: float = Query(0.04),
     market_return: float = Query(0.10),
     growth_rate: float = Query(0.08),
 ):
     try:
-        resolved, use_fmp = resolve_ticker(ticker, market, advanced)
+        info, income_df, balance_df, cashflow_df, data_source = get_company_data(
+            ticker=ticker, market=market, source=source
+        )
 
-        if use_fmp:
-            info = get_fmp_profile(resolved)
-            if not info:
-                return {"error": f"FMP returned no data for {resolved}"}
-        else:
-            stock = yf.Ticker(resolved)
-            info = stock.info
+        def _row(df, *keys):
+            if df is None or df.empty:
+                return None
+            for idx in df.index:
+                if all(k.lower() in idx.lower() for k in keys):
+                    try:
+                        v = df.loc[idx].iloc[0]
+                        return None if v is None or str(v) == "nan" else float(v)
+                    except Exception:
+                        return None
+            return None
 
         current_price = info.get("currentPrice")
         eps           = info.get("trailingEps") or 0.0
-        pe_ratio      = info.get("trailingPE")
-        forward_pe    = info.get("forwardPE")
         beta          = info.get("beta") or 1.0
-        pb_ratio      = info.get("priceToBook")
-        market_cap    = info.get("marketCap")
-        roe           = info.get("returnOnEquity")
-        de_ratio      = info.get("debtToEquity")
         book_value    = info.get("bookValue")
+        shares        = info.get("sharesOutstanding")
+        market_cap    = info.get("marketCap") or (
+            current_price * shares if current_price and shares else None)
+        pe_ratio      = info.get("trailingPE") or (
+            current_price / eps if current_price and eps > 0 else None)
+        pb_ratio      = info.get("priceToBook") or (
+            current_price / book_value if current_price and book_value else None)
 
+        # ROE and D/E from the store's own statements
+        net_income = info.get("netIncome") or _row(income_df, "net income")
+        equity     = _row(balance_df, "stockholders equity") or _row(balance_df, "total equity")
+        total_debt = info.get("totalDebt") or _row(balance_df, "total debt") or 0.0
+        roe        = info.get("returnOnEquity") or (
+            net_income / equity if net_income and equity else None)
+        de_ratio   = (total_debt / equity * 100) if equity else None
+
+        # WACC — real debt when available, 80/20 otherwise
         cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
         cost_of_debt   = 0.06
-        equity_value   = market_cap if (market_cap and market_cap > 0) else 1
-        debt_value     = equity_value * 0.2  # assumed 20% debt ratio when no real debt data
-        wacc = (
-            (equity_value / (equity_value + debt_value)) * cost_of_equity +
-            (debt_value   / (equity_value + debt_value)) * cost_of_debt
-        )
+        if market_cap:
+            equity_value = market_cap
+            debt_value   = total_debt if total_debt else market_cap * 0.2
+        else:
+            debt_value   = total_debt if total_debt else 1.0
+            equity_value = debt_value * 4.0
+        wacc = ((equity_value / (equity_value + debt_value)) * cost_of_equity +
+                (debt_value / (equity_value + debt_value)) * cost_of_debt)
 
+        # Gordon Growth with a denominator floor — growth is capped so the
+        # spread (wacc - g) never drops below 4%, preventing absurd values
+        # (e.g. the old ₹4,472 base case from a 1.3% denominator)
+        g_eff = min(growth_rate, wacc - 0.04)
         intrinsic_value = None
-        if eps and wacc > growth_rate:
-            intrinsic_value = (eps * (1 + growth_rate)) / (wacc - growth_rate)
+        if eps and eps > 0 and wacc > g_eff:
+            intrinsic_value = (eps * (1 + g_eff)) / (wacc - g_eff)
 
         valuation_low = valuation_high = None
-        if eps:
-            low_growth, high_growth = growth_rate - 0.02, growth_rate + 0.02
-            low_disc  = wacc + 0.02
-            high_disc = max(wacc - 0.02, 0.01)  # never let discount rate go below 1%
-            if low_disc  > low_growth:
-                valuation_low  = (eps * (1 + low_growth))  / (low_disc  - low_growth)
-            if high_disc > high_growth:
-                valuation_high = (eps * (1 + high_growth)) / (high_disc - high_growth)
+        if eps and eps > 0:
+            g_low,  d_low  = g_eff - 0.02, wacc + 0.02
+            g_high, d_high = g_eff + 0.01, max(wacc - 0.01, g_eff + 0.04)
+            if d_low > g_low:
+                valuation_low = (eps * (1 + g_low)) / (d_low - g_low)
+            if d_high > g_high:
+                valuation_high = (eps * (1 + g_high)) / (d_high - g_high)
 
         return {
-            "ticker":          resolved,
+            "ticker":          ticker.upper(),
             "market":          market,
-            "data_source":     "FMP" if use_fmp else "yfinance",
+            "data_source":     data_source,
             "current_price":   current_price,
-            "eps":             eps,
-            "pe_ratio":        pe_ratio,
-            "forward_pe":      forward_pe,
+            "eps":             round(eps, 2) if eps else 0.0,
+            "pe_ratio":        round(pe_ratio, 2) if pe_ratio else None,
+            "forward_pe":      info.get("forwardPE"),
             "beta":            beta,
-            "pb_ratio":        pb_ratio,
-            "book_value":      book_value,
+            "pb_ratio":        round(pb_ratio, 2) if pb_ratio else None,
+            "book_value":      round(book_value, 2) if book_value else None,
             "market_cap":      market_cap,
-            "roe":             roe,
-            "de_ratio":        de_ratio,
-            "intrinsic_value": intrinsic_value,
-            "valuation_low":   valuation_low,
-            "valuation_high":  valuation_high,
-            "growth_rate_used":   growth_rate,
-            "discount_rate_used": wacc,
-            "wacc":               wacc,
+            "roe":             round(roe, 4) if roe else None,
+            "de_ratio":        round(de_ratio, 2) if de_ratio else None,
+            "intrinsic_value": round(intrinsic_value, 2) if intrinsic_value else None,
+            "valuation_low":   round(valuation_low, 2) if valuation_low else None,
+            "valuation_high":  round(valuation_high, 2) if valuation_high else None,
+            "growth_rate_used":   round(g_eff, 4),
+            "discount_rate_used": round(wacc, 4),
+            "wacc":               round(wacc, 4),
             "promoters_holding":  None,
             "fii_holding":        None,
             "dii_holding":        None,
             "retail_holding":     None,
         }
-
     except Exception as e:
         return {"error": str(e)}
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /financials  — yfinance for India default, FMP for US / Advanced
-# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/financials")
 def get_financials(
     ticker: str = Query(...),
     market: str = Query("us"),
-    advanced: bool = Query(False),
+    advanced: bool = Query(False),          # kept for URL compatibility
+    source: str = Query("auto"),
 ):
     try:
-        resolved, use_fmp = resolve_ticker(ticker, market, advanced)
+        info, income_df, balance_df, cashflow_df, data_source = get_company_data(
+            ticker=ticker, market=market, source=source
+        )
+        shares = info.get("sharesOutstanding")
 
-        if use_fmp:
-            inc_list = get_fmp_income(resolved, 5)
-            cf_list  = get_fmp_cashflow(resolved, 5)
-            bal_list = get_fmp_balance(resolved, 5)
-            if not inc_list:
-                return {"error": f"FMP returned no income statement data for {resolved}. Check ticker or FMP plan."}
-
-            def list_to_dict(records: list, key_field: str = "calendarYear") -> dict:
-                out = {}
-                for r in records:
-                    yr = r.get(key_field) or r.get("date", "N/A")
-                    out[str(yr)] = r   # always string key
-                return out
-
-            income        = list_to_dict(inc_list)
-            cashflow      = list_to_dict(cf_list)
-            balance_sheet = list_to_dict(bal_list)
-
-            roe_dupont = {}
-            for yr, r in income.items():
-                net_income = r.get("netIncome") or 1
-                revenue    = r.get("revenue") or 1
-                # Balance sheet key may use date string instead of calendarYear — try both
-                date_val = r.get("date") or ""
-                bal = balance_sheet.get(yr) or balance_sheet.get(str(date_val)[:4]) or {}
-                assets = bal.get("totalAssets") or 1
-                equity = bal.get("totalStockholdersEquity") or bal.get("totalEquity") or 1
+        def df_to_serializable(df, n=6):
+            if df is None or df.empty:
+                return {}
+            out = {}
+            for col in df.columns[:n]:
                 try:
-                    roe_dupont[yr] = (net_income / revenue) * (revenue / assets) * (assets / equity)
-                except ZeroDivisionError:
-                    roe_dupont[yr] = 0.0
-
-        else:
-            stock       = yf.Ticker(resolved)
-            income_df   = stock.financials
-            cashflow_df = stock.cashflow
-            balance_df  = stock.balance_sheet
-
-
-            def df_to_serializable(df, n=5):
-                """Convert yfinance DataFrame to JSON-safe dict with string year keys."""
-                if df is None or df.empty:
-                    return {}
-                out = {}
-                for col in df.columns[:n]:
+                    yr = str(col.year)
+                except Exception:
+                    yr = str(col)
+                row = {}
+                for idx in df.index:
                     try:
-                        yr = str(col.year)
+                        v = float(df.loc[idx, col])
+                        row[idx] = None if (math.isnan(v) or math.isinf(v)) else v
                     except Exception:
-                        yr = str(col)
-                    row = {}
-                    for idx in df.index:
-                        val = df.loc[idx, col]
-                        try:
-                            v = float(val)
-                            row[idx] = None if math.isnan(v) or math.isinf(v) else v
-                        except Exception:
-                            row[idx] = None
-                    out[yr] = row
-                return out
+                        row[idx] = None
+                out[yr] = row
+            return out
 
-            income        = df_to_serializable(income_df)
-            cashflow      = df_to_serializable(cashflow_df)
-            balance_sheet = df_to_serializable(balance_df)
+        income        = df_to_serializable(income_df)
+        cashflow      = df_to_serializable(cashflow_df)
+        balance_sheet = df_to_serializable(balance_df)
 
-            roe_dupont = {}
-            for year, row in income.items():
-                ni  = row.get("Net Income") or 1
-                rev = row.get("Total Revenue") or 1
-                bal_yr = balance_sheet.get(year, {})
-                assets = bal_yr.get("Total Assets") or 1
-                equity = (bal_yr.get("Stockholders Equity")
-                          or bal_yr.get("Total Stockholder Equity")
-                          or bal_yr.get("Common Stock Equity") or 1)
-                try:
+        # Per-year Basic EPS derived from NI / shares (store has no EPS rows)
+        if shares:
+            for yr, row in income.items():
+                ni = row.get("Net Income")
+                if ni and "Basic EPS" not in row:
+                    row["Basic EPS"] = round(ni / shares, 2)
+
+        # ROE per year: DuPont when total assets exist, plain NI/equity otherwise
+        roe_dupont = {}
+        for year, row in income.items():
+            ni  = row.get("Net Income") or 0
+            bal = balance_sheet.get(year, {})
+            equity = (bal.get("Total Stockholders Equity")
+                      or bal.get("Stockholders Equity") or 0)
+            assets = bal.get("Total Assets")
+            try:
+                if assets and equity and row.get("Total Revenue"):
+                    rev = row["Total Revenue"]
                     roe_val = (ni / rev) * (rev / assets) * (assets / equity)
-                    roe_dupont[year] = 0.0 if (math.isnan(roe_val) or math.isinf(roe_val)) else roe_val
-                except (ZeroDivisionError, TypeError):
-                    roe_dupont[year] = 0.0
+                elif equity:
+                    roe_val = ni / equity
+                else:
+                    roe_val = 0.0
+                roe_dupont[year] = 0.0 if (math.isnan(roe_val) or math.isinf(roe_val)) else roe_val
+            except (ZeroDivisionError, TypeError):
+                roe_dupont[year] = 0.0
 
         return {
-            "data_source":      "FMP" if use_fmp else "yfinance",
+            "data_source":      data_source,
             "income_statement": income,
             "cash_flow":        cashflow,
             "balance_sheet":    balance_sheet,
             "dupont_roe":       roe_dupont,
         }
-
     except Exception as e:
         return {"error": str(e)}
 
