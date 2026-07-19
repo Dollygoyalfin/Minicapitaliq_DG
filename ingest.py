@@ -180,8 +180,18 @@ def refresh_all():
     from data_store import _conn
     with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT ticker, market FROM companies")
+            # Financials change quarterly — refresh each company ~weekly.
+            # Oldest-updated first, hard nightly cap keeps runs ~1-1.5h.
+            cur.execute("""
+                SELECT ticker, market FROM companies
+                WHERE updated_at < NOW() - INTERVAL '6 days'
+                ORDER BY updated_at ASC
+                LIMIT 200
+            """)
             companies = cur.fetchall()
+    if not companies:
+        print("Nothing stale — all companies refreshed within 6 days.")
+        return
 
     print(f"Refreshing {len(companies)} companies...")
     ok = 0
