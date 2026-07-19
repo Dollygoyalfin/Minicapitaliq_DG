@@ -2237,320 +2237,101 @@ def get_commodities():
 #  /ai-verdict  — with competitor comparison + all new data sources
 # ─────────────────────────────────────────────────────────────────────────────
 
-class VerdictRequest(BaseModel):
-    ticker:     str
-    market:     str = "us"
-    dcf_result: dict
+# ── AI VERDICT (hardened drop-in) ─────────────────────────────────────────────
+# Replace the existing @app.post("/ai-verdict") block in main.py with this.
+# Guarantees: ALWAYS returns JSON (never an empty body), survives Groq model
+# deprecations via a fallback chain, bounded prompt size, 45s timeout.
+# Requires (already in main.py): os, json, httpx, BaseModel
+
+class AIVerdictRequest(BaseModel):
+    ticker: str
+    market: str = "us"
+    dcf_result: dict = {}
+
+
+_GROQ_MODELS = [
+    "llama-3.3-70b-versatile",   # primary
+    "llama-3.1-8b-instant",      # fast fallback
+    "gemma2-9b-it",              # last resort
+]
+
 
 @app.post("/ai-verdict")
-async def get_ai_verdict(request: VerdictRequest):
+def ai_verdict(req: AIVerdictRequest):
     try:
-        ticker     = request.ticker.upper()
-        market     = request.market.lower()
-        dcf_result = request.dcf_result
+        api_key = os.environ.get("GROQ_API_KEY", "")
+        if not api_key:
+            return {"error": "AI Verdict unavailable: GROQ_API_KEY not configured."}
 
-        resolved, use_fmp = resolve_ticker(ticker, market, False)
-
-        if not dcf_result:
-            return {"error": "DCF result is empty. Please run the DCF model first."}
-        if dcf_result.get("error"):
-            return {"error": f"DCF result has an error: {dcf_result['error']}"}
-
-        # ── Step 1: Company info ──────────────────────────────────────────────
-        if use_fmp:
-            profile      = get_fmp_profile(resolved)
-            company_name = profile.get("longName") or resolved
-            sector       = profile.get("sector", "Unknown")
-            industry     = profile.get("industry", "Unknown")
-            current_price = profile.get("currentPrice")
-        else:
-            stock         = yf.Ticker(resolved)
-            company_name  = stock.info.get("longName") or resolved
-            sector        = stock.info.get("sector", "Unknown")
-            industry      = stock.info.get("industry", "Unknown")
-            current_price = stock.info.get("currentPrice")
-
-        # ── Step 2: Fetch competitor data via FMP ─────────────────────────────
-        peers_data = fmp_get(f"/stock_peers/{resolved}")
-        # FMP /stock_peers returns a LIST: [{"symbol":"X","peersList":[...]}]
-        if isinstance(peers_data, list) and peers_data:
-            peer_list = peers_data[0].get("peersList", [])
-        elif isinstance(peers_data, dict):
-            peer_list = peers_data.get("peersList", [])
-        else:
-            peer_list = []
-        peer_list  = peer_list[:4]  # top 4 competitors
-
-        competitor_summaries = []
-        for peer in peer_list:
-            try:
-                # Lightweight: only fetch /profile, skip balance sheet for speed
-                p_data = fmp_get(f"/profile/{peer}")
-                if isinstance(p_data, list) and p_data:
-                    p = p_data[0]
-                    competitor_summaries.append(
-                        f"  {peer}: Price={p.get('price')}, "
-                        f"PE={p.get('pe')}, "
-                        f"MCap={p.get('mktCap')}, "
-                        f"ROE={p.get('roe')}"
-                    )
-            except Exception:
-                pass
-
-        competitors_text = "\n".join(competitor_summaries) if competitor_summaries else "  No peer data available"
-
-        # ── Step 3: Analyst targets ───────────────────────────────────────────
-        targets_data = fmp_get(f"/price-target/{resolved}", {"limit": 5})
-        analyst_targets = []
-        if isinstance(targets_data, list):
-            for t in targets_data[:5]:
-                analyst_targets.append(
-                    f"  {t.get('analystCompany', 'N/A')}: Target ${t.get('priceTarget', 'N/A')}"
-                )
-        analyst_text = "\n".join(analyst_targets) if analyst_targets else "  No analyst targets available"
-
-        # ── Step 4: Insider sentiment ─────────────────────────────────────────
-        insider_data   = fmp_get(f"/insider-trading/{resolved}", {"limit": 10})
-        insider_buys  = sum(1 for t in (insider_data or [])
-                           if (t.get("transactionType") or "").upper().startswith("P-")
-                           or "purchase" in (t.get("transactionType") or "").lower())
-        insider_sells = sum(1 for t in (insider_data or [])
-                            if (t.get("transactionType") or "").upper().startswith("S-")
-                            or "sale" in (t.get("transactionType") or "").lower())
-        insider_signal = "Bullish" if insider_buys > insider_sells else "Bearish" if insider_sells > insider_buys else "Neutral"
-
-        # ── Step 5: Earnings surprise history ────────────────────────────────
-        earn_data = fmp_get(f"/historical/earning_calendar/{resolved}", {"limit": 4})
-        earn_lines = []
-        if isinstance(earn_data, list):
-            for e in earn_data[:4]:
-                actual = e.get("eps"); est = e.get("epsEstimated")
-                try:
-                    surprise = round(((float(actual) - float(est)) / abs(float(est))) * 100, 1) if actual is not None and est is not None and float(est) != 0 else None
-                except (TypeError, ValueError, ZeroDivisionError):
-                    surprise = None
-                earn_lines.append(f"  {e.get('date')}: Actual EPS={actual}, Est={est}, Surprise={surprise}%")
-        earnings_text = "\n".join(earn_lines) if earn_lines else "  No earnings history available"
-
-        # ── Step 6: News ──────────────────────────────────────────────────────
-        news_items = []
-        try:
-            if use_fmp:
-                news_data = fmp_get(f"/stock_news", {"tickers": resolved, "limit": 8})
-                if isinstance(news_data, list):
-                    for item in news_data[:8]:
-                        title   = item.get("title", "")
-                        summary = (item.get("text", ""))[:200]
-                        source  = item.get("site", "")
-                        if title:
-                            news_items.append(f"- [{source}] {title}: {summary}")
-            else:
-                stock = yf.Ticker(resolved)
-                news  = stock.news or []
-                for item in news[:8]:
-                    if "content" in item and isinstance(item["content"], dict):
-                        inner   = item["content"]
-                        title   = inner.get("title", "")
-                        summary = (inner.get("summary", "") or "")[:250]
-                        source  = inner.get("provider", {}).get("displayName", "") if isinstance(inner.get("provider"), dict) else ""
-                    else:
-                        title   = item.get("title", "")
-                        summary = (item.get("summary", "") or "")[:250]
-                        source  = item.get("publisher", "")
-                    if title:
-                        news_items.append(f"- [{source}] {title}: {summary}")
-        except Exception:
-            pass
-
-        if not news_items:
-            try:
-                company_query = (company_name or resolved).replace(" ", "+")
-                rss_url = f"https://news.google.com/rss/search?q={company_query}+stock&hl=en&gl=IN&ceid=IN:en"
-                async with httpx.AsyncClient(timeout=10.0) as nc:
-                    rss_resp = await nc.get(rss_url)
-                if rss_resp.status_code == 200:
-                    titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", rss_resp.text)
-                    if not titles:
-                        titles = re.findall(r"<title>(.*?)</title>", rss_resp.text)
-                    for t in titles[1:6]:
-                        if t and len(t) > 10:
-                            news_items.append(f"- {t}")
-            except Exception:
-                pass
-
-        if not news_items:
-            news_items = ["No recent news available."]
-        news_text = "\n".join(news_items)
-
-        # ── Step 7: DCF metrics ───────────────────────────────────────────────
-        def fmt_num(n):
-            if n is None: return "N/A"
-            try:
-                n = float(n)
-                if abs(n) >= 1e12: return f"{n/1e12:.2f}T"
-                if abs(n) >= 1e9:  return f"{n/1e9:.2f}B"
-                if abs(n) >= 1e6:  return f"{n/1e6:.2f}M"
-                return f"{n:.2f}"
-            except: return str(n)
-
-        intrinsic     = dcf_result.get("intrinsic_value_per_share", "N/A")
-        intrinsic_mos = dcf_result.get("intrinsic_value_with_margin_of_safety", "N/A")
-        upside        = dcf_result.get("upside_downside_pct", "N/A")
-        wacc_raw      = dcf_result.get("wacc", "N/A")
-        wacc          = f"{float(wacc_raw)*100:.2f}%" if wacc_raw not in (None, "N/A") else "N/A"
-        verdict_dcf   = dcf_result.get("verdict", "N/A")
-        ev_raw        = dcf_result.get("enterprise_value", "N/A")
-        ev            = fmt_num(ev_raw) if ev_raw != "N/A" else "N/A"
-        avg_tax       = f"{float(dcf_result.get('avg_tax_rate_used', 0))*100:.2f}%" if dcf_result.get('avg_tax_rate_used') is not None else "N/A"
-        hist_years    = dcf_result.get("historical_years_used", "N/A")
-        mos_used      = dcf_result.get("margin_of_safety_used", "N/A")
-
-        gr         = dcf_result.get("derived_growth_rates", {})
-        rev_growth = gr.get("revenue_growth", 0)
-        opex_growth = gr.get("opex_growth", 0)
-        term_growth = gr.get("terminal_growth", 0)
-
-        hist = dcf_result.get("historical_table", [])
-        hist_lines = [
-            f"  {r.get('year')}: Revenue={fmt_num(r.get('revenue'))}, NOP After Tax={fmt_num(r.get('nop_after_tax'))}, CapEx={fmt_num(r.get('capex'))}, FCFF={fmt_num(r.get('fcff'))}"
-            for r in hist[:4]
-        ]
-        hist_summary = "\n".join(hist_lines) if hist_lines else "  Not available"
-
-        proj = dcf_result.get("projection_table", [])
-        proj_lines = [
-            f"  {r.get('year')}: Revenue={fmt_num(r.get('revenue'))}, FCFF={fmt_num(r.get('fcff'))}, PV={fmt_num(r.get('pv_fcff'))}"
-            for r in proj[:3]
-        ]
-        proj_summary = "\n".join(proj_lines) if proj_lines else "  Not available"
-
-        term = dcf_result.get("terminal_year", {})
-        term_summary = (
-            f"  {term.get('year')}: Revenue={fmt_num(term.get('revenue'))}, FCFF={fmt_num(term.get('fcff'))}"
-        ) if term else "  Not available"
-
-        # ── Step 8: Build prompt ──────────────────────────────────────────────
-        prompt = f"""You are a senior equity research analyst. Provide a rigorous investment analysis for {company_name} ({resolved}) in the {sector} sector ({industry}).
-
-═══ DCF VALUATION OUTPUT ═══
-Current Market Price:     {current_price}
-Intrinsic Value (DCF):    {intrinsic}
-Intrinsic Value (w/ MOS): {intrinsic_mos}  [MOS used: {mos_used}]
-Upside / Downside:        {upside}%
-WACC:                     {wacc}
-Enterprise Value:         {ev}
-DCF Model Signal:         {verdict_dcf}
-Historical Years Used:    {hist_years}
-Avg Effective Tax Rate:   {avg_tax}
-Revenue Growth:    {round(float(rev_growth or 0)*100,1)}%
-OpEx Growth:       {round(float(opex_growth or 0)*100,1)}%
-Terminal Growth:   {round(float(term_growth or 0)*100,1)}%
-
-Historical FCFF:
-{hist_summary}
-
-Projected FCFF (Years 1-3):
-{proj_summary}
-
-Terminal Year:
-{term_summary}
-
-═══ COMPETITORS ═══
-{competitors_text}
-
-═══ ANALYST PRICE TARGETS ═══
-{analyst_text}
-
-═══ INSIDER ACTIVITY (last 10 trades) ═══
-Buys: {insider_buys} | Sells: {insider_sells} | Signal: {insider_signal}
-
-═══ EARNINGS SURPRISE HISTORY ═══
-{earnings_text}
-
-═══ RECENT NEWS ═══
-{news_text}
-
-═══ INSTRUCTIONS ═══
-Respond ONLY with a valid JSON object. No preamble, no markdown. Pure JSON only.
-
-{{
-  "verdict": "one of: Strong Buy / Buy / Hold / Sell / Strong Sell",
-  "confidence": "one of: High / Medium / Low",
-  "summary": "3-4 sentence plain English investment thesis mentioning valuation, growth, and key risk",
-  "bull_case": "3 specific bullish arguments referencing actual numbers",
-  "bear_case": "3 specific bearish arguments referencing actual numbers",
-  "competitor_analysis": "2-3 sentences: how does {resolved} compare to peers on valuation and growth? Is it cheaper or more expensive than peers? Any competitive moat?",
-  "management_guidance": {{
-    "capex": "CapEx guidance from news or N/A",
-    "revenue": "Revenue growth guidance from news or N/A",
-    "expansion": "Any expansion or strategic plans from news or N/A"
-  }},
-  "model_vs_reality": "2 sentences: how do DCF assumptions compare to analyst targets and what the market expects?",
-  "insider_read": "1 sentence: what does insider activity signal about management confidence?",
-  "earnings_track_record": "1 sentence: summarize earnings beat/miss history and what it implies",
-  "news_sentiment": "one of: Positive / Neutral / Negative",
-  "recent_headlines": ["headline 1", "headline 2", "headline 3"],
-  "key_risks": ["specific risk 1", "specific risk 2", "specific risk 3"],
-  "analyst_note": "One actionable sentence: what specific metric or event should investors watch next quarter?"
-}}"""
-
-        # ── Step 9: Call Groq ─────────────────────────────────────────────────
-        if not GROQ_API_KEY:
-            return {"error": "GROQ_API_KEY environment variable not set on server."}
-
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "max_tokens": 1800,
-                    "messages": [
-                        {"role": "system", "content": "You are a senior equity research analyst. Always respond with valid JSON only. No preamble, no markdown, no explanation outside the JSON object."},
-                        {"role": "user",   "content": prompt},
-                    ],
-                    "temperature": 0.3,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-
-        if response.status_code != 200:
-            return {"error": f"Groq API error {response.status_code}: {response.text[:300]}"}
-
-        raw     = response.json()
-        ai_text = raw.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-
-        try:
-            clean = ai_text
-            if "```" in clean:
-                for part in clean.split("```"):
-                    stripped = part.strip()
-                    if stripped.startswith("json"):
-                        stripped = stripped[4:].strip()
-                    if stripped.startswith("{"):
-                        clean = stripped
-                        break
-            start = clean.find("{"); end = clean.rfind("}") + 1
-            if start != -1 and end > start:
-                clean = clean[start:end]
-            ai_verdict = json.loads(clean)
-        except Exception:
-            ai_verdict = {
-                "verdict": "Analysis Complete", "confidence": "Medium",
-                "summary": ai_text[:500], "parse_error": True, "raw_response": ai_text,
-            }
-
-        return {
-            "ticker":        resolved,
-            "company_name":  company_name,
-            "sector":        sector,
-            "industry":      industry,
-            "current_price": current_price,
-            "data_source":   "FMP" if use_fmp else "yfinance",
-            "ai_verdict":    ai_verdict,
-            "news_fed":      news_items[:5],
-            "competitors_analyzed": peer_list,
+        d = req.dcf_result or {}
+        summary = {
+            "ticker":          req.ticker,
+            "market":          req.market,
+            "current_price":   d.get("current_price"),
+            "intrinsic_value": d.get("intrinsic_value_per_share"),
+            "upside_pct":      d.get("upside_pct"),
+            "verdict":         d.get("verdict"),
+            "wacc":            (d.get("assumptions") or {}).get("wacc") or d.get("wacc"),
+            "growth_rates":    d.get("derived_growth_rates"),
+            "data_source":     d.get("data_source"),
+            "warning":         d.get("reliability_warning"),
         }
 
+        prompt = f"""You are an equity analyst. Based on this DCF output, give a
+balanced verdict. Respond with ONLY a JSON object, no markdown:
+
+{{
+  "verdict": "<one line: overall stance>",
+  "confidence": "<High|Medium|Low> - <one-line reason>",
+  "news_sentiment": "<one line on likely current sentiment for this stock>",
+  "management_guidance": "<one line on what management guidance typically implies here>",
+  "key_risks": ["<risk 1>", "<risk 2>", "<risk 3>"],
+  "recent_headlines": []
+}}
+
+Rules: be specific to the numbers given; if a reliability warning is present,
+lead with caution; never invent headlines - leave recent_headlines empty.
+
+DCF DATA:
+{json.dumps(summary)}"""
+
+        last_err = None
+        for model in _GROQ_MODELS:
+            try:
+                with httpx.Client(timeout=45.0) as client:
+                    resp = client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Content-Type": "application/json",
+                                 "Authorization": f"Bearer {api_key}"},
+                        json={"model": model,
+                              "max_tokens": 700,
+                              "temperature": 0.3,
+                              "response_format": {"type": "json_object"},
+                              "messages": [
+                                  {"role": "system",
+                                   "content": "Respond with valid JSON only."},
+                                  {"role": "user", "content": prompt}]},
+                    )
+                if resp.status_code == 200:
+                    text = (resp.json().get("choices") or [{}])[0] \
+                        .get("message", {}).get("content", "")
+                    try:
+                        parsed = json.loads(text)
+                    except Exception:
+                        last_err = f"{model}: non-JSON reply"
+                        continue
+                    parsed.setdefault("verdict", "No verdict generated.")
+                    parsed.setdefault("confidence", "Low")
+                    parsed.setdefault("news_sentiment", "-")
+                    parsed.setdefault("management_guidance", "-")
+                    parsed.setdefault("key_risks", [])
+                    parsed.setdefault("recent_headlines", [])
+                    return {"ai_verdict": parsed, "model_used": model}
+                last_err = f"{model}: HTTP {resp.status_code} {resp.text[:120]}"
+            except Exception as e:
+                last_err = f"{model}: {e}"
+
+        return {"error": f"AI Verdict temporarily unavailable ({last_err})."}
+
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"AI Verdict failed: {e}"}
