@@ -968,8 +968,21 @@ def get_dcf(
         total_debt         = info.get("totalDebt", 0) or 0
         total_cash         = info.get("totalCash", 0) or 0
 
+        # Derive shares if missing: (a) marketCap/price, (b) netIncome/EPS
         if not shares_outstanding or shares_outstanding == 0:
-            return {"error": "Shares outstanding not available for this ticker."}
+            if market_cap and current_price:
+                shares_outstanding = market_cap / current_price
+            else:
+                _eps = info.get("trailingEps")
+                _ni  = info.get("netIncome")
+                if _eps and _ni and _eps != 0:
+                    derived = _ni / _eps
+                    if 1e5 < abs(derived) < 1e12:
+                        shares_outstanding = derived
+        if not shares_outstanding or shares_outstanding == 0:
+            return {"error": "Shares outstanding not available for this ticker "
+                             f"(source: {data_source}). If this is an ingested "
+                             "stock, re-run: python ingest.py one TICKER MARKET"}
 
         for label, df in [("Income statement", income_df),
                            ("Cash flow statement", cashflow_df),
@@ -1182,7 +1195,24 @@ def get_dcf(
         revenue_growth = avg_yoy_growth(revenue_series)
         opex_growth    = avg_yoy_growth(opex_series)
         # Soft cap on opex: can grow faster than revenue short term but not 2x+
-        opex_growth    = min(opex_growth, revenue_growth * 1.5)
+        # Growth discipline:
+        # - clamp revenue growth to a defensible band (extreme 4-yr windows
+        #   — e.g. commodity peaks — otherwise compound into nonsense)
+        # - margin freeze: opex can never compound faster than revenue,
+        #   which previously inverted margins for TSLA-type profiles
+        revenue_growth = max(-0.05, min(revenue_growth, 0.30))
+        opex_growth    = min(opex_growth, revenue_growth)
+        opex_growth    = max(-0.10, min(opex_growth, 0.30))
+        # Cash-based DCF needs a real balance sheet — refuse garbage-in
+        if (not any(v for v in ca_series if v)
+                and not any(v for v in cl_series if v)
+                and not any(v for v in net_ppe_series if v)):
+            return {"error": "Balance-sheet data unavailable for this company — "
+                             "cash-based FCFF DCF is not meaningful (common for "
+                             "insurers/financial conglomerates). Use the "
+                             "Convergence tab's earnings-based models instead.",
+                    "data_source": data_source}
+
         ca_growth      = avg_yoy_growth(ca_series)
         cl_growth      = avg_yoy_growth(cl_series)
         cash_growth    = avg_yoy_growth(cash_series)
@@ -1394,8 +1424,18 @@ def get_dcf(
         }
 
         # Terminal Value = FCFF_terminal / (WACC - g)
-        terminal_value    = term_fcff / (wacc - terminal_growth_rate)
-        pv_terminal_value = terminal_value / ((1 + wacc) ** projection_years)
+        # Gordon growth is only valid for positive terminal cash flow —
+        # a negative TV would dominate EV with economically meaningless numbers
+        reliability_warning = None
+        if term_fcff > 0:
+            terminal_value    = term_fcff / (wacc - terminal_growth_rate)
+            pv_terminal_value = terminal_value / ((1 + wacc) ** projection_years)
+        else:
+            terminal_value    = 0.0
+            pv_terminal_value = 0.0
+            reliability_warning = ("Projected terminal cash flow is negative — "
+                                   "terminal value excluded; DCF output is not "
+                                   "meaningful for this profile.")
 
         # ── Enterprise & Equity Value ─────────────────────────────────────────
         enterprise_value = total_pv_fcff + pv_terminal_value
@@ -1437,12 +1477,19 @@ def get_dcf(
             else "Fairly Valued" if upside_pct is not None
             else None
         )
+        if intrinsic_value_per_share < 0 and not reliability_warning:
+            reliability_warning = ("Negative intrinsic value — projected cash "
+                                   "flows don't support a meaningful DCF for "
+                                   "this company profile.")
+        if reliability_warning:
+            verdict = "Not Meaningful"
 
         # ── Response ──────────────────────────────────────────────────────────
         return {
             "ticker":        raw_ticker,
             "market":        market,
             "data_source":   data_source,
+            "reliability_warning": reliability_warning,
             "current_price": current_price,
 
             # Growth rates used
