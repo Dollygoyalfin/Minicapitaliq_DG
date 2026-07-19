@@ -364,7 +364,16 @@ def get_company_data(ticker: str, market: str = "us", source: str = "auto"):
     if source in ("auto", "store"):
         try:
             from data_store import get_from_store, get_live_price
-            stored = get_from_store(ticker, market)
+            stored = None
+            for _attempt in range(2):
+                try:
+                    stored = get_from_store(ticker, market)
+                    break
+                except Exception:
+                    if _attempt == 0:
+                        time.sleep(1.5)
+                    else:
+                        raise
             if stored:
                 info, inc, bal, cf = stored
                 # Fetch ONLY the live price (small, fast, rarely rate-limited)
