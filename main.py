@@ -2279,8 +2279,11 @@ balanced verdict. Respond with ONLY a JSON object, no markdown:
 {{
   "verdict": "<one line: overall stance>",
   "confidence": "<High|Medium|Low> - <one-line reason>",
+  "summary": "<3-4 sentence balanced analysis of the valuation>",
+  "bull_case": "<2-3 sentences: the strongest case for upside>",
+  "bear_case": "<2-3 sentences: the strongest case for downside>",
   "news_sentiment": "<one line on likely current sentiment for this stock>",
-  "management_guidance": "<one line on what management guidance typically implies here>",
+  "management_guidance": {{"capex": "N/A", "revenue": "N/A", "expansion": "N/A"}},
   "key_risks": ["<risk 1>", "<risk 2>", "<risk 3>"],
   "recent_headlines": []
 }}
@@ -2318,11 +2321,31 @@ DCF DATA:
                         continue
                     parsed.setdefault("verdict", "No verdict generated.")
                     parsed.setdefault("confidence", "Low")
+                    parsed.setdefault("summary", "Analysis not available.")
+                    parsed.setdefault("bull_case", "")
+                    parsed.setdefault("bear_case", "")
                     parsed.setdefault("news_sentiment", "-")
-                    parsed.setdefault("management_guidance", "-")
+                    if not isinstance(parsed.get("management_guidance"), dict):
+                        parsed["management_guidance"] = {}
                     parsed.setdefault("key_risks", [])
                     parsed.setdefault("recent_headlines", [])
-                    return {"ai_verdict": parsed, "model_used": model}
+                    # Top-level fields the frontend header renders
+                    company_name, sector = req.ticker.upper(), "-"
+                    try:
+                        from data_store import get_from_store
+                        stored = get_from_store(req.ticker, req.market)
+                        if stored:
+                            company_name = stored[0].get("longName") or company_name
+                            sector       = stored[0].get("sector") or sector
+                    except Exception:
+                        pass
+                    return {"ai_verdict": parsed,
+                            "model_used": model,
+                            "ticker": req.ticker.upper(),
+                            "company_name": company_name,
+                            "sector": sector,
+                            "current_price": (req.dcf_result or {}).get("current_price"),
+                            "news_fed": []}
                 last_err = f"{model}: HTTP {resp.status_code} {resp.text[:120]}"
             except Exception as e:
                 last_err = f"{model}: {e}"
