@@ -370,6 +370,8 @@ def get_from_store(ticker: str, market: str = "us"):
         "totalCash":          company["total_cash"],
         "bookValue":          company["book_value"],
         "trailingEps":        company["eps"],
+        "netIncome":          (income_rows[0].get("net_income")
+                               if income_rows else None),
         "currentPrice":       None,   # filled live
         "regularMarketPrice": None,
         "marketCap":          None,
@@ -417,6 +419,20 @@ def get_live_price(ticker: str, market: str = "us"):
             return sp
     except Exception:
         pass
+
+    # NSE quote fallback for India (Stooq doesn't cover NSE)
+    if market.lower() == "india":
+        try:
+            from india_data_pipeline import _nse_get_json, _q
+            sym = raw_ticker.replace(".NS", "")
+            data = _nse_get_json(
+                f"https://www.nseindia.com/api/quote-equity?symbol={_q(sym)}"
+            )
+            p = (data.get("priceInfo") or {}).get("lastPrice")
+            if p:
+                return float(str(p).replace(",", ""))
+        except Exception:
+            pass
     return None
 
 
