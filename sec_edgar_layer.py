@@ -181,7 +181,9 @@ def _get_concept_annual(facts: dict, *tags, unit: str = "USD") -> dict:
             start = item.get("start")
             end   = item.get("end")
 
-            if form != "10-K" or val is None or not end:
+            # Accept 10-K, 10-K/A (amended), 20-F (foreign filers)
+            if not (str(form).startswith("10-K") or str(form).startswith("20-F")) \
+                    or val is None or not end:
                 continue
 
             # Period must be a full year (~365 days) — skip quarterly chunks
@@ -232,7 +234,9 @@ def _get_concept_instant(facts: dict, *tags, unit: str = "USD") -> dict:
             form = item.get("form", "")
             val  = item.get("val")
             end  = item.get("end")
-            if form != "10-K" or val is None or not end:
+            # Accept 10-K, 10-K/A (amended), 20-F (foreign filers)
+            if not (str(form).startswith("10-K") or str(form).startswith("20-F")) \
+                    or val is None or not end:
                 continue
             try:
                 period_year = datetime.fromisoformat(end).year
@@ -479,7 +483,8 @@ def _get_shares_outstanding(facts: dict):
         if tag in us_gaap:
             units = us_gaap[tag].get("units", {})
             shares_data = units.get("shares", [])
-            annual = [x for x in shares_data if x.get("form") == "10-K" and x.get("val")]
+            annual = [x for x in shares_data
+                      if str(x.get("form", "")).startswith(("10-K", "20-F")) and x.get("val")]
             if annual:
                 latest = sorted(annual, key=lambda x: x.get("end", ""), reverse=True)
                 return float(latest[0]["val"])
