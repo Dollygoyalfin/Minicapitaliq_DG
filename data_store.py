@@ -207,10 +207,16 @@ def _upsert_statements_inner(ticker: str, income_df: pd.DataFrame,
     with _conn() as conn:
         with conn.cursor() as cur:
             for i, col_label in enumerate(income_df.columns):
+                # Columns are year strings ("2024") from our pipelines, but
+                # DATETIMES from yfinance-fallback data — int(Timestamp)
+                # raised and silently skipped EVERY column (hollow rows)
                 try:
                     fy = int(col_label)
                 except (ValueError, TypeError):
-                    continue
+                    try:
+                        fy = int(col_label.year)
+                    except Exception:
+                        continue
 
                 # Income statement
                 cur.execute("""
