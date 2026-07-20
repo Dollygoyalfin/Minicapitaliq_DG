@@ -1314,7 +1314,7 @@
         const err = m.error;
         return `<div class="model-row">
           <div class="mr-cell name">${m.method || key}</div>
-          <div class="mr-cell mono">${iv != null ? (d.current_price > 1000 ? '₹' : '$') + iv.toLocaleString() : err ? '⚠ Error' : '—'}</div>
+          <div class="mr-cell mono">${iv != null ? (d.current_price = market === "india" ? '₹' : '$') + iv.toLocaleString() : err ? '⚠ Error' : '—'}</div>
           <div class="mr-cell mono ${up != null ? (up > 0 ? 'nu' : 'nd') : ''}">${up != null ? (up > 0 ? '+' : '') + up.toFixed(1) + '%' : '—'}</div>
           <div class="mr-cell"><span class="signal-pill ${sigClass(sig)}">${sig}</span></div>
           <div class="mr-cell" style="font-size:0.72rem;color:var(--muted)">${m.confidence || '—'}</div>
