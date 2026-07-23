@@ -196,11 +196,25 @@ def _upsert_statements_inner(ticker: str, income_df: pd.DataFrame,
                              balance_df: pd.DataFrame, cashflow_df: pd.DataFrame):
 
     def gv(df, row_name, col):
+        """Fuzzy row lookup: exact first, then case-insensitive substring
+        (yfinance names rows 'Stockholders Equity' / 'Current Assets' where
+        our pipelines use 'Total Stockholders Equity' etc.)."""
+        if df is None or df.empty:
+            return None
         try:
             v = df.loc[row_name].iloc[col]
             return None if (v is None or str(v) == "nan") else float(v)
         except Exception:
-            return None
+            pass
+        needle = row_name.lower().replace("total ", "")
+        for idx in df.index:
+            if needle in idx.lower() or idx.lower() in row_name.lower():
+                try:
+                    v = df.loc[idx].iloc[col]
+                    return None if (v is None or str(v) == "nan") else float(v)
+                except Exception:
+                    return None
+        return None
 
     years = [int(c) for c in income_df.columns if str(c).isdigit()]
 
