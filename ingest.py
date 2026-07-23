@@ -171,6 +171,62 @@ def backfill_india_own(universe: list):
     print(f"\n✅ Own-pipeline backfill complete: {success}/{total} stored.")
 
 
+def backfill_prices(target: str = "both", period: str = "5y"):
+    """
+    Batched daily-price backfill via yf.download (40 tickers per call —
+    far gentler than per-ticker). ~15 min for the full 1,000-name universe.
+    Also used nightly with period='7d' as a cheap top-up.
+    """
+    import yfinance as yf
+    from data_store import _conn, upsert_prices
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ticker, market FROM companies")
+            all_companies = cur.fetchall()
+
+    tickers = [t for t, m in all_companies
+               if target == "both" or m == target]
+    print(f"Price backfill: {len(tickers)} tickers, period={period}")
+
+    total_rows = 0
+    for i in range(0, len(tickers), 40):
+        batch = tickers[i:i + 40]
+        try:
+            data = yf.download(
+                " ".join(batch), period=period, interval="1d",
+                group_by="ticker", auto_adjust=True,
+                threads=True, progress=False,
+            )
+        except Exception as e:
+            print(f"  batch {i//40 + 1}: download failed ({e})")
+            time.sleep(5)
+            continue
+
+        for t in batch:
+            try:
+                sub = data[t] if len(batch) > 1 else data
+                sub = sub.dropna(subset=["Close"])
+                rows = []
+                for idx, r in sub.iterrows():
+                    vol = r.get("Volume")
+                    rows.append((idx.date(), float(r["Close"]),
+                                 int(vol) if vol == vol else None))
+                n = upsert_prices(t, rows)
+                total_rows += n
+            except Exception:
+                pass
+        print(f"  batch {i//40 + 1}/{(len(tickers)-1)//40 + 1} done "
+              f"({total_rows} rows so far)")
+        time.sleep(2)
+    print(f"✅ Price backfill complete: {total_rows} rows.")
+
+
+def refresh_prices():
+    """Nightly top-up: last 7 days for every ticker (fast, batched)."""
+    backfill_prices(target="both", period="7d")
+
+
 def refresh_all():
     """
     Nightly refresh. Re-fetches all companies in the store.
@@ -209,6 +265,11 @@ def refresh_all():
             print(f"  ❌ {clean_ticker}: {e}")
         time.sleep(1.5 if market == "us" else 3.0)
     print(f"✅ Refresh complete: {ok}/{len(companies)}.")
+    # Daily price top-up for the whole universe (cheap, batched)
+    try:
+        refresh_prices()
+    except Exception as e:
+        print(f"⚠ price refresh failed: {e}")
 
 
 if __name__ == "__main__":
@@ -237,6 +298,9 @@ if __name__ == "__main__":
         backfill(fetch_us_universe(), "us")
     elif cmd == "backfill_india_full":
         backfill_india_own(fetch_india_universe())
+    elif cmd == "backfill_prices":
+        tgt = sys.argv[2] if len(sys.argv) > 2 else "both"
+        backfill_prices(target=tgt)
     elif cmd == "refresh":
         refresh_all()
     else:
