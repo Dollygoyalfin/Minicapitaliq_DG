@@ -218,6 +218,7 @@ def get_valuation(
         current_price = info.get("currentPrice")
         eps           = info.get("trailingEps") or 0.0
         beta          = info.get("beta") or 1.0
+        beta          = max(0.5, min(float(beta), 2.5))  # sanity clamp
         book_value    = info.get("bookValue")
         shares        = info.get("sharesOutstanding")
         market_cap    = info.get("marketCap") or (
@@ -960,6 +961,7 @@ def get_dcf(
         current_price      = info.get("currentPrice")
         shares_outstanding = info.get("sharesOutstanding")
         beta               = info.get("beta", 1.0) or 1.0
+        beta               = max(0.5, min(float(beta), 2.5))  # sanity clamp
         market_cap         = info.get("marketCap")
         total_debt         = info.get("totalDebt", 0) or 0
         total_cash         = info.get("totalCash", 0) or 0
