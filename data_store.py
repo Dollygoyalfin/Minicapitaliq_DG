@@ -111,7 +111,16 @@ def init_db():
         PRIMARY KEY (ticker, fiscal_year)
     );
 
+    CREATE TABLE IF NOT EXISTS price_history (
+        ticker  TEXT,
+        date    DATE,
+        close   DOUBLE PRECISION,
+        volume  BIGINT,
+        PRIMARY KEY (ticker, date)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_income_ticker  ON income_statements(ticker);
+    CREATE INDEX IF NOT EXISTS idx_price_ticker   ON price_history(ticker);
     CREATE INDEX IF NOT EXISTS idx_balance_ticker ON balance_sheets(ticker);
     CREATE INDEX IF NOT EXISTS idx_cashflow_ticker ON cash_flows(ticker);
     CREATE INDEX IF NOT EXISTS idx_companies_market ON companies(market);
@@ -454,6 +463,49 @@ def get_live_price(ticker: str, market: str = "us"):
         except Exception:
             pass
     return None
+
+
+def upsert_prices(ticker: str, rows: list) -> int:
+    """Bulk-write daily prices. rows = [(date, close, volume_or_None), ...]"""
+    if not rows:
+        return 0
+    from psycopg2.extras import execute_values
+
+    def _do():
+        conn = _conn()
+        try:
+            with conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    """INSERT INTO price_history (ticker, date, close, volume)
+                       VALUES %s
+                       ON CONFLICT (ticker, date) DO UPDATE
+                       SET close = EXCLUDED.close, volume = EXCLUDED.volume""",
+                    [(ticker, d, c_, v) for d, c_, v in rows],
+                    page_size=500,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return len(rows)
+
+    return _retry_db(_do)
+
+
+def get_price_history(ticker: str, market: str = "us", days: int = 1825) -> list:
+    """Read daily closes from the store. Returns [(date, close), ...] ascending."""
+    raw_ticker = ticker.upper()
+    if market.lower() == "india" and not raw_ticker.endswith(".NS"):
+        raw_ticker += ".NS"
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT date, close FROM price_history
+                   WHERE ticker = %s AND date >= CURRENT_DATE - %s
+                   ORDER BY date ASC""",
+                (raw_ticker, days),
+            )
+            return cur.fetchall()
 
 
 def store_has_ticker(ticker: str, market: str = "us") -> bool:
