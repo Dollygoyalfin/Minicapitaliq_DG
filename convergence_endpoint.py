@@ -147,8 +147,14 @@ def get_convergence(
         interest_exp   = abs(safe_float(income_df, interest_row) or 0.0)
         cost_of_debt   = max(0.03, min(interest_exp / total_debt, 0.15)) if total_debt > 0 and interest_exp > 0 else 0.06
 
-        equity_val    = market_cap if market_cap else 1
-        debt_val      = total_debt if total_debt else equity_val * 0.2
+        if market_cap:
+            equity_val = market_cap
+            debt_val   = total_debt if total_debt else market_cap * 0.2
+        else:
+            # Price/market cap unavailable — assume a standard 80/20
+            # capital structure instead of collapsing to all-debt WACC
+            debt_val   = total_debt if total_debt else 1.0
+            equity_val = debt_val * 4.0
         total_capital = equity_val + debt_val
 
         # Approximate avg tax rate from income statement
@@ -346,21 +352,35 @@ def get_convergence(
             avg_hist_pe   = None
             hist_pe_years = 0
 
-            # Use cached price history to avoid extra yfinance calls
-            import yfinance as yf
-            hist_cache_key = f"hist_price:{raw_ticker}"
-            hist_price = _cache_get(hist_cache_key)
+            # STORE FIRST: daily closes from our own price_history table.
+            # yfinance only as fallback for tickers not yet price-backfilled.
+            hist_price = None
+            try:
+                from data_store import get_price_history
+                ph = get_price_history(raw_ticker, market, days=1900)
+                if ph and len(ph) > 200:
+                    import pandas as pd
+                    hist_price = pd.DataFrame(ph, columns=["Date", "Close"])
+                    hist_price["Date"] = pd.to_datetime(hist_price["Date"])
+                    hist_price = hist_price.set_index("Date")
+            except Exception:
+                hist_price = None
+
             if hist_price is None:
-                try:
-                    stock_yf   = yf.Ticker(raw_ticker)
-                    hist_price = _with_retry(
-                        lambda: stock_yf.history(period="5y", interval="1mo"),
-                        max_retries=3, base_delay=2.0
-                    )
-                    if hist_price is not None and not hist_price.empty:
-                        _cache_set(hist_cache_key, hist_price)
-                except Exception:
-                    hist_price = None
+                import yfinance as yf
+                hist_cache_key = f"hist_price:{raw_ticker}"
+                hist_price = _cache_get(hist_cache_key)
+                if hist_price is None:
+                    try:
+                        stock_yf   = yf.Ticker(raw_ticker)
+                        hist_price = _with_retry(
+                            lambda: stock_yf.history(period="5y", interval="1mo"),
+                            max_retries=3, base_delay=2.0
+                        )
+                        if hist_price is not None and not hist_price.empty:
+                            _cache_set(hist_cache_key, hist_price)
+                    except Exception:
+                        hist_price = None
 
             if hist_price is not None and not hist_price.empty:
                 # Get trailing EPS for each year from financials
