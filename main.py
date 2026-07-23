@@ -398,8 +398,8 @@ SECTOR_PE_MEDIANS = {
     # Default
     "Unknown":                   20.0,
 }
-
-
+ 
+ 
 @app.get("/convergence")
 def get_convergence(
     ticker: str = Query(...),
@@ -412,14 +412,14 @@ def get_convergence(
 ):
     """
     Convergence Engine — 5 valuation methods aggregated into one consensus signal.
-
+ 
     Methods:
     1. DCF (FCFF-based)         — cash flow intrinsic value
     2. Earnings Power Value     — zero-growth floor value (Bruce Greenwald)
     3. Graham Number            — Benjamin Graham's formula
     4. Relative Valuation       — sector P/E median × EPS
     5. Historical P/E Mean      — reversion to historical average multiple
-
+ 
     Outputs:
     - Individual intrinsic values per method
     - Upside/downside per method
@@ -433,14 +433,14 @@ def get_convergence(
         raw_ticker = ticker.upper()
         if market.lower() == "india" and not raw_ticker.endswith(".NS"):
             raw_ticker += ".NS"
-
+ 
         try:
             info, income_df, balance_df, cashflow_df, data_source = get_company_data(
                 ticker=ticker, market=market, source=source
             )
         except Exception as e:
             return {"error": f"Data fetch failed: {e}"}
-
+ 
         # ── Info fields ───────────────────────────────────────────────────────
         current_price      = info.get("currentPrice") or info.get("regularMarketPrice")
         shares_outstanding = info.get("sharesOutstanding")
@@ -454,19 +454,19 @@ def get_convergence(
         sector             = info.get("sector", "Unknown")
         company_name       = info.get("longName", raw_ticker)
         roe                = info.get("returnOnEquity")
-
+ 
         if not current_price:
             return {"error": "Current price not available for this ticker."}
         if not shares_outstanding or shares_outstanding == 0:
             return {"error": "Shares outstanding not available."}
-
+ 
         # ── Helpers ───────────────────────────────────────────────────────────
         def find_row(df, *keywords):
             for idx in df.index:
                 if all(k.lower() in idx.lower() for k in keywords):
                     return idx
             return None
-
+ 
         def safe_float(df, row_key, col=0):
             if row_key is None or df is None or df.empty:
                 return None
@@ -477,12 +477,12 @@ def get_convergence(
                 return float(val)
             except Exception:
                 return None
-
+ 
         def upside(intrinsic, price):
             if intrinsic is None or price is None or price == 0:
                 return None
             return round((intrinsic - price) / price * 100, 2)
-
+ 
         def signal(up):
             if up is None:
                 return "N/A"
@@ -491,13 +491,13 @@ def get_convergence(
             if up > -10: return "Hold"
             if up > -30: return "Sell"
             return "Strong Sell"
-
+ 
         # ── WACC ──────────────────────────────────────────────────────────────
         cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
         interest_row   = find_row(income_df, "interest", "expense")
         interest_exp   = abs(safe_float(income_df, interest_row) or 0.0)
         cost_of_debt   = max(0.03, min(interest_exp / total_debt, 0.15)) if total_debt > 0 and interest_exp > 0 else 0.06
-
+ 
         if market_cap:
             equity_val = market_cap
             debt_val   = total_debt if total_debt else market_cap * 0.2
@@ -507,21 +507,21 @@ def get_convergence(
             debt_val   = total_debt if total_debt else 1.0
             equity_val = debt_val * 4.0
         total_capital = equity_val + debt_val
-
+ 
         # Approximate avg tax rate from income statement
         pretax_row = find_row(income_df, "pretax") or find_row(income_df, "income before tax")
         tax_row    = find_row(income_df, "tax", "provision") or find_row(income_df, "income tax")
         pretax_val = safe_float(income_df, pretax_row) or 0
         tax_val    = safe_float(income_df, tax_row)    or 0
         avg_tax    = max(0.05, min(abs(tax_val / pretax_val), 0.40)) if pretax_val != 0 else 0.25
-
+ 
         wacc = (
             (equity_val / total_capital) * cost_of_equity +
             (debt_val   / total_capital) * cost_of_debt * (1 - avg_tax)
         )
-
+ 
         results = {}
-
+ 
         # ─────────────────────────────────────────────────────────────────────
         # METHOD 1 — DCF (simplified FCFF for convergence, full model in /dcf)
         # ─────────────────────────────────────────────────────────────────────
@@ -530,15 +530,15 @@ def get_convergence(
             opex_row    = (find_row(income_df, "total expenses")
                            or find_row(income_df, "total operating expenses")
                            or find_row(income_df, "operating expense"))
-
+ 
             revenue     = safe_float(income_df, revenue_row) or 0
             opex        = abs(safe_float(income_df, opex_row) or 0)
             nop         = revenue - opex
             nop_at      = nop * (1 - avg_tax)
-
+ 
             capex_row   = find_row(income_df, "depreciation") or find_row(cashflow_df, "capital expenditure")
             capex       = abs(safe_float(income_df, capex_row) or safe_float(cashflow_df, capex_row) or 0)
-
+ 
             fcff_base   = nop_at - capex
             if wacc > terminal_growth_rate and fcff_base > 0:
                 # Simple Gordon Growth on FCFF
@@ -549,7 +549,7 @@ def get_convergence(
                 dcf_value    = equity_dcf / shares_outstanding
             else:
                 dcf_value = None
-
+ 
             results["dcf"] = {
                 "method":          "DCF (FCFF)",
                 "description":     "Free Cash Flow to Firm — discounted at WACC",
@@ -561,7 +561,7 @@ def get_convergence(
             }
         except Exception as e:
             results["dcf"] = {"method": "DCF (FCFF)", "intrinsic_value": None, "error": str(e)}
-
+ 
         # ─────────────────────────────────────────────────────────────────────
         # METHOD 2 — EARNINGS POWER VALUE (EPV)
         # Bruce Greenwald: value assuming zero growth — conservative floor
@@ -571,7 +571,7 @@ def get_convergence(
             ebit_row = (find_row(income_df, "ebit")
                         or find_row(income_df, "operating income")
                         or find_row(income_df, "income from operations"))
-
+ 
             # Average EBIT over available years for normalization
             ebit_values = []
             if ebit_row:
@@ -579,14 +579,14 @@ def get_convergence(
                     v = safe_float(income_df, ebit_row, col)
                     if v and v > 0:
                         ebit_values.append(v)
-
+ 
             if not ebit_values:
                 # Derive EBIT from revenue - opex if no direct row
                 rev_vals  = [safe_float(income_df, revenue_row, c) for c in range(min(len(income_df.columns), 5))]
                 opex_vals = [safe_float(income_df, opex_row,    c) for c in range(min(len(income_df.columns), 5))]
                 ebit_values = [r - o for r, o in zip(rev_vals, opex_vals)
                                if r is not None and o is not None and (r - o) > 0]
-
+ 
             if ebit_values and wacc > 0:
                 norm_ebit  = sum(ebit_values) / len(ebit_values)
                 nopat      = norm_ebit * (1 - avg_tax)
@@ -595,7 +595,7 @@ def get_convergence(
                 epv_value  = equity_epv / shares_outstanding
             else:
                 epv_value = None
-
+ 
             results["epv"] = {
                 "method":          "Earnings Power Value",
                 "description":     "Normalized EBIT × (1-t) / WACC — zero-growth conservative floor",
@@ -607,7 +607,7 @@ def get_convergence(
             }
         except Exception as e:
             results["epv"] = {"method": "Earnings Power Value", "intrinsic_value": None, "error": str(e)}
-
+ 
         # ─────────────────────────────────────────────────────────────────────
         # METHOD 3 — GRAHAM NUMBER
         # √(22.5 × EPS × Book Value per Share)
@@ -621,7 +621,7 @@ def get_convergence(
                 ni     = safe_float(income_df, ni_row)
                 if ni and ni > 0 and shares_outstanding:
                     g_eps = ni / shares_outstanding
-
+ 
             # Get book value per share from info or derive from balance sheet
             g_bv = book_value
             if not g_bv or g_bv <= 0:
@@ -631,12 +631,12 @@ def get_convergence(
                 equity = safe_float(balance_df, eq_row)
                 if equity and equity > 0 and shares_outstanding:
                     g_bv = equity / shares_outstanding
-
+ 
             if g_eps and g_bv and g_eps > 0 and g_bv > 0:
                 graham_value = (22.5 * g_eps * g_bv) ** 0.5
             else:
                 graham_value = None
-
+ 
             results["graham"] = {
                 "method":          "Graham Number",
                 "description":     "√(22.5 × EPS × Book Value) — Benjamin Graham's formula",
@@ -651,31 +651,31 @@ def get_convergence(
             }
         except Exception as e:
             results["graham"] = {"method": "Graham Number", "intrinsic_value": None, "error": str(e)}
-
+ 
         # ─────────────────────────────────────────────────────────────────────
         # METHOD 4 — RELATIVE VALUATION (Sector P/E)
         # Fair Value = EPS × Sector Median P/E
         # ─────────────────────────────────────────────────────────────────────
         try:
             sector_pe = SECTOR_PE_MEDIANS.get(sector, SECTOR_PE_MEDIANS["Unknown"])
-
+ 
             r_eps = eps
             if not r_eps or r_eps <= 0:
                 ni_row = find_row(income_df, "net income")
                 ni     = safe_float(income_df, ni_row)
                 if ni and ni > 0 and shares_outstanding:
                     r_eps = ni / shares_outstanding
-
+ 
             if r_eps and r_eps > 0:
                 relative_value = r_eps * sector_pe
             else:
                 relative_value = None
-
+ 
             # P/E premium/discount to sector
             pe_vs_sector = None
             if pe_ratio and sector_pe:
                 pe_vs_sector = round((pe_ratio - sector_pe) / sector_pe * 100, 1)
-
+ 
             results["relative"] = {
                 "method":           "Relative Valuation",
                 "description":      f"EPS × {sector} sector median P/E ({sector_pe}x)",
@@ -692,7 +692,7 @@ def get_convergence(
             }
         except Exception as e:
             results["relative"] = {"method": "Relative Valuation", "intrinsic_value": None, "error": str(e)}
-
+ 
         # ─────────────────────────────────────────────────────────────────────
         # METHOD 5 — HISTORICAL P/E MEAN REVERSION
         # Fair Value = EPS × 5-year average P/E
@@ -702,28 +702,42 @@ def get_convergence(
             hist_pe_value = None
             avg_hist_pe   = None
             hist_pe_years = 0
-
-            # Use cached price history to avoid extra yfinance calls
-            import yfinance as yf
-            hist_cache_key = f"hist_price:{raw_ticker}"
-            hist_price = _cache_get(hist_cache_key)
+ 
+            # STORE FIRST: daily closes from our own price_history table.
+            # yfinance only as fallback for tickers not yet price-backfilled.
+            hist_price = None
+            try:
+                from data_store import get_price_history
+                ph = get_price_history(raw_ticker, market, days=1900)
+                if ph and len(ph) > 200:
+                    import pandas as pd
+                    hist_price = pd.DataFrame(ph, columns=["Date", "Close"])
+                    hist_price["Date"] = pd.to_datetime(hist_price["Date"])
+                    hist_price = hist_price.set_index("Date")
+            except Exception:
+                hist_price = None
+ 
             if hist_price is None:
-                try:
-                    stock_yf   = yf.Ticker(raw_ticker)
-                    hist_price = _with_retry(
-                        lambda: stock_yf.history(period="5y", interval="1mo"),
-                        max_retries=3, base_delay=2.0
-                    )
-                    if hist_price is not None and not hist_price.empty:
-                        _cache_set(hist_cache_key, hist_price)
-                except Exception:
-                    hist_price = None
-
+                import yfinance as yf
+                hist_cache_key = f"hist_price:{raw_ticker}"
+                hist_price = _cache_get(hist_cache_key)
+                if hist_price is None:
+                    try:
+                        stock_yf   = yf.Ticker(raw_ticker)
+                        hist_price = _with_retry(
+                            lambda: stock_yf.history(period="5y", interval="1mo"),
+                            max_retries=3, base_delay=2.0
+                        )
+                        if hist_price is not None and not hist_price.empty:
+                            _cache_set(hist_cache_key, hist_price)
+                    except Exception:
+                        hist_price = None
+ 
             if hist_price is not None and not hist_price.empty:
                 # Get trailing EPS for each year from financials
                 ni_row   = find_row(income_df, "net income")
                 hist_pes = []
-
+ 
                 if ni_row and shares_outstanding:
                     for col in range(min(len(income_df.columns), 5)):
                         ni_hist = safe_float(income_df, ni_row, col)
@@ -740,7 +754,7 @@ def get_convergence(
                                         hist_pes.append(pe_yr)
                             except Exception:
                                 pass
-
+ 
                 if hist_pes:
                     avg_hist_pe   = sum(hist_pes) / len(hist_pes)
                     hist_pe_years = len(hist_pes)
@@ -752,7 +766,7 @@ def get_convergence(
                             h_eps = ni / shares_outstanding
                     if h_eps and h_eps > 0:
                         hist_pe_value = h_eps * avg_hist_pe
-
+ 
             results["historical_pe"] = {
                 "method":          "Historical P/E Reversion",
                 "description":     f"EPS × {hist_pe_years}-year avg P/E — mean reversion signal",
@@ -768,7 +782,7 @@ def get_convergence(
             }
         except Exception as e:
             results["historical_pe"] = {"method": "Historical P/E Reversion", "intrinsic_value": None, "error": str(e)}
-
+ 
         # ─────────────────────────────────────────────────────────────────────
         # CONSENSUS — Trimmed mean of valid intrinsic values
         # ─────────────────────────────────────────────────────────────────────
@@ -777,7 +791,7 @@ def get_convergence(
             for r in results.values()
             if r.get("intrinsic_value") is not None and r["intrinsic_value"] > 0
         ]
-
+ 
         consensus_value = None
         if valid_values:
             # Trimmed mean — drop highest and lowest if we have 4+ values
@@ -787,7 +801,7 @@ def get_convergence(
             else:
                 trimmed = sorted_vals
             consensus_value = sum(trimmed) / len(trimmed)
-
+ 
         # ─────────────────────────────────────────────────────────────────────
         # CONFIDENCE SCORE — % of models agreeing on direction (Buy/Sell)
         # ─────────────────────────────────────────────────────────────────────
@@ -796,7 +810,7 @@ def get_convergence(
         sell_signals = sum(1 for r in results.values()
                            if r.get("upside_pct") is not None and r["upside_pct"] < -10)
         total_valid  = sum(1 for r in results.values() if r.get("upside_pct") is not None)
-
+ 
         if total_valid > 0:
             dominant    = max(buy_signals, sell_signals)
             confidence  = round((dominant / total_valid) * 100)
@@ -804,12 +818,12 @@ def get_convergence(
         else:
             confidence  = 0
             direction   = "Neutral"
-
+ 
         # ─────────────────────────────────────────────────────────────────────
         # CONVERGENCE SIGNAL
         # ─────────────────────────────────────────────────────────────────────
         consensus_upside = upside(consensus_value, current_price)
-
+ 
         if confidence >= 80 and consensus_upside and consensus_upside > 20:
             convergence_signal = "Strong Buy"
         elif confidence >= 60 and consensus_upside and consensus_upside > 10:
@@ -820,24 +834,24 @@ def get_convergence(
             convergence_signal = "Sell"
         else:
             convergence_signal = "Hold / Inconclusive"
-
+ 
         # ─────────────────────────────────────────────────────────────────────
         # BUY ZONE (Margin of Safety applied to consensus)
         # ─────────────────────────────────────────────────────────────────────
         buy_zone = round(consensus_value * (1 - margin_of_safety), 2) if consensus_value else None
-
+ 
         at_buy_zone = (
             buy_zone is not None
             and current_price is not None
             and current_price <= buy_zone * 1.05  # within 5% of buy zone
         )
-
+ 
         # ─────────────────────────────────────────────────────────────────────
         # VALUE RANGE (bear / base / bull)
         # ─────────────────────────────────────────────────────────────────────
         bear_value = min(valid_values) if valid_values else None
         bull_value = max(valid_values) if valid_values else None
-
+ 
         # ─────────────────────────────────────────────────────────────────────
         # RESPONSE
         # ─────────────────────────────────────────────────────────────────────
@@ -848,10 +862,10 @@ def get_convergence(
             "market":       market,
             "data_source":  data_source,
             "current_price": current_price,
-
+ 
             # Individual model results
             "models": results,
-
+ 
             # Consensus
             "consensus": {
                 "intrinsic_value":   round(consensus_value, 2) if consensus_value else None,
@@ -863,7 +877,7 @@ def get_convergence(
                 "buy_signals":       buy_signals,
                 "sell_signals":      sell_signals,
             },
-
+ 
             # Buy zone
             "buy_zone": {
                 "price":          buy_zone,
@@ -874,14 +888,14 @@ def get_convergence(
                     if buy_zone and current_price and current_price > buy_zone else "Below buy zone"
                 ) if buy_zone else "N/A",
             },
-
+ 
             # Value range
             "value_range": {
                 "bear": round(bear_value, 2) if bear_value else None,
                 "base": round(consensus_value, 2) if consensus_value else None,
                 "bull": round(bull_value, 2) if bull_value else None,
             },
-
+ 
             # Model assumptions
             "assumptions": {
                 "wacc":                round(wacc, 4),
@@ -894,7 +908,7 @@ def get_convergence(
                 "terminal_growth":     terminal_growth_rate,
             },
         }
-
+ 
     except Exception as e:
         return {"error": str(e)}
 
