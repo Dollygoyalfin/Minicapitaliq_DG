@@ -368,9 +368,19 @@ def extract_financials_from_xbrl(xml_bytes: bytes, period_end: date) -> dict:
         total_debt = (borrow_cur or 0) + (borrow_nc or 0)
 
     # Cash flow (present in annual filings)
-    ocf   = _pick(f, "NetCashFlowsFromUsedInOperatingActivities",
-                  contains="operatingactivities")
+    # Exact tags first; the old loose contains="operatingactivities" could
+    # first-match unrelated small facts (e.g. adjustments lines), which
+    # produced ~5%-of-NI phantom OCF for TCS's XBRL years
+    ocf = _pick(f, "NetCashFlowsFromUsedInOperatingActivities",
+                "CashFlowsFromUsedInOperatingActivities",
+                "NetCashFlowFromOperatingActivities")
+    if ocf is None:
+        for k, v in f.items():
+            if "netcash" in k and "operatingactivities" in k:
+                ocf = v
+                break
     capex = _pick(f, "PurchaseOfPropertyPlantAndEquipment",
+                  "PaymentsToAcquirePropertyPlantAndEquipment",
                   contains="purchaseofproperty")
 
     return {
