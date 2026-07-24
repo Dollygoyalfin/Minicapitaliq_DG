@@ -12,6 +12,7 @@ on:
           - us
           - india
           - both
+          - prices
 
 jobs:
   backfill:
@@ -37,6 +38,14 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           FMP_API_KEY:  ${{ secrets.FMP_API_KEY }}
         run: python ingest.py backfill_us_full
+
+      - name: Backfill Prices (5y daily, both markets)
+        if: ${{ inputs.target == 'prices' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          FMP_API_KEY:  ${{ secrets.FMP_API_KEY }}
+        run: python ingest.py backfill_prices both
 
       - name: Backfill India (Nifty 500)
         if: ${{ inputs.target == 'india' || inputs.target == 'both' }}
