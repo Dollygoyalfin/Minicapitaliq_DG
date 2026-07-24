@@ -2370,3 +2370,241 @@ DCF DATA:
 
     except Exception as e:
         return {"error": f"AI Verdict failed: {e}"}
+
+# ── QUALITY & MOAT SCORE + RED-FLAG CHECKLIST (paste into main.py) ────────────
+# Buffett/Munger-style quality assessment computed from the store's
+# multi-year statements. No new data sources needed.
+
+@app.get("/quality")
+def get_quality(
+    ticker: str = Query(...),
+    market: str = Query("us"),
+    source: str = Query("auto"),
+):
+    try:
+        info, income_df, balance_df, cashflow_df, data_source = get_company_data(
+            ticker=ticker, market=market, source=source
+        )
+
+        def series(df, *keywords, n=6):
+            """Yearly values (newest first) for the first fuzzy-matched row."""
+            if df is None or df.empty:
+                return []
+            for idx in df.index:
+                if all(k.lower() in idx.lower() for k in keywords):
+                    out = []
+                    for col in df.columns[:n]:
+                        try:
+                            v = float(df.loc[idx, col])
+                            out.append(None if v != v else v)
+                        except Exception:
+                            out.append(None)
+                    return out
+            return []
+
+        revenue  = series(income_df, "total revenue")
+        ni       = series(income_df, "net income")
+        expenses = series(income_df, "total expenses")
+        interest = series(income_df, "interest", "expense")
+        depr     = series(income_df, "depreciation") or series(cashflow_df, "depreciation")
+        equity   = series(balance_df, "stockholders equity") or series(balance_df, "total equity")
+        debt     = series(balance_df, "total debt")
+        ocf      = series(cashflow_df, "operating cash flow")
+        capex    = series(cashflow_df, "capital expenditure")
+
+        years_used = sum(1 for v in revenue if v is not None)
+        if years_used < 2:
+            return {"error": "Insufficient multi-year data for quality scoring.",
+                    "data_source": data_source}
+
+        sector       = info.get("sector") or "Unknown"
+        is_financial = sector in ("Financial Services", "Financials", "Banking")
+
+        def pair(a, b):
+            return [(x, y) for x, y in zip(a, b) if x is not None and y is not None]
+
+        caveats = []
+
+        # ── Component 1: ROE consistency (25) ────────────────────────────────
+        roe_years = [n_ / e for n_, e in pair(ni, equity) if e]
+        roe_score, roe_detail = 0, "insufficient data"
+        if roe_years:
+            avg_roe   = sum(roe_years) / len(roe_years)
+            steady    = sum(1 for r in roe_years if r >= 0.12) / len(roe_years)
+            roe_score = round(min(avg_roe / 0.15, 1.0) * 15 + steady * 10)
+            roe_score = max(0, min(25, roe_score))
+            roe_detail = (f"avg ROE {avg_roe*100:.1f}% over {len(roe_years)} yrs; "
+                          f"{steady*100:.0f}% of years above 12%")
+
+        # ── Component 2: Margin stability (20) ───────────────────────────────
+        margins = [(r - e) / r for r, e in pair(revenue, expenses) if r]
+        m_score, m_detail = 0, "insufficient data"
+        if len(margins) >= 2:
+            avg_m  = sum(margins) / len(margins)
+            spread = max(margins) - min(margins)
+            stability = max(0.0, 1.0 - spread / max(abs(avg_m), 0.05) / 2)
+            m_score = round(min(max(avg_m, 0) / 0.15, 1.0) * 10 + stability * 10)
+            m_score = max(0, min(20, m_score))
+            m_detail = f"avg operating margin {avg_m*100:.1f}%; range {min(margins)*100:.1f}%–{max(margins)*100:.1f}%"
+
+        # ── Component 3: Cash conversion (15) ────────────────────────────────
+        conv = [o / n_ for o, n_ in pair(ocf, ni) if n_ and n_ > 0]
+        c_score, c_detail = 0, "cash flow data unavailable"
+        if conv:
+            avg_conv = sum(conv) / len(conv)
+            c_score  = round(min(max(avg_conv, 0) / 0.9, 1.0) * 15)
+            c_detail = f"operating cash flow averages {avg_conv*100:.0f}% of net income"
+        else:
+            caveats.append("Cash conversion unscored — OCF not available in store for this company.")
+
+        # ── Component 4: Balance-sheet strength (20) ─────────────────────────
+        b_score, b_detail = 0, "insufficient data"
+        de_now = cover_now = None
+        de_pairs = pair(debt, equity)
+        if de_pairs and de_pairs[0][1]:
+            de_now = de_pairs[0][0] / de_pairs[0][1]
+        cov_pairs = pair(ni, interest)
+        if cov_pairs and cov_pairs[0][1]:
+            # approximate EBIT coverage: (NI + interest) / interest
+            cover_now = (cov_pairs[0][0] + cov_pairs[0][1]) / cov_pairs[0][1]
+        if is_financial:
+            b_score  = 12
+            b_detail = "financial-sector: leverage metrics not comparable; neutral score"
+            caveats.append("Financial-sector company — D/E and coverage excluded from scoring.")
+        else:
+            s = 0
+            if de_now is not None:
+                s += 10 if de_now < 0.5 else 7 if de_now < 1.0 else 3 if de_now < 2.0 else 0
+            if cover_now is not None:
+                s += 10 if cover_now > 8 else 7 if cover_now > 4 else 3 if cover_now > 2 else 0
+            elif de_now is not None and de_now < 0.1:
+                s += 8   # effectively debt-free
+            b_score  = min(20, s)
+            b_detail = (f"D/E {de_now:.2f}" if de_now is not None else "D/E n/a") + \
+                       (f"; interest coverage ~{cover_now:.1f}x" if cover_now is not None else "")
+
+        # ── Component 5: Growth quality (20) ─────────────────────────────────
+        g_score, g_detail = 0, "insufficient data"
+        rev_clean = [v for v in revenue if v is not None]
+        ni_clean  = [v for v in ni if v is not None]
+        if len(rev_clean) >= 3 and rev_clean[-1] > 0:
+            yrs  = len(rev_clean) - 1
+            cagr = (rev_clean[0] / rev_clean[-1]) ** (1 / yrs) - 1
+            up_years = sum(1 for i in range(len(rev_clean) - 1)
+                           if rev_clean[i] > rev_clean[i + 1])
+            steadiness = up_years / (len(rev_clean) - 1)
+            lever = 0
+            if len(ni_clean) >= 3 and ni_clean[-1] > 0 and ni_clean[0] > 0:
+                ni_cagr = (ni_clean[0] / ni_clean[-1]) ** (1 / (len(ni_clean) - 1)) - 1
+                lever = 5 if ni_cagr >= cagr else 2
+            g_score  = round(min(max(cagr, 0) / 0.12, 1.0) * 10 + steadiness * 5 + lever)
+            g_score  = max(0, min(20, g_score))
+            g_detail = f"revenue CAGR {cagr*100:.1f}%; grew in {up_years}/{len(rev_clean)-1} years"
+
+        quality_score = roe_score + m_score + c_score + b_score + g_score
+        grade = ("A" if quality_score >= 80 else "B" if quality_score >= 65
+                 else "C" if quality_score >= 50 else "D" if quality_score >= 35 else "F")
+
+        # ── Munger Red-Flag Checklist ────────────────────────────────────────
+        flags = []
+
+        def flag(name, status, detail):
+            flags.append({"check": name, "status": status, "detail": detail})
+
+        if not is_financial:
+            if cover_now is not None:
+                flag("Interest coverage above 2x",
+                     "pass" if cover_now > 2 else "fail",
+                     f"~{cover_now:.1f}x")
+            else:
+                flag("Interest coverage above 2x", "na", "interest expense not reported")
+            if de_now is not None:
+                flag("Debt/Equity below 2x",
+                     "pass" if de_now < 2 else "fail", f"{de_now:.2f}")
+        else:
+            flag("Leverage checks", "na", "not comparable for financial-sector companies")
+
+        fcf_years = [(o - abs(cx)) for o, cx in pair(ocf, capex)]
+        if fcf_years:
+            neg = sum(1 for f_ in fcf_years if f_ < 0)
+            flag("Free cash flow positive in most years",
+                 "pass" if neg <= len(fcf_years) // 2 else "fail",
+                 f"negative FCF in {neg}/{len(fcf_years)} years")
+        else:
+            flag("Free cash flow positive in most years", "na", "OCF/capex not available")
+
+        if conv:
+            flag("Earnings backed by cash (OCF ≥ 50% of NI)",
+                 "pass" if (sum(conv) / len(conv)) >= 0.5 else "fail",
+                 f"avg {sum(conv)/len(conv)*100:.0f}%")
+
+        if len(rev_clean) >= 3:
+            declining = (rev_clean[0] < rev_clean[1] < rev_clean[2])
+            flag("Revenue not in multi-year decline",
+                 "fail" if declining else "pass",
+                 "declined 2+ consecutive years" if declining else "no sustained decline")
+
+        eq_clean = [v for v in equity if v is not None]
+        if len(eq_clean) >= 2 and ni_clean:
+            shrinking_bad = eq_clean[0] < eq_clean[-1] and ni_clean[0] is not None and ni_clean[0] < 0
+            flag("Equity base not eroding through losses",
+                 "fail" if shrinking_bad else "pass",
+                 "equity shrinking while loss-making" if shrinking_bad else "intact")
+
+        if len(margins) >= 3:
+            collapse = margins[0] < max(margins) * 0.7 and max(margins) > 0
+            flag("No margin collapse from peak",
+                 "warn" if collapse else "pass",
+                 f"current {margins[0]*100:.1f}% vs peak {max(margins)*100:.1f}%"
+                 if collapse else "margins near historical range")
+
+        flag("Promoter share pledging", "na",
+             "not yet tracked — planned data source (India)")
+
+        fail_count = sum(1 for f_ in flags if f_["status"] == "fail")
+
+        # ── Owner Earnings (Buffett 1986) ────────────────────────────────────
+        owner = None
+        shares = info.get("sharesOutstanding")
+        if ni_clean and shares:
+            d0 = next((v for v in depr if v is not None), 0) or 0
+            cx_vals = [abs(v) for v in capex if v is not None]
+            maint_capex = (sorted(cx_vals)[len(cx_vals) // 2] if cx_vals else d0)
+            oe = ni_clean[0] + d0 - maint_capex
+            r, g = 0.10, 0.03
+            if oe > 0:
+                owner = {
+                    "owner_earnings":       round(oe, 0),
+                    "per_share_value":      round(oe * (1 + g) / (r - g) / shares, 2),
+                    "assumptions":          {"discount": r, "growth": g,
+                                             "maint_capex": "median capex (proxy)"},
+                }
+            else:
+                owner = {"owner_earnings": round(oe, 0), "per_share_value": None,
+                         "note": "negative owner earnings — capex exceeds NI + depreciation"}
+
+        caveats.append(f"Scored on {years_used} years of data; "
+                       "longer histories give stronger signals.")
+
+        return {
+            "ticker":        ticker.upper(),
+            "market":        market,
+            "sector":        sector,
+            "data_source":   data_source,
+            "quality_score": quality_score,
+            "grade":         grade,
+            "components": {
+                "roe_consistency":   {"score": roe_score, "max": 25, "detail": roe_detail},
+                "margin_stability":  {"score": m_score,  "max": 20, "detail": m_detail},
+                "cash_conversion":   {"score": c_score,  "max": 15, "detail": c_detail},
+                "balance_sheet":     {"score": b_score,  "max": 20, "detail": b_detail},
+                "growth_quality":    {"score": g_score,  "max": 20, "detail": g_detail},
+            },
+            "red_flags":      flags,
+            "red_flag_count": fail_count,
+            "owner_earnings": owner,
+            "years_used":     years_used,
+            "caveats":        caveats,
+        }
+    except Exception as e:
+        return {"error": str(e)}
