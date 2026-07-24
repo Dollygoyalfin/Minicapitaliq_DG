@@ -114,8 +114,15 @@ def ingest_one(ticker: str, market: str):
         if market == "india" and not raw_ticker.endswith(".NS"):
             raw_ticker += ".NS"
 
-        # Enrich US sector from constituents CSV when SEC SIC mapping failed
-        if market == "us" and info.get("sector") in (None, "Unknown"):
+        # US sector: GICS from constituents CSV is authoritative — always
+        # prefer it over the crude SIC-range mapping (which e.g. filed
+        # Apple under Industrials)
+        if market == "us":
+            if not US_SECTOR_MAP:
+                try:
+                    fetch_us_universe()   # lazily loads US_SECTOR_MAP
+                except Exception:
+                    pass
             gics = US_SECTOR_MAP.get(raw_ticker)
             if gics:
                 _g2s = {
