@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import pathlib
 
+
 # Set yfinance to use a persistent session with headers to reduce rate limiting
 try:
     import yfinance as yf
@@ -33,6 +34,7 @@ try:
     yf.utils._session = _yf_session
 except Exception:
     pass
+
 
 app = FastAPI()
 
@@ -366,6 +368,7 @@ def get_financials(
         }
     except Exception as e:
         return {"error": str(e)}
+
 
 # ── Sector P/E medians (hardcoded, update quarterly) ──────────────────────────
 SECTOR_PE_MEDIANS = {
@@ -911,6 +914,7 @@ def get_convergence(
  
     except Exception as e:
         return {"error": str(e)}
+ 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  /dcf  — yfinance for India default, FMP for US / Advanced
