@@ -99,12 +99,13 @@ def audit():
                 if conv < 0.2 or conv > 3.0:
                     add(tkr, "C1", f"FY{fy} OCF/NI = {conv:.2f} (suspicious)")
 
-            # C2 — capex vs revenue
-            if capex and rev and rev > 0 and abs(capex) > 0.6 * rev:
+            # C2 — capex vs revenue (skip build-out sectors where this is normal)
+            heavy = (meta.get("sector") or "") in ("Utilities", "Energy", "Real Estate")
+            if not heavy and capex and rev and rev > 0 and abs(capex) > 0.6 * rev:
                 add(tkr, "C2", f"FY{fy} capex {abs(capex)/rev*100:.0f}% of revenue")
 
             # C3 — capex vs depreciation (skip financials)
-            if (not is_fin and capex and row["depr"] and row["depr"] > 0
+            if (not is_fin and not heavy and capex and row["depr"] and row["depr"] > 0
                     and abs(capex) > 4 * row["depr"]):
                 add(tkr, "C3", f"FY{fy} capex {abs(capex)/row['depr']:.1f}x depreciation")
 
@@ -163,16 +164,28 @@ def audit():
     print("=" * 70)
     print(f"\nCompanies with at least one flag: {len(flags)} "
           f"({len(flags)/max(len(companies),1)*100:.0f}%)")
-    print("\nFlags by check:")
+    tier1 = {"M1", "D2", "C1", "E1", "R1", "B2"}   # usually a data problem
+    tier2 = {"B1", "R2", "C2", "C3", "D1"}          # often real accounting
+    print("\n--- TIER 1: likely DATA ERRORS (investigate) ---")
     for code, n in check_counts.most_common():
-        print(f"  {code}: {n}")
+        if code in tier1:
+            print(f"  {code}: {n}")
+    print("\n--- TIER 2: unusual but often REAL (buybacks, capex cycles,")
+    print("             demergers, distress, COVID recovery) ---")
+    for code, n in check_counts.most_common():
+        if code in tier2:
+            print(f"  {code}: {n}")
     print("\nCompleteness gaps:")
     for k, n in sorted(null_census.items()):
         print(f"  {k}: {n}")
     print("\n" + "=" * 70)
-    print("TOP 40 MOST-FLAGGED COMPANIES")
+    print("TOP 40 — RANKED BY TIER-1 (DATA ERROR) FLAGS")
     print("=" * 70)
-    ranked = sorted(flags.items(), key=lambda kv: len(kv[1]), reverse=True)[:40]
+    def t1_count(fl):
+        return sum(1 for f_ in fl if f_.split(":")[0] in
+                   {"M1", "D2", "C1", "E1", "R1", "B2"})
+    ranked = sorted(flags.items(), key=lambda kv: (t1_count(kv[1]), len(kv[1])),
+                    reverse=True)[:40]
     for tkr, fl in ranked:
         meta = companies[tkr]
         print(f"\n{tkr} [{meta['market']}, {meta['source']}] — {len(fl)} flags")
