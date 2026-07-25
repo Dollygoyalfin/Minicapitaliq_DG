@@ -274,14 +274,38 @@ def _has_tag(facts: dict, tag: str) -> bool:
     return tag in facts.get("facts", {}).get("us-gaap", {})
 
 
+def _latest_val(facts: dict, tag: str):
+    d = _get_concept_annual(facts, tag) or {}
+    if not d:
+        return None
+    return d[max(d.keys())]
+
+
+def _material(facts: dict, tag: str, ref: float, threshold: float = 0.2) -> bool:
+    """True only if this tag carries a MATERIAL share of the company's income
+    statement. Many ordinary companies incidentally report a small
+    OperatingLeaseLeaseIncome (subleasing office space) — presence alone must
+    never reclassify them as a REIT."""
+    v = _latest_val(facts, tag)
+    return v is not None and ref and v >= threshold * ref
+
+
 def _detect_filer_profile(facts: dict) -> str:
-    if _has_tag(facts, "PremiumsEarnedNet"):
+    # Reference scale: the largest ordinary revenue line reported
+    ref = 0.0
+    for t in ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+              "SalesRevenueNet"):
+        v = _latest_val(facts, t)
+        if v and v > ref:
+            ref = v
+
+    if _material(facts, "PremiumsEarnedNet", ref):
         return "insurance"
-    if (_has_tag(facts, "InterestAndDividendIncomeOperating")
-            or _has_tag(facts, "InterestIncomeExpenseNet")):
+    if (_material(facts, "InterestAndDividendIncomeOperating", ref)
+            or _material(facts, "InterestIncomeExpenseNet", ref)):
         return "bank"
-    if (_has_tag(facts, "OperatingLeaseLeaseIncome")
-            or _has_tag(facts, "RealEstateRevenueNet")):
+    if (_material(facts, "OperatingLeaseLeaseIncome", ref, 0.5)
+            or _material(facts, "RealEstateRevenueNet", ref, 0.5)):
         return "reit"
     if _has_tag(facts, "RegulatedAndUnregulatedOperatingRevenue"):
         return "utility"
@@ -439,17 +463,13 @@ def _compose_instant(facts: dict, tags: list):
     return out
 
 
-def _compose_revenue(facts: dict, profile: str):
-    """Returns ({year: revenue}, {year: basis_string})."""
-    rules = REVENUE_RULES.get(profile, REVENUE_RULES["standard"])
+def _revenue_by_rules(facts: dict, rules: dict):
     result, basis = {}, {}
-
     for tag in rules["totals"]:
         for y, v in (_get_concept_annual(facts, tag) or {}).items():
             if v is not None and y not in result:
                 result[y] = v
                 basis[y]  = f"total:{tag}"
-
     if rules["parts"]:
         part_data = [(t, _get_concept_annual(facts, t) or {}) for t in rules["parts"]]
         all_years = set()
@@ -463,6 +483,47 @@ def _compose_revenue(facts: dict, profile: str):
                 result[y] = sum(v for _, v in present)
                 basis[y]  = "sum:" + "+".join(t for t, _ in present)
     return result, basis
+
+
+def _compose_revenue(facts: dict, profile: str):
+    """Standard extraction is authoritative. Industry composition is only
+    allowed to REPLACE it for a year where the standard figure is missing or
+    STRUCTURALLY IMPOSSIBLE (revenue below that year's depreciation or
+    interest expense). By construction this can only fix broken years — it
+    can never regress a year that was already extracting correctly."""
+    std, std_basis = _revenue_by_rules(facts, REVENUE_RULES["standard"])
+    if profile == "standard":
+        return std, std_basis
+
+    ind, ind_basis = _revenue_by_rules(
+        facts, REVENUE_RULES.get(profile, REVENUE_RULES["standard"]))
+
+    dep = _get_concept_annual(facts, "DepreciationDepletionAndAmortization",
+                              "DepreciationAndAmortization") or {}
+    iex = _get_concept_annual(facts, "InterestExpense") or {}
+
+    def violations(v, y):
+        if v is None or v <= 0:
+            return 99
+        n = 0
+        d, x = dep.get(y), iex.get(y)
+        if d and v < d:
+            n += 1
+        if x and v < x:
+            n += 1
+        return n
+
+    out, basis = {}, {}
+    for y in set(std) | set(ind):
+        s, i = std.get(y), ind.get(y)
+        vs, vi = violations(s, y), violations(i, y)
+        if vi < vs:                       # industry rescues a broken year
+            out[y], basis[y] = i, ind_basis.get(y, "industry")
+        elif s is not None:               # standard stands (default)
+            out[y], basis[y] = s, std_basis.get(y, "standard")
+        elif i is not None:
+            out[y], basis[y] = i, ind_basis.get(y, "industry")
+    return out, basis
 
 
 def _build_dataframes(facts: dict):
@@ -537,19 +598,22 @@ def _build_dataframes(facts: dict):
         cogs_y = cost_revenue.get(y)
         opex_y = operating_expenses.get(y)
 
+        # ORIGINAL priority preserved: CostsAndExpenses -> COGS+OpEx -> EBIT
+        # derivation. The only bug fix is that COGS+OpEx now requires BOTH to
+        # be present (treating a missing COGS as zero produced McKesson's 98%
+        # "operating margin"). Industry-specific totals are a LAST fallback,
+        # so a company that already extracted correctly is unaffected.
         candidates = []
-        # 1) this industry's authoritative total-expense line(s)
-        for _tag in EXPENSE_RULES.get(profile, EXPENSE_RULES["standard"]):
-            _v = _get_concept_annual(facts, _tag).get(y)
-            if _v is not None:
-                candidates.append(_v)
-        # 2) derived from EBIT (works across all industries when reported)
-        if rev_y is not None and oi_y is not None:
-            candidates.append(rev_y - oi_y)
-        # 3) COGS + OpEx — only when BOTH present (a missing COGS treated as
-        #    zero was what produced McKesson's 98% "operating margin")
+        if cae is not None:
+            candidates.append(cae)
         if cogs_y is not None and opex_y is not None:
             candidates.append(cogs_y + opex_y)
+        if rev_y is not None and oi_y is not None:
+            candidates.append(rev_y - oi_y)
+        for _tag in EXPENSE_RULES.get(profile, EXPENSE_RULES["standard"]):
+            _v = (_get_concept_annual(facts, _tag) or {}).get(y)
+            if _v is not None:
+                candidates.append(_v)
         if not candidates and cogs_y is not None:
             candidates.append(cogs_y)
 
