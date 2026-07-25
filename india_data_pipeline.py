@@ -316,12 +316,40 @@ def extract_financials_from_xbrl(xml_bytes: bytes, period_end: date) -> dict:
     """Map raw XBRL facts → our store schema fields (absolute rupees)."""
     f = parse_xbrl(xml_bytes, period_end)
 
-    revenue = _pick(f, "RevenueFromOperations", contains="revenuefromoperations")
-    total_income = _pick(f, "Income", "TotalIncome")
-    if revenue is None:
-        revenue = total_income
+    # ── Filer structure: Indian banks/NBFCs file a different statement from
+    # corporates (interest earned + other income; interest expended +
+    # operating expenses), so extraction is keyed to the structure THIS
+    # filing uses rather than one generic rule for all 500 companies.
+    is_bank = any(k in f for k in ("interestearned", "interestexpended",
+                                   "incomeinterestearned"))
+    is_nbfc = (not is_bank) and ("financecosts" in f
+                                 and _pick(f, "RevenueFromOperations") is None
+                                 and any("interestincome" in k for k in f))
 
-    expenses = _pick(f, "Expenses", "TotalExpenses", contains="totalexpense")
+    if is_bank or is_nbfc:
+        # Revenue = total income line when reported, else interest + other
+        revenue = _pick(f, "Income", "TotalIncome", "TotalRevenueFromOperations")
+        if revenue is None:
+            parts = [_pick(f, "InterestEarned", "IncomeInterestEarned",
+                           contains="interestearned"),
+                     _pick(f, "OtherIncome")]
+            parts = [p for p in parts if p is not None]
+            revenue = sum(parts) if parts else None
+        # Expenses = total expenditure line, else interest expended + opex
+        # (pre-provision basis — provisions are a separate, volatile line)
+        expenses = _pick(f, "TotalExpenditure", "Expenses", "TotalExpenses")
+        if expenses is None:
+            eparts = [_pick(f, "InterestExpended", contains="interestexpended"),
+                      _pick(f, "OperatingExpenses", "EmployeeBenefitExpense")]
+            eparts = [p for p in eparts if p is not None]
+            expenses = sum(eparts) if eparts else None
+    else:
+        # Corporate structure: revenue from operations is the top line
+        # (total income would wrongly fold in other income)
+        revenue = _pick(f, "RevenueFromOperations", contains="revenuefromoperations")
+        if revenue is None:
+            revenue = _pick(f, "Income", "TotalIncome")
+        expenses = _pick(f, "Expenses", "TotalExpenses", contains="totalexpense")
     pbt      = _pick(f, "ProfitBeforeTax", "ProfitLossBeforeTax",
                      contains="profitbeforetax")
     tax      = _pick(f, "TaxExpense", "TotalTaxExpenses", contains="taxexpense")
