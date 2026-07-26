@@ -972,6 +972,16 @@ def get_dcf(
             info, income_df, balance_df, cashflow_df, data_source = get_company_data(
                 ticker=ticker, market=market, source=source
             )
+
+            # ── DATA QUALITY GATE ───────────────────────────────────────────────
+            # Refuse to publish a valuation built on inputs that fail accounting
+            # sanity, rather than returning a confident wrong number.
+            _ok, _why, _dq_warnings = validate_financials(
+                info, income_df, balance_df, cashflow_df, market)
+            if not _ok:
+                return {"error": f"Data quality check failed: {_why}",
+                        "ticker": ticker.upper(), "market": market,
+                        "data_source": data_source}
         except Exception as fetch_err:
             return {"error": f"Could not fetch financial data: {fetch_err}"}
 
@@ -1506,6 +1516,7 @@ def get_dcf(
             "market":        market,
             "data_source":   data_source,
             "reliability_warning": reliability_warning,
+            "data_quality_warnings": _dq_warnings,
             "current_price": current_price,
 
             # Growth rates used
@@ -1560,7 +1571,6 @@ def get_dcf(
 
     except Exception as e:
         return {"error": str(e)}
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  /reverse-dcf  — What growth rate does the current price imply?
 # ─────────────────────────────────────────────────────────────────────────────
