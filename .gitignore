@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 Python 3.14/
 node_modules/
+sec_cache/
+nse_cache/
+
