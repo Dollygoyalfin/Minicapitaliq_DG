@@ -1,6 +1,5 @@
 """
 FMP Data Layer for MiniTradeIQ
-
 ================================
 Fetches financial statements from Financial Modeling Prep's /stable API
 and converts them into the SAME shape that yfinance returns
