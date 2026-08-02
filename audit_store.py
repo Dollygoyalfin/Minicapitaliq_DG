@@ -24,6 +24,8 @@ Notes: financial-sector companies are excluded from C1/C3/D1 because those
 ratios are legitimately extreme for banks/NBFCs — flags there would be noise.
 """
 
+AUDIT_BUILD = "2026-07-25c (build census)"
+
 from collections import defaultdict, Counter
 from data_store import _conn
 
@@ -31,10 +33,19 @@ from data_store import _conn
 def fetch_all():
     with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""SELECT ticker, market, sector, data_source,
-                                  shares_outstanding, eps FROM companies""")
+            try:
+                cur.execute("""SELECT ticker, market, sector, data_source,
+                                      shares_outstanding, eps, pipeline_build
+                               FROM companies""")
+                rows = cur.fetchall()
+            except Exception:
+                conn.rollback()
+                cur.execute("""SELECT ticker, market, sector, data_source,
+                                      shares_outstanding, eps FROM companies""")
+                rows = [r + (None,) for r in cur.fetchall()]
             companies = {r[0]: {"market": r[1], "sector": r[2], "source": r[3],
-                                "shares": r[4], "eps": r[5]} for r in cur.fetchall()}
+                                "shares": r[4], "eps": r[5], "build": r[6]}
+                         for r in rows}
             cur.execute("""SELECT ticker, fiscal_year, revenue, total_expenses,
                                   net_income, interest_expense, depreciation
                            FROM income_statements ORDER BY ticker, fiscal_year DESC""")
@@ -93,11 +104,20 @@ def audit():
             ocf, capex = cf.get("ocf"), cf.get("capex")
             b = bal.get(fy, {})
 
-            # C1 — cash conversion band (skip financials: deposit-flow noise)
+            # C1 — cash conversion vs NI + D&A.
+            # Comparing OCF to net income ALONE structurally flags every
+            # capital-intensive business (a REIT with NI 100 / D&A 400 should
+            # have OCF ~500). Adding depreciation back to the denominator is
+            # the meaningful test: OCF should approximate NI + D&A +/- working
+            # capital swings. Broken data (TCS's phantom OCF at 5% of NI,
+            # KEI's -0.00) still fails decisively.
             if not is_fin and ocf and ni and ni > 0:
-                conv = ocf / ni
-                if conv < 0.2 or conv > 3.0:
-                    add(tkr, "C1", f"FY{fy} OCF/NI = {conv:.2f} (suspicious)")
+                base = ni + (row["depr"] or 0)
+                if base > 0:
+                    conv = ocf / base
+                    if conv < 0.4 or conv > 2.5:
+                        add(tkr, "C1", f"FY{fy} OCF/(NI+D&A) = {conv:.2f} "
+                                       f"(OCF={ocf:.3g}, NI={ni:.3g})")
 
             # C2 — capex vs revenue (skip build-out sectors where this is normal)
             heavy = (meta.get("sector") or "") in ("Utilities", "Energy", "Real Estate")
@@ -160,7 +180,8 @@ def audit():
 
     # ── Report ───────────────────────────────────────────────────────────────
     print("=" * 70)
-    print(f"STORE AUDIT v2 — {len(companies)} companies")
+    print(f"STORE AUDIT — build {AUDIT_BUILD}")
+    print(f"{len(companies)} companies")
     print("=" * 70)
     print(f"\nCompanies with at least one flag: {len(flags)} "
           f"({len(flags)/max(len(companies),1)*100:.0f}%)")
@@ -175,6 +196,11 @@ def audit():
     for code, n in check_counts.most_common():
         if code in tier2:
             print(f"  {code}: {n}")
+    print("\nPIPELINE BUILD THAT WROTE EACH ROW:")
+    _builds = Counter((m.get("build") or "unknown") for m in companies.values())
+    for _b, _n in _builds.most_common():
+        print(f"  {_n:>5}  {_b}")
+
     print("\nCompleteness gaps:")
     for k, n in sorted(null_census.items()):
         print(f"  {k}: {n}")
