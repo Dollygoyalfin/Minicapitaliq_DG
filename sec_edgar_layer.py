@@ -20,6 +20,9 @@ Usage:
     info, income_df, balance_df, cashflow_df = get_sec_company_data("AAPL")
 """
 
+SEC_LAYER_BUILD = "2026-07-25j (net income fallbacks)"
+
+
 import time
 import httpx
 import pandas as pd
@@ -132,11 +135,59 @@ def company_title(ticker: str) -> str:
 
 _FACTS_CACHE_MAX = 3   # companyfacts JSONs are multi-MB — keep RAM bounded
 
+# ── Disk cache ────────────────────────────────────────────────────────────────
+# companyfacts JSONs are 5-50MB each; downloading 503 of them takes hours.
+# The SEC data changes at most quarterly, but the PARSER changes constantly
+# during development — so cache raw JSON on disk and re-parse locally.
+# Set SEC_CACHE_DIR to change location, SEC_CACHE_DAYS=0 to force refresh.
+import os as _os
+import json as _json
+import gzip as _gzip
+
+_DISK_CACHE_DIR  = _os.environ.get("SEC_CACHE_DIR", "sec_cache")
+_DISK_CACHE_DAYS = float(_os.environ.get("SEC_CACHE_DAYS", "7"))
+
+
+def _disk_cache_path(cik: str) -> str:
+    return _os.path.join(_DISK_CACHE_DIR, f"{cik}.json.gz")
+
+
+def _disk_cache_read(cik: str):
+    if _DISK_CACHE_DAYS <= 0:
+        return None
+    path = _disk_cache_path(cik)
+    try:
+        age_days = (time.time() - _os.path.getmtime(path)) / 86400.0
+        if age_days > _DISK_CACHE_DAYS:
+            return None
+        with _gzip.open(path, "rt", encoding="utf-8") as fh:
+            return _json.load(fh)
+    except Exception:
+        return None
+
+
+def _disk_cache_write(cik: str, data: dict):
+    try:
+        _os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
+        with _gzip.open(_disk_cache_path(cik), "wt", encoding="utf-8") as fh:
+            _json.dump(data, fh)
+    except Exception:
+        pass
+
+
 def _fetch_company_facts(cik: str) -> dict:
     cache_key = f"sec_facts:{cik}"
     cached = _CIK_CACHE.get(cache_key)
     if cached and (time.time() - cached["time"]) < _CIK_CACHE_TTL:
         return cached["data"]
+
+    disk = _disk_cache_read(cik)
+    if disk is not None:
+        while len(_CIK_CACHE) >= _FACTS_CACHE_MAX:
+            oldest = min(_CIK_CACHE, key=lambda k: _CIK_CACHE[k]["time"])
+            del _CIK_CACHE[oldest]
+        _CIK_CACHE[cache_key] = {"data": disk, "time": time.time()}
+        return disk
 
     url = SEC_FACTS_URL.format(cik=cik)
     time.sleep(0.12)  # respect 10 req/sec limit
@@ -146,6 +197,7 @@ def _fetch_company_facts(cik: str) -> dict:
         raise RuntimeError(f"SEC companyfacts failed for CIK {cik}: {resp.status_code}")
 
     data = resp.json()
+    _disk_cache_write(cik, data)
     # Evict oldest entries beyond the cap (prevents unbounded RAM growth
     # on small servers — each cached facts dict can be tens of MB)
     while len(_CIK_CACHE) >= _FACTS_CACHE_MAX:
@@ -299,6 +351,21 @@ def _detect_filer_profile(facts: dict) -> str:
         if v and v > ref:
             ref = v
 
+    # If the filer publishes NO conventional revenue line, it is definitively
+    # not a standard filer — materiality cannot be judged against a zero
+    # reference, so fall back to presence-based classification.
+    if not ref:
+        if _has_tag(facts, "PremiumsEarnedNet"):
+            return "insurance"
+        if (_has_tag(facts, "InterestAndDividendIncomeOperating")
+                or _has_tag(facts, "InterestIncomeExpenseNet")):
+            return "bank"
+        if (_has_tag(facts, "OperatingLeaseLeaseIncome")
+                or _has_tag(facts, "RealEstateRevenueNet")):
+            return "reit"
+        if _has_tag(facts, "RegulatedAndUnregulatedOperatingRevenue"):
+            return "utility"
+
     if _material(facts, "PremiumsEarnedNet", ref):
         return "insurance"
     if (_material(facts, "InterestAndDividendIncomeOperating", ref)
@@ -396,6 +463,53 @@ DEPRECIATION_RULES = {
 }
 
 
+def _compose_revenue(facts: dict, profile: str):
+    """Standard extraction is authoritative. The industry series replaces it
+    only if the standard series is structurally impossible MORE OFTEN — and
+    the decision is made ONCE for the whole company, so the series never
+    switches source between years."""
+    std, std_basis = _revenue_by_rules(facts, REVENUE_RULES["standard"])
+    if profile == "standard":
+        if std:
+            return std, std_basis
+        # Standard extraction found nothing at all — try every industry's
+        # component set rather than returning a company with no revenue.
+        for _prof, _rules in REVENUE_RULES.items():
+            if _prof == "standard" or not _rules.get("parts"):
+                continue
+            alt, alt_basis = _revenue_by_rules(facts, _rules)
+            if alt:
+                return alt, alt_basis
+        return std, std_basis
+
+    ind, ind_basis = _revenue_by_rules(
+        facts, REVENUE_RULES.get(profile, REVENUE_RULES["standard"]))
+
+    dep = _get_concept_annual(facts, "DepreciationDepletionAndAmortization",
+                              "DepreciationAndAmortization") or {}
+    iex = _get_concept_annual(facts, "InterestExpense") or {}
+
+    def violation_rate(series):
+        if not series:
+            return 1.0
+        bad = 0
+        for y, v in series.items():
+            if v is None or v <= 0:
+                bad += 1
+                continue
+            d, x = dep.get(y), iex.get(y)
+            if (d and v < d) or (x and v < x):
+                bad += 1
+        return bad / len(series)
+
+    vs, vi = violation_rate(std), violation_rate(ind)
+    if vi < vs:                    # industry series is structurally sounder
+        return ind, ind_basis
+    if std:
+        return std, std_basis
+    return ind, ind_basis
+
+
 def _compose_by_rules(facts: dict, rules: dict):
     """Totals first (authoritative single line); else SUM the components."""
     result, basis = {}, {}
@@ -464,66 +578,104 @@ def _compose_instant(facts: dict, tags: list):
 
 
 def _revenue_by_rules(facts: dict, rules: dict):
-    result, basis = {}, {}
+    """Pick ONE concept for the whole series, never a different tag per year.
+
+    A source that flips mid-series (Revenues in FY2024, a small fee-income
+    tag in FY2023) manufactures fake growth rates like -84% / +579% — and
+    DCF projections are driven by exactly those year-over-year changes, so
+    an inconsistent series is more damaging than a uniformly imperfect one.
+    Selection = best year coverage, ties broken by the rules' priority order.
+    """
+    # Select by year coverage first. Among concepts with (near-)equal
+    # coverage, prefer the one with the larger median value: an aggregate
+    # revenue line cannot be SMALLER than a concept nested inside it
+    # (ASC-606 contract revenue is a subset of total Revenues). Extra Space
+    # Storage reports both — Revenues ~$3.3B and contract revenue ~$0.16B of
+    # tenant fees — and list-order tiebreaking picked the $0.16B line.
+    import statistics as _stats
+    _cands = []
     for tag in rules["totals"]:
-        for y, v in (_get_concept_annual(facts, tag) or {}).items():
-            if v is not None and y not in result:
-                result[y] = v
-                basis[y]  = f"total:{tag}"
-    if rules["parts"]:
-        part_data = [(t, _get_concept_annual(facts, t) or {}) for t in rules["parts"]]
-        all_years = set()
-        for _, d in part_data:
-            all_years |= set(d.keys())
-        for y in all_years:
-            if y in result:
+        d = _get_concept_annual(facts, tag) or {}
+        if d:
+            _cands.append((tag, d))
+
+    best_tag, best_data, best_cov = None, {}, 0
+    if _cands:
+        _top_cov = max(len(d) for _, d in _cands)
+        _finalists = [(t, d) for t, d in _cands if len(d) >= _top_cov - 1]
+        best_tag, best_data = max(
+            _finalists,
+            key=lambda td: _stats.median([v for v in td[1].values() if v is not None] or [0]))
+        best_cov = len(best_data)
+
+    if best_cov:
+        result = dict(best_data)
+        basis  = {y: f"total:{best_tag}" for y in best_data}
+        # Gap-fill missing years from the other candidate tags, but ONLY when
+        # the value is scale-consistent with its nearest known year. This keeps
+        # full coverage (a missing latest year breaks the DCF entirely) while
+        # still blocking the order-of-magnitude source flips that fabricated
+        # -84% / +579% growth rates.
+        for tag in rules["totals"]:
+            if tag == best_tag:
                 continue
-            present = [(t, d[y]) for t, d in part_data if d.get(y) is not None]
-            if present:
-                result[y] = sum(v for _, v in present)
-                basis[y]  = "sum:" + "+".join(t for t, _ in present)
-    return result, basis
+            for y, v in (_get_concept_annual(facts, tag) or {}).items():
+                if y in result or v is None or v <= 0:
+                    continue
+                nearest = min(result.keys(), key=lambda yy: abs(yy - y), default=None)
+                if nearest is None:
+                    continue
+                ref = result[nearest]
+                if ref and 0.33 <= v / ref <= 3.0:
+                    result[y] = v
+                    basis[y]  = f"fill:{tag}"
 
+        # Still-missing years: compose from this industry's COMPONENTS.
+        # Banks in particular often stop publishing a single Revenues line
+        # for the newest year while the components (interest income +
+        # non-interest income) are present — previously unreachable because
+        # the totals branch never fell through to parts.
+        parts = rules.get("parts", [])
+        if parts:
+            pdata = [(t, _get_concept_annual(facts, t) or {}) for t in parts]
+            pdata = [(t, d) for t, d in pdata if d]
+            if pdata:
+                pyears = set()
+                for _, d in pdata:
+                    pyears |= set(d.keys())
+                for y in sorted(pyears):
+                    if y in result:
+                        continue
+                    present = [(t, d[y]) for t, d in pdata if d.get(y) is not None]
+                    if not present:
+                        continue
+                    v = sum(val for _, val in present)
+                    nearest = min(result.keys(), key=lambda yy: abs(yy - y),
+                                  default=None)
+                    if nearest is None:
+                        continue
+                    ref = result[nearest]
+                    if ref and v > 0 and 0.33 <= v / ref <= 3.0:
+                        result[y] = v
+                        basis[y]  = "fill_sum:" + "+".join(t for t, _ in present)
+        return result, basis
 
-def _compose_revenue(facts: dict, profile: str):
-    """Standard extraction is authoritative. Industry composition is only
-    allowed to REPLACE it for a year where the standard figure is missing or
-    STRUCTURALLY IMPOSSIBLE (revenue below that year's depreciation or
-    interest expense). By construction this can only fix broken years — it
-    can never regress a year that was already extracting correctly."""
-    std, std_basis = _revenue_by_rules(facts, REVENUE_RULES["standard"])
-    if profile == "standard":
-        return std, std_basis
-
-    ind, ind_basis = _revenue_by_rules(
-        facts, REVENUE_RULES.get(profile, REVENUE_RULES["standard"]))
-
-    dep = _get_concept_annual(facts, "DepreciationDepletionAndAmortization",
-                              "DepreciationAndAmortization") or {}
-    iex = _get_concept_annual(facts, "InterestExpense") or {}
-
-    def violations(v, y):
-        if v is None or v <= 0:
-            return 99
-        n = 0
-        d, x = dep.get(y), iex.get(y)
-        if d and v < d:
-            n += 1
-        if x and v < x:
-            n += 1
-        return n
-
-    out, basis = {}, {}
-    for y in set(std) | set(ind):
-        s, i = std.get(y), ind.get(y)
-        vs, vi = violations(s, y), violations(i, y)
-        if vi < vs:                       # industry rescues a broken year
-            out[y], basis[y] = i, ind_basis.get(y, "industry")
-        elif s is not None:               # standard stands (default)
-            out[y], basis[y] = s, std_basis.get(y, "standard")
-        elif i is not None:
-            out[y], basis[y] = i, ind_basis.get(y, "industry")
-    return out, basis
+    # No single total line — compose from this industry's components, using
+    # only years where the SAME component set is available
+    parts = rules.get("parts", [])
+    if not parts:
+        return {}, {}
+    part_data = [(t, _get_concept_annual(facts, t) or {}) for t in parts]
+    part_data = [(t, d) for t, d in part_data if d]
+    if not part_data:
+        return {}, {}
+    common_years = set.intersection(*[set(d.keys()) for _, d in part_data])
+    if not common_years:                      # fall back to the widest part
+        t, d = max(part_data, key=lambda td: len(td[1]))
+        return dict(d), {y: f"part:{t}" for y in d}
+    label = "sum:" + "+".join(t for t, _ in part_data)
+    result = {y: sum(d[y] for _, d in part_data) for y in common_years}
+    return result, {y: label for y in result}
 
 
 def _build_dataframes(facts: dict):
@@ -546,7 +698,20 @@ def _build_dataframes(facts: dict):
     # captured separately so downstream models never conflate the two
     interest_inc = _get_concept_annual(facts, "InvestmentIncomeInterest",
                                        "InterestAndDividendIncomeOperating")
-    net_income   = _get_concept_annual(facts, "NetIncomeLoss")
+    # Net income: NetIncomeLoss is the standard tag, but REITs and companies
+    # with non-controlling interests frequently report only ProfitLoss (total
+    # incl. NCI) or the available-to-common variant. AvalonBay had NI for just
+    # 2 of 6 years and Essex none at all — which silently broke ROE, cash
+    # conversion and tax-rate derivation downstream.
+    net_income = _get_concept_annual(facts, "NetIncomeLoss")
+    for _ni_tag in ("ProfitLoss",
+                    "NetIncomeLossAvailableToCommonStockholdersBasic",
+                    "IncomeLossFromContinuingOperationsIncludingPortionAttributableToNoncontrollingInterest",
+                    "IncomeLossFromContinuingOperations"):
+        _extra = _get_concept_annual(facts, _ni_tag) or {}
+        for _y, _v in _extra.items():
+            if _y not in net_income and _v is not None:
+                net_income[_y] = _v
     depreciation, depr_basis = _compose_by_rules(
         facts, DEPRECIATION_RULES.get(profile, DEPRECIATION_RULES["standard"]))
 
@@ -581,60 +746,95 @@ def _build_dataframes(facts: dict):
     def row(concept_dict):
         return [concept_dict.get(y) for y in years]
 
-    # ── Build "Total Expenses" = total costs including COGS ────────────────────
-    # Priority:
-    #   1. CostsAndExpenses (already total incl COGS + OpEx)
-    #   2. CostOfRevenue + OperatingExpenses (sum them)
-    #   3. Revenue - OperatingIncome (derive from EBIT)
-    # Build candidates per year, then choose the first that yields a PLAUSIBLE
-    # operating margin. The old code summed COGS+OpEx treating a missing COGS
-    # as zero — storing SG&A alone as "total expenses" and reporting a 98%
-    # margin for distributors like McKesson.
-    total_expenses_row = []
-    for y in years:
-        rev_y  = revenue.get(y)
-        oi_y   = operating_income.get(y)
-        cae    = costs_and_expenses.get(y)
-        cogs_y = cost_revenue.get(y)
-        opex_y = operating_expenses.get(y)
+    # ── Total Expenses: pick ONE consistent series for all years ─────────────
+    # A source that changes between years (CostsAndExpenses in FY24, a partial
+    # line in FY23) fabricates growth rates that flow straight into the DCF
+    # projection. Priority order preserved; COGS+OpEx requires BOTH present
+    # (treating a missing COGS as zero produced McKesson's 98% margin).
+    _exp_series = []
+    if costs_and_expenses:
+        _exp_series.append(("CostsAndExpenses", costs_and_expenses))
+    _both = {y: cost_revenue[y] + operating_expenses[y]
+             for y in set(cost_revenue) & set(operating_expenses)}
+    if _both:
+        _exp_series.append(("COGS+OpEx", _both))
+    _derived = {y: revenue[y] - operating_income[y]
+                for y in set(revenue) & set(operating_income)}
+    if _derived:
+        _exp_series.append(("Revenue-EBIT", _derived))
+    for _tag in EXPENSE_RULES.get(profile, EXPENSE_RULES["standard"]):
+        _d = _get_concept_annual(facts, _tag) or {}
+        if _d:
+            _exp_series.append((_tag, _d))
 
-        # ORIGINAL priority preserved: CostsAndExpenses -> COGS+OpEx -> EBIT
-        # derivation. The only bug fix is that COGS+OpEx now requires BOTH to
-        # be present (treating a missing COGS as zero produced McKesson's 98%
-        # "operating margin"). Industry-specific totals are a LAST fallback,
-        # so a company that already extracted correctly is unaffected.
-        candidates = []
-        if cae is not None:
-            candidates.append(cae)
-        if cogs_y is not None and opex_y is not None:
-            candidates.append(cogs_y + opex_y)
-        if rev_y is not None and oi_y is not None:
-            candidates.append(rev_y - oi_y)
-        for _tag in EXPENSE_RULES.get(profile, EXPENSE_RULES["standard"]):
-            _v = (_get_concept_annual(facts, _tag) or {}).get(y)
-            if _v is not None:
-                candidates.append(_v)
-        if not candidates and cogs_y is not None:
-            candidates.append(cogs_y)
+    # ── Choose the expense series, validated against accounting identities ──
+    # Two failures found in live SEC data:
+    #  (a) HP redefined CostsAndExpenses in FY2022 — it now excludes COGS, so
+    #      the tag reports $8.2B against $43.9B of cost of revenue. Total
+    #      expenses can NEVER be less than cost of revenue, so that series is
+    #      rejected outright rather than trusted for having long history.
+    #  (b) AvalonBay's CostsAndExpenses covers 8 years vs 16 for
+    #      OperatingIncomeLoss — measuring coverage over ALL history rejected
+    #      the correct series even though it covers every year we use.
+    #      Coverage is therefore measured over the TARGET years only.
+    def _covers(series):
+        return sum(1 for y in years if series.get(y) is not None)
 
-        # Take candidates in priority order, skipping only IMPOSSIBLE values.
-        # A margin band would wrongly reject genuinely high-margin businesses
-        # (exchanges, royalty companies ~85%) and genuinely loss-making ones
-        # (early-stage biotech, -500%). The only defensible rejection is a
-        # figure that cannot be total expenses: non-positive, or one implying
-        # ~zero costs while the filer explicitly reports cost of revenue.
-        chosen = None
-        for cand in candidates:
-            if cand is None or cand <= 0:
+    def _series_valid(series):
+        for y in years:
+            v = series.get(y)
+            if v is None:
                 continue
-            if (rev_y and rev_y > 0 and cogs_y is not None
-                    and (rev_y - cand) / rev_y > 0.95):
-                continue          # claims ~no costs, yet COGS is reported
-            chosen = cand
+            if v <= 0:
+                return False
+            cogs_y = cost_revenue.get(y)
+            if cogs_y and v < cogs_y * 0.999:      # expenses < COGS: impossible
+                return False
+            d_y = depreciation.get(y)
+            if d_y and v < d_y * 0.999:            # expenses < D&A: impossible
+                return False
+        # internal discontinuity not mirrored by revenue implies the filer
+        # changed the tag's meaning mid-series
+        ys = [y for y in years if series.get(y) is not None]
+        for a, b in zip(ys, ys[1:]):
+            va, vb = series[a], series[b]
+            ra, rb = revenue.get(a), revenue.get(b)
+            if vb and va / vb > 3.0 or (vb and va / vb < 0.34):
+                if ra and rb and rb > 0 and 0.5 <= (ra / rb) <= 2.0:
+                    return False                   # expenses jumped, revenue didn't
+        return True
+
+    _target_cov = max((_covers(d) for _, d in _exp_series), default=0)
+    _chosen_name, _chosen = None, {}
+    for _name, _d in _exp_series:                  # priority order preserved
+        if _covers(_d) >= _target_cov - 1 and _covers(_d) > 0 and _series_valid(_d):
+            _chosen_name, _chosen = _name, _d
             break
-        if chosen is None and candidates:
-            chosen = candidates[0]
-        total_expenses_row.append(chosen)
+    if not _chosen:                                # relax validity, keep coverage
+        for _name, _d in _exp_series:
+            if _covers(_d) >= _target_cov - 1 and _covers(_d) > 0:
+                _chosen_name, _chosen = _name, _d
+                break
+    if not _chosen and _exp_series:
+        _chosen_name, _chosen = max(_exp_series, key=lambda nd: _covers(nd[1]))
+
+    # Same treatment for expenses: fill gaps from other series when the value
+    # is scale-consistent, so a single missing year doesn't void the row.
+    _exp_final = dict(_chosen)
+    for _name, _d in _exp_series:
+        if _name == _chosen_name:
+            continue
+        for _y, _v in _d.items():
+            if _y in _exp_final or _v is None or _v <= 0:
+                continue
+            _near = min(_exp_final.keys(), key=lambda yy: abs(yy - _y), default=None)
+            if _near is None:
+                continue
+            _ref = _exp_final[_near]
+            if _ref and 0.33 <= _v / _ref <= 3.0:
+                _exp_final[_y] = _v
+
+    total_expenses_row = [_exp_final.get(y) for y in years]
 
     # Income statement DataFrame (index names match find_row searches)
     income_data = {
@@ -687,6 +887,24 @@ def _build_dataframes(facts: dict):
         income_df.attrs["filer_profile"]  = profile
         income_df.attrs["nwc_applicable"] = profile not in ("bank", "insurance")
         income_df.attrs["revenue_basis"]  = revenue_basis
+    except Exception:
+        pass
+
+    # Provenance for diagnosis: which concept produced each series
+    try:
+        income_df.attrs["extraction_report"] = {
+            "profile":        profile,
+            "revenue_basis":  revenue_basis,
+            "expense_source": _chosen_name,
+            "capex_basis":    capex_basis,
+            "depr_basis":     depr_basis,
+            "revenue":        dict(revenue),
+            "total_expenses": {y: v for y, v in zip(years, total_expenses_row)},
+            "operating_cf":   dict(operating_cf),
+            "net_income":     dict(net_income),
+            "depreciation":   dict(depreciation),
+            "capex":          dict(capex),
+        }
     except Exception:
         pass
 
@@ -896,3 +1114,50 @@ def _enrich_with_price(ticker: str, info: dict) -> dict:
             pass
 
     return info
+
+
+def diagnose(ticker: str) -> dict:
+    """Return exactly what was extracted and WHICH us-gaap concept produced it.
+    Removes guesswork when a company's numbers look wrong."""
+    cik = ticker_to_cik(ticker)
+    facts = _fetch_company_facts(cik)
+    income_df, balance_df, cashflow_df, ni, eq = _build_dataframes(facts)
+    rep = income_df.attrs.get("extraction_report", {})
+
+    print(f"\n=== {ticker}  (CIK {cik}) ===")
+    print(f"filer profile : {rep.get('profile')}")
+    print(f"expense source: {rep.get('expense_source')}")
+    print(f"\n{'year':<8}{'revenue':>16}{'expenses':>16}{'margin':>9}"
+          f"{'OCF':>16}{'NI':>14}{'D&A':>14}{'capex':>14}")
+    rev  = rep.get("revenue", {})
+    exp  = rep.get("total_expenses", {})
+    ocf  = rep.get("operating_cf", {})
+    nirep= rep.get("net_income", {})
+    dep  = rep.get("depreciation", {})
+    cx   = rep.get("capex", {})
+    for y in sorted(rev.keys(), reverse=True)[:6]:
+        r, e = rev.get(y), exp.get(y)
+        m = f"{(r-e)/r*100:7.1f}%" if (r and e is not None and r != 0) else "      -"
+        def f(v):
+            return f"{v:>16.4g}" if v is not None else f"{'-':>16}"
+        print(f"{y:<8}{f(r)}{f(e)}{m:>9}{f(ocf.get(y))}"
+              f"{str(round(nirep.get(y))) if nirep.get(y) is not None else '-':>14}"
+              f"{str(round(dep.get(y))) if dep.get(y) is not None else '-':>14}"
+              f"{str(round(cx.get(y))) if cx.get(y) is not None else '-':>14}")
+
+    print("\nrevenue concept by year:")
+    for y, b in sorted(rep.get("revenue_basis", {}).items(), reverse=True)[:6]:
+        print(f"  {y}: {b}")
+
+    print("\nAVAILABLE us-gaap revenue/expense concepts in this filing:")
+    ug = facts.get("facts", {}).get("us-gaap", {})
+    for tag in sorted(ug):
+        low = tag.lower()
+        if any(k in low for k in ("revenue", "costsandexpenses", "operatingexpenses",
+                                  "costofrevenue", "costofgoods", "benefitslosses",
+                                  "noninterestexpense", "operatingincomeloss")):
+            annual = _get_concept_annual(facts, tag)
+            if annual:
+                latest = max(annual)
+                print(f"  {tag:<62} {latest}: {annual[latest]:.4g}  ({len(annual)} yrs)")
+    return rep
