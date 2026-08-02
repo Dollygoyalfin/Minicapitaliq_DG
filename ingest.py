@@ -279,7 +279,25 @@ def refresh_all():
         print(f"⚠ price refresh failed: {e}")
 
 
+def _print_builds():
+    """Every run declares which code version produced it — prevents acting on
+    output from a stale local copy."""
+    print("--- BUILD STAMPS ---")
+    try:
+        from sec_edgar_layer import SEC_LAYER_BUILD
+        print(f"  sec_edgar_layer:     {SEC_LAYER_BUILD}")
+    except Exception:
+        print("  sec_edgar_layer:     (no stamp — STALE FILE)")
+    try:
+        from india_data_pipeline import INDIA_PIPELINE_BUILD
+        print(f"  india_data_pipeline: {INDIA_PIPELINE_BUILD}")
+    except Exception:
+        print("  india_data_pipeline: (no stamp — STALE FILE)")
+    print("--------------------")
+
+
 if __name__ == "__main__":
+    _print_builds()
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
 
     if cmd == "init":
@@ -301,6 +319,42 @@ if __name__ == "__main__":
             ingest_india_own(tkr)
         else:
             ingest_one(tkr, mkt)
+    elif cmd == "diagnose":
+        # python ingest.py diagnose HPQ
+        tkr = sys.argv[2] if len(sys.argv) > 2 else None
+        if not tkr:
+            print("Usage: python ingest.py diagnose TICKER")
+        else:
+            from sec_edgar_layer import diagnose
+            diagnose(tkr.upper())
+    elif cmd == "sample_us":
+        # Fast validation set: one company per statement archetype.
+        # Runs in ~1 minute so parser changes can be tested without a
+        # 3-hour full backfill.
+        SAMPLE = [
+            "AAPL",   # standard tech
+            "MSFT",   # standard tech (regression check)
+            "MCK",    # distributor — thin margins, COGS structure
+            "AVB",    # REIT — rental revenue
+            "EXR",    # REIT — storage
+            "AMT",    # REIT — towers
+            "MET",    # insurer — premiums + investment income
+            "HIG",    # insurer
+            "COF",    # bank — interest + non-interest income
+            "FITB",   # bank
+            "JPM",    # bank (large)
+            "DTE",    # utility
+            "DUK",    # utility
+            "XOM",    # energy — depletion, E&D capex
+            "OXY",    # energy
+            "WYNN",   # resort w/ incidental lease income (misdetection check)
+            "DGX",    # lab services w/ sublease income
+            "URI",    # equipment rental — heavy capex
+            "HPQ",    # negative equity from buybacks
+            "BG",     # commodity trader
+        ]
+        print(f"Sample backfill: {len(SAMPLE)} companies across all archetypes")
+        backfill(SAMPLE, "us")
     elif cmd == "backfill_us_full":
         backfill(fetch_us_universe(), "us")
     elif cmd == "backfill_india_full":
