@@ -19,6 +19,8 @@ Requirements: httpx, pdfplumber (fallback only)
 Env: GROQ_API_KEY (fallback only)
 """
 
+INDIA_PIPELINE_BUILD = "2026-07-25c (disk cache)"
+
 import os
 import io
 import re
@@ -57,7 +59,66 @@ def _nse():
     return client
 
 
+# ── Disk cache for NSE downloads ─────────────────────────────────────────────
+# XBRL filings are immutable once published, so caching them makes re-runs
+# nearly instant. The filings-list API is cached with a short TTL since new
+# results appear quarterly. NSE_CACHE_DAYS=0 forces fresh fetches.
+import hashlib as _hashlib
+
+_NSE_CACHE_DIR  = os.environ.get("NSE_CACHE_DIR", "nse_cache")
+_NSE_CACHE_DAYS = float(os.environ.get("NSE_CACHE_DAYS", "7"))
+
+
+def _nse_cache_path(url: str) -> str:
+    key = _hashlib.sha1(url.encode()).hexdigest()[:20]
+    return os.path.join(_NSE_CACHE_DIR, f"{key}.bin")
+
+
+def _nse_cache_read(url: str, immutable: bool = False):
+    if _NSE_CACHE_DAYS <= 0 and not immutable:
+        return None
+    path = _nse_cache_path(url)
+    try:
+        if not immutable:
+            age = (time.time() - os.path.getmtime(path)) / 86400.0
+            if age > _NSE_CACHE_DAYS:
+                return None
+        with open(path, "rb") as fh:
+            return fh.read()
+    except Exception:
+        return None
+
+
+def _nse_cache_write(url: str, content: bytes):
+    try:
+        os.makedirs(_NSE_CACHE_DIR, exist_ok=True)
+        with open(_nse_cache_path(url), "wb") as fh:
+            fh.write(content)
+    except Exception:
+        pass
+
+
+class _CachedResponse:
+    """Minimal stand-in for httpx.Response when served from disk."""
+    def __init__(self, content: bytes):
+        self.content = content
+        self.status_code = 200
+
+    @property
+    def text(self):
+        return self.content.decode("utf-8", errors="replace")
+
+    def json(self):
+        return json.loads(self.text)
+
+
 def _nse_get(url: str, retries: int = 3):
+    # XBRL/PDF documents never change once filed — cache them permanently
+    _immutable = url.endswith(".xml") or url.endswith(".pdf") or "/xbrl/" in url
+    _cached = _nse_cache_read(url, immutable=_immutable)
+    if _cached is not None:
+        return _CachedResponse(_cached)
+
     last_err = None
     for attempt in range(retries):
         try:
@@ -67,6 +128,7 @@ def _nse_get(url: str, retries: int = 3):
                 _nse_client = None
             resp = _nse().get(url)
             if resp.status_code == 200:
+                _nse_cache_write(url, resp.content)
                 return resp
             last_err = f"HTTP {resp.status_code}"
         except Exception as e:
@@ -563,7 +625,9 @@ def ingest_india_own(ticker: str) -> bool:
                       f"({data['_facts_found']} facts)")
         except Exception as e:
             print(f"  ⚠ FY{fy}: XBRL failed ({e})")
-        time.sleep(1.0)
+        # no rate-limit courtesy needed when served from local cache
+        if _nse_cache_read(info_f["xbrl"], immutable=True) is None:
+            time.sleep(1.0)
 
     # ── Fill years from yfinance (XBRL years keep priority; for new
     #    listings with zero XBRL this becomes the sole source) ───────────────
