@@ -111,6 +111,8 @@ def init_db():
         PRIMARY KEY (ticker, fiscal_year)
     );
 
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS pipeline_build TEXT;
+
     CREATE TABLE IF NOT EXISTS price_history (
         ticker  TEXT,
         date    DATE,
@@ -163,6 +165,19 @@ def upsert_company(info: dict, ticker: str, market: str, data_source: str):
     return _retry_db(lambda: _upsert_company_inner(info, ticker, market, data_source))
 
 
+def _current_build(market: str) -> str:
+    """Code version that produced this row — lets the audit prove whether a
+    backfill actually took effect instead of guessing from unchanged numbers."""
+    try:
+        if market.lower() == "india":
+            from india_data_pipeline import INDIA_PIPELINE_BUILD
+            return INDIA_PIPELINE_BUILD
+        from sec_edgar_layer import SEC_LAYER_BUILD
+        return SEC_LAYER_BUILD
+    except Exception:
+        return "unknown"
+
+
 def _upsert_company_inner(info: dict, ticker: str, market: str, data_source: str):
     with _conn() as conn:
         with conn.cursor() as cur:
@@ -170,8 +185,8 @@ def _upsert_company_inner(info: dict, ticker: str, market: str, data_source: str
                 INSERT INTO companies
                     (ticker, name, sector, industry, market, cik,
                      shares_outstanding, beta, total_debt, total_cash,
-                     book_value, eps, data_source, updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
+                     book_value, eps, data_source, pipeline_build, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
                 ON CONFLICT (ticker) DO UPDATE SET
                     name = EXCLUDED.name,
                     sector = EXCLUDED.sector,
@@ -185,12 +200,13 @@ def _upsert_company_inner(info: dict, ticker: str, market: str, data_source: str
                     book_value = EXCLUDED.book_value,
                     eps = EXCLUDED.eps,
                     data_source = EXCLUDED.data_source,
+                    pipeline_build = EXCLUDED.pipeline_build,
                     updated_at = NOW();
             """, (
                 ticker, info.get("longName"), info.get("sector"), info.get("industry"),
                 market, info.get("_cik"), info.get("sharesOutstanding"), info.get("beta"),
                 info.get("totalDebt"), info.get("totalCash"), info.get("bookValue"),
-                info.get("trailingEps"), data_source,
+                info.get("trailingEps"), data_source, _current_build(market),
             ))
         conn.commit()
 
