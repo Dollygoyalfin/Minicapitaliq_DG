@@ -1,0 +1,332 @@
+======================================================================
+STORE AUDIT — build 2026-07-25c (build census)
+1004 companies
+======================================================================
+
+Companies with at least one flag: 419 (42%)
+
+--- TIER 1: likely DATA ERRORS (investigate) ---
+  C1: 343
+  B2: 98
+  M1: 41
+  D2: 21
+  R1: 8
+  E1: 1
+
+--- TIER 2: unusual but often REAL (buybacks, capex cycles,
+             demergers, distress, COVID recovery) ---
+  C3: 196
+  B1: 154
+  R2: 113
+  D1: 40
+  C2: 15
+
+PIPELINE BUILD THAT WROTE EACH ROW:
+    503  2026-07-25j (net income fallbacks)
+    500  2026-07-25c (disk cache)
+      1  unknown
+
+Completeness gaps:
+  india: eps NULL: 1
+  india: no OCF any year: 13
+  india: sector Unknown: 1
+  india: shares_outstanding NULL: 1
+  us: eps NULL: 2
+  us: no OCF any year: 2
+  us: shares_outstanding NULL: 2
+
+======================================================================
+TOP 40 — RANKED BY TIER-1 (DATA ERROR) FLAGS
+======================================================================
+
+SYF [us, sec_edgar] — 12 flags
+   R2: FY2024 revenue YoY +426%
+   M1: FY2025 operating margin -888%
+   D2: FY2025 depreciation 99% of revenue
+   M1: FY2024 operating margin -218%
+   M1: FY2023 operating margin -1546%
+   D2: FY2023 depreciation 158% of revenue
+   ... and 6 more
+
+MMTC.NS [india, nse_xbrl+yfinance] — 12 flags
+   R2: FY2024 revenue YoY -100%
+   C1: FY2026 OCF/(NI+D&A) = -1.54 (OCF=-6.05e+09, NI=3.87e+09)
+   B2: FY2026 CA/CL = 20.83
+   M1: FY2026 operating margin -5467%
+   D2: FY2026 depreciation 151% of revenue
+   C1: FY2025 OCF/(NI+D&A) = -4.03 (OCF=-3.67e+09, NI=8.66e+08)
+   ... and 6 more
+
+JIOFIN.NS [india, nse_xbrl+yfinance] — 7 flags
+   R2: FY2026 revenue YoY +122%
+   R2: FY2024 revenue YoY +8653%
+   M1: FY2026 operating margin 82%
+   M1: FY2025 operating margin 122%
+   M1: FY2024 operating margin 82%
+   B2: FY2023 CA/CL = 13062.67
+   ... and 1 more
+
+UBL.NS [india, nse_xbrl+yfinance] — 5 flags
+   B2: FY2026 CA/CL = 26.34
+   C1: FY2025 OCF/(NI+D&A) = 0.32 (OCF=2.14e+09, NI=4.42e+09)
+   B2: FY2025 CA/CL = 39.49
+   C1: FY2024 OCF/(NI+D&A) = 0.12 (OCF=7.73e+08, NI=4.11e+09)
+   C1: FY2023 OCF/(NI+D&A) = -0.23 (OCF=-1.2e+09, NI=3.05e+09)
+
+PATANJALI.NS [india, nse_xbrl+yfinance] — 5 flags
+   C1: FY2026 OCF/(NI+D&A) = -0.16 (OCF=-3.33e+09, NI=1.81e+10)
+   B2: FY2026 CA/CL = 117.93
+   C1: FY2025 OCF/(NI+D&A) = 0.13 (OCF=1.97e+09, NI=1.3e+10)
+   B2: FY2025 CA/CL = 149.91
+   C1: FY2023 OCF/(NI+D&A) = -0.32 (OCF=-3.39e+09, NI=8.86e+09)
+
+IDEA.NS [india, nse_xbrl+yfinance] — 9 flags
+   C1: FY2026 OCF/(NI+D&A) = 0.34 (OCF=1.94e+11, NI=3.46e+11)
+   B1: FY2026 equity <= 0 while profitable
+   D1: FY2026 interest 48% of revenue
+   D1: FY2025 interest 56% of revenue
+   D2: FY2025 depreciation 51% of revenue
+   D1: FY2024 interest 61% of revenue
+   ... and 3 more
+
+RCL [us, sec_edgar] — 9 flags
+   R2: FY2022 revenue YoY +477%
+   C2: FY2021 capex 146% of revenue
+   M1: FY2021 operating margin -253%
+   D1: FY2021 interest 84% of revenue
+   D2: FY2021 depreciation 84% of revenue
+   C2: FY2020 capex 89% of revenue
+   ... and 3 more
+
+NCLH [us, sec_edgar] — 9 flags
+   R2: FY2022 revenue YoY +648%
+   C2: FY2021 capex 116% of revenue
+   M1: FY2021 operating margin -394%
+   D1: FY2021 interest 324% of revenue
+   D2: FY2021 depreciation 117% of revenue
+   C2: FY2020 capex 74% of revenue
+   ... and 3 more
+
+TTML.NS [india, nse_xbrl+yfinance] — 8 flags
+   D1: FY2026 interest 118% of revenue
+   D1: FY2025 interest 130% of revenue
+   B2: FY2024 CA/CL = 0.04
+   M1: FY2024 operating margin -104%
+   D1: FY2024 interest 136% of revenue
+   B2: FY2023 CA/CL = 0.03
+   ... and 2 more
+
+JWL.NS [india, nse_xbrl+yfinance] — 7 flags
+   C1: FY2026 OCF/(NI+D&A) = 0.04 (OCF=9.45e+07, NI=1.71e+09)
+   C3: FY2026 capex 8.0x depreciation
+   C1: FY2025 OCF/(NI+D&A) = 0.24 (OCF=1.04e+09, NI=3.82e+09)
+   C3: FY2025 capex 9.5x depreciation
+   B2: FY2025 CA/CL = 20.33
+   C1: FY2024 OCF/(NI+D&A) = -0.05 (OCF=-1.91e+08, NI=3.31e+09)
+   ... and 1 more
+
+KAYNES.NS [india, nse_xbrl+yfinance] — 7 flags
+   C1: FY2026 OCF/(NI+D&A) = -1.27 (OCF=-6e+09, NI=3.64e+09)
+   C3: FY2026 capex 11.6x depreciation
+   C1: FY2025 OCF/(NI+D&A) = -0.24 (OCF=-8.23e+08, NI=2.93e+09)
+   C3: FY2025 capex 21.2x depreciation
+   C1: FY2024 OCF/(NI+D&A) = 0.34 (OCF=7.01e+08, NI=1.83e+09)
+   C3: FY2024 capex 15.2x depreciation
+   ... and 1 more
+
+IRCON.NS [india, nse_xbrl+yfinance] — 6 flags
+   C1: FY2026 OCF/(NI+D&A) = -0.81 (OCF=-6.18e+09, NI=5.95e+09)
+   C1: FY2025 OCF/(NI+D&A) = -1.31 (OCF=-1.11e+10, NI=7.27e+09)
+   C3: FY2025 capex 8.9x depreciation
+   C1: FY2024 OCF/(NI+D&A) = -0.08 (OCF=-7.86e+08, NI=9.3e+09)
+   C3: FY2024 capex 8.4x depreciation
+   C1: FY2023 OCF/(NI+D&A) = -0.19 (OCF=-1.68e+09, NI=7.65e+09)
+
+AIIL.NS [india, nse_xbrl+yfinance] — 5 flags
+   R2: FY2024 revenue YoY +921%
+   B2: FY2025 CA/CL = 35.59
+   M1: FY2025 operating margin 88%
+   M1: FY2024 operating margin 95%
+   M1: FY2023 operating margin 340%
+
+HEG.NS [india, nse_xbrl+yfinance] — 5 flags
+   C1: FY2026 OCF/(NI+D&A) = 0.39 (OCF=2.13e+09, NI=3.38e+09)
+   B2: FY2026 CA/CL = 33.46
+   B2: FY2025 CA/CL = 29.31
+   C1: FY2023 OCF/(NI+D&A) = 0.18 (OCF=1.13e+09, NI=5.32e+09)
+   C3: FY2023 capex 4.7x depreciation
+
+JAINREC.NS [india, yfinance (no NSE XBRL yet)] — 5 flags
+   C1: FY2026 OCF/(NI+D&A) = -1.62 (OCF=-6.02e+09, NI=3.57e+09)
+   C3: FY2026 capex 7.1x depreciation
+   C1: FY2025 OCF/(NI+D&A) = 0.02 (OCF=3.82e+07, NI=2.2e+09)
+   C1: FY2024 OCF/(NI+D&A) = 0.19 (OCF=3.34e+08, NI=1.64e+09)
+   C1: FY2023 OCF/(NI+D&A) = 0.10 (OCF=1.09e+08, NI=9.18e+08)
+
+ASHOKLEY.NS [india, nse_xbrl+yfinance] — 4 flags
+   C1: FY2026 OCF/(NI+D&A) = -1.06 (OCF=-4.89e+10, NI=3.47e+10)
+   C1: FY2025 OCF/(NI+D&A) = 0.03 (OCF=1.28e+09, NI=3.11e+10)
+   C1: FY2024 OCF/(NI+D&A) = -1.73 (OCF=-6.26e+10, NI=2.7e+10)
+   C1: FY2023 OCF/(NI+D&A) = -1.99 (OCF=-4.5e+10, NI=1.36e+10)
+
+BHEL.NS [india, nse_xbrl+yfinance] — 4 flags
+   C1: FY2026 OCF/(NI+D&A) = 3.05 (OCF=5.84e+10, NI=1.6e+10)
+   C1: FY2025 OCF/(NI+D&A) = 2.72 (OCF=2.19e+10, NI=5.34e+09)
+   C1: FY2024 OCF/(NI+D&A) = -6.99 (OCF=-3.71e+10, NI=2.82e+09)
+   C1: FY2023 OCF/(NI+D&A) = -1.01 (OCF=-7.42e+09, NI=4.77e+09)
+
+COCHINSHIP.NS [india, nse_xbrl+yfinance] — 4 flags
+   C1: FY2026 OCF/(NI+D&A) = -1.46 (OCF=-1.23e+10, NI=7.17e+09)
+   C1: FY2025 OCF/(NI+D&A) = -0.31 (OCF=-2.84e+09, NI=8.27e+09)
+   C1: FY2024 OCF/(NI+D&A) = -0.20 (OCF=-1.72e+09, NI=7.83e+09)
+   C1: FY2023 OCF/(NI+D&A) = 5.06 (OCF=1.89e+10, NI=3.05e+09)
+
+ENGINERSIN.NS [india, nse_xbrl+yfinance] — 4 flags
+   B2: FY2026 CA/CL = 50.99
+   C1: FY2025 OCF/(NI+D&A) = 0.19 (OCF=1.17e+09, NI=5.8e+09)
+   B2: FY2025 CA/CL = 72.84
+   C1: FY2023 OCF/(NI+D&A) = -0.30 (OCF=-1.13e+09, NI=3.46e+09)
+
+GRSE.NS [india, nse_xbrl+yfinance] — 4 flags
+   C1: FY2025 OCF/(NI+D&A) = 0.03 (OCF=1.56e+08, NI=5.27e+09)
+   C1: FY2024 OCF/(NI+D&A) = -1.77 (OCF=-7.07e+09, NI=3.57e+09)
+   C1: FY2023 OCF/(NI+D&A) = 5.43 (OCF=1.45e+10, NI=2.28e+09)
+   C1: FY2022 OCF/(NI+D&A) = -1.58 (OCF=-3.56e+09, NI=1.9e+09)
+
+GRASIM.NS [india, nse_xbrl+yfinance] — 4 flags
+   C1: FY2026 OCF/(NI+D&A) = -1.40 (OCF=-1.78e+11, NI=4.97e+10)
+   C1: FY2025 OCF/(NI+D&A) = -1.69 (OCF=-1.72e+11, NI=3.71e+10)
+   C1: FY2024 OCF/(NI+D&A) = -0.72 (OCF=-1.07e+11, NI=9.93e+10)
+   C1: FY2023 OCF/(NI+D&A) = -0.81 (OCF=-1.27e+11, NI=1.11e+11)
+
+GODREJIND.NS [india, nse_xbrl+yfinance] — 4 flags
+   C1: FY2026 OCF/(NI+D&A) = -4.82 (OCF=-8.85e+10, NI=1.24e+10)
+   C1: FY2025 OCF/(NI+D&A) = -3.52 (OCF=-5.15e+10, NI=9.81e+09)
+   C1: FY2024 OCF/(NI+D&A) = -4.44 (OCF=-4.28e+10, NI=5.95e+09)
+   C1: FY2023 OCF/(NI+D&A) = -2.56 (OCF=-4.41e+10, NI=1.42e+10)
+
+GODREJPROP.NS [india, nse_xbrl+yfinance] — 4 flags
+   C1: FY2026 OCF/(NI+D&A) = -1.02 (OCF=-2e+10, NI=1.85e+10)
+   C1: FY2025 OCF/(NI+D&A) = -1.52 (OCF=-2.24e+10, NI=1.4e+10)
+   C1: FY2024 OCF/(NI+D&A) = -0.87 (OCF=-6.93e+09, NI=7.47e+09)
+   C1: FY2023 OCF/(NI+D&A) = -4.44 (OCF=-2.86e+10, NI=6.21e+09)
+
+PTCIL.NS [india, nse_xbrl+yfinance] — 9 flags
+   R2: FY2026 revenue YoY +96%
+   C1: FY2026 OCF/(NI+D&A) = -0.50 (OCF=-6.87e+08, NI=1.02e+09)
+   C3: FY2026 capex 8.6x depreciation
+   C1: FY2025 OCF/(NI+D&A) = 0.17 (OCF=1.36e+08, NI=6.1e+08)
+   C2: FY2025 capex 62% of revenue
+   C3: FY2025 capex 10.2x depreciation
+   ... and 3 more
+
+ONESOURCE.NS [india, yfinance (no NSE XBRL yet)] — 8 flags
+   R2: FY2025 revenue YoY +740%
+   R2: FY2024 revenue YoY +344%
+   D1: FY2024 interest 50% of revenue
+   D2: FY2024 depreciation 55% of revenue
+   C2: FY2023 capex 114% of revenue
+   M1: FY2023 operating margin -558%
+   ... and 2 more
+
+CCL [us, sec_edgar] — 7 flags
+   R2: FY2022 revenue YoY +538%
+   C2: FY2021 capex 189% of revenue
+   M1: FY2021 operating margin -372%
+   D1: FY2021 interest 84% of revenue
+   D2: FY2021 depreciation 117% of revenue
+   C2: FY2020 capex 65% of revenue
+   ... and 1 more
+
+ADANIENT.NS [india, nse_xbrl+yfinance] — 7 flags
+   C1: FY2026 OCF/(NI+D&A) = 0.15 (OCF=2.36e+10, NI=9.34e+10)
+   C3: FY2026 capex 5.4x depreciation
+   C1: FY2025 OCF/(NI+D&A) = 0.40 (OCF=4.51e+10, NI=7.11e+10)
+   C3: FY2025 capex 7.1x depreciation
+   C3: FY2024 capex 7.4x depreciation
+   C1: FY2023 OCF/(NI+D&A) = 3.63 (OCF=1.76e+11, NI=2.42e+10)
+   ... and 1 more
+
+INOXWIND.NS [india, nse_xbrl+yfinance] — 7 flags
+   R2: FY2025 revenue YoY +104%
+   R2: FY2024 revenue YoY +137%
+   C1: FY2026 OCF/(NI+D&A) = -0.98 (OCF=-5.98e+09, NI=4.05e+09)
+   C1: FY2025 OCF/(NI+D&A) = 0.22 (OCF=1.38e+09, NI=4.45e+09)
+   B2: FY2025 CA/CL = 28.23
+   C3: FY2024 capex 6.8x depreciation
+   ... and 1 more
+
+SWANCORP.NS [india, nse_xbrl+yfinance] — 7 flags
+   R2: FY2024 revenue YoY +249%
+   C1: FY2026 OCF/(NI+D&A) = -0.04 (OCF=-1.45e+08, NI=2.74e+09)
+   C1: FY2025 OCF/(NI+D&A) = -0.59 (OCF=-5.29e+09, NI=7.55e+09)
+   C3: FY2025 capex 10.7x depreciation
+   C1: FY2024 OCF/(NI+D&A) = 0.04 (OCF=2.59e+08, NI=5.86e+09)
+   C2: FY2023 capex 144% of revenue
+   ... and 1 more
+
+TITAGARH.NS [india, nse_xbrl+yfinance] — 6 flags
+   C3: FY2026 capex 7.2x depreciation
+   C1: FY2025 OCF/(NI+D&A) = -0.83 (OCF=-9.74e+08, NI=8.82e+08)
+   C3: FY2025 capex 8.0x depreciation
+   C1: FY2024 OCF/(NI+D&A) = 0.27 (OCF=8.58e+08, NI=2.86e+09)
+   C3: FY2024 capex 6.0x depreciation
+   C1: FY2023 OCF/(NI+D&A) = 0.25 (OCF=4.09e+08, NI=1.39e+09)
+
+ABDL.NS [india, nse_xbrl+yfinance] — 5 flags
+   R2: FY2024 revenue YoY +156%
+   C3: FY2026 capex 4.4x depreciation
+   C1: FY2025 OCF/(NI+D&A) = -2.66 (OCF=-6.78e+09, NI=1.95e+09)
+   C1: FY2024 OCF/(NI+D&A) = 3.11 (OCF=1.86e+09, NI=1.83e+07)
+   C1: FY2023 OCF/(NI+D&A) = 4.05 (OCF=2.3e+09, NI=1.6e+07)
+
+DATAPATTNS.NS [india, nse_xbrl+yfinance] — 5 flags
+   C1: FY2026 OCF/(NI+D&A) = 0.27 (OCF=8.02e+08, NI=2.71e+09)
+   C1: FY2025 OCF/(NI+D&A) = -0.38 (OCF=-8.99e+08, NI=2.22e+09)
+   C3: FY2025 capex 7.6x depreciation
+   C1: FY2023 OCF/(NI+D&A) = -0.14 (OCF=-1.84e+08, NI=1.24e+09)
+   C3: FY2023 capex 4.7x depreciation
+
+JYOTICNC.NS [india, nse_xbrl+yfinance] — 5 flags
+   C1: FY2026 OCF/(NI+D&A) = 0.14 (OCF=5.44e+08, NI=3.36e+09)
+   C3: FY2026 capex 6.4x depreciation
+   C1: FY2025 OCF/(NI+D&A) = -0.30 (OCF=-1.05e+09, NI=3.16e+09)
+   C3: FY2025 capex 8.5x depreciation
+   C1: FY2024 OCF/(NI+D&A) = -0.26 (OCF=-4.83e+08, NI=1.51e+09)
+
+SMCI [us, sec_edgar] — 5 flags
+   R2: FY2024 revenue YoY +110%
+   C1: FY2024 OCF/(NI+D&A) = -2.10 (OCF=-2.49e+09, NI=1.15e+09)
+   C3: FY2024 capex 4.1x depreciation
+   C1: FY2022 OCF/(NI+D&A) = -1.42 (OCF=-4.41e+08, NI=2.85e+08)
+   C1: FY2020 OCF/(NI+D&A) = -0.27 (OCF=-3.03e+07, NI=8.43e+07)
+
+CEG [us, sec_edgar] — 3 flags
+   C1: FY2024 OCF/(NI+D&A) = -0.38 (OCF=-2.46e+09, NI=3.75e+09)
+   C1: FY2023 OCF/(NI+D&A) = -1.28 (OCF=-5.3e+09, NI=1.62e+09)
+   C1: FY2020 OCF/(NI+D&A) = 0.14 (OCF=5.84e+08, NI=5.89e+08)
+
+ACC.NS [india, nse_xbrl+yfinance] — 3 flags
+   C1: FY2026 OCF/(NI+D&A) = -0.42 (OCF=-1.36e+10, NI=2.14e+10)
+   C1: FY2023 OCF/(NI+D&A) = -0.72 (OCF=-1.24e+10, NI=8.85e+09)
+   C1: FY2022 OCF/(NI+D&A) = -1.27 (OCF=-1.67e+10, NI=6.49e+09)
+
+BEL.NS [india, nse_xbrl+yfinance] — 3 flags
+   C1: FY2026 OCF/(NI+D&A) = 0.23 (OCF=1.54e+10, NI=6.06e+10)
+   C1: FY2025 OCF/(NI+D&A) = 0.10 (OCF=5.64e+09, NI=5.32e+10)
+   C1: FY2023 OCF/(NI+D&A) = 0.37 (OCF=1.27e+10, NI=2.99e+10)
+
+SUZLON.NS [india, nse_xbrl+yfinance] — 3 flags
+   C1: FY2026 OCF/(NI+D&A) = 0.35 (OCF=1.2e+10, NI=3.16e+10)
+   C1: FY2024 OCF/(NI+D&A) = 0.04 (OCF=3.32e+08, NI=6.6e+09)
+   C1: FY2023 OCF/(NI+D&A) = 0.15 (OCF=4.67e+09, NI=2.89e+10)
+
+GODFRYPHLP.NS [india, nse_xbrl+yfinance] — 3 flags
+   C1: FY2026 OCF/(NI+D&A) = 0.31 (OCF=5.18e+09, NI=1.53e+10)
+   C1: FY2025 OCF/(NI+D&A) = 0.08 (OCF=1.07e+09, NI=1.15e+10)
+   C1: FY2024 OCF/(NI+D&A) = 0.28 (OCF=2.9e+09, NI=8.84e+09)
+
+KIRLOSENG.NS [india, nse_xbrl+yfinance] — 3 flags
+   C1: FY2025 OCF/(NI+D&A) = -1.18 (OCF=-7.39e+09, NI=4.87e+09)
+   C1: FY2024 OCF/(NI+D&A) = -0.84 (OCF=-4.69e+09, NI=4.4e+09)
+   C1: FY2023 OCF/(NI+D&A) = -2.11 (OCF=-9.2e+09, NI=3.32e+09)
