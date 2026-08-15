@@ -531,6 +531,7 @@
   <div class="tab" onclick="switchTab('screener',this)">Screener</div>
   <div class="tab" onclick="switchTab('convergence',this)">🎯 Convergence</div>
   <div class="tab" onclick="switchTab('quality',this)">🏰 Quality</div>
+  <div class="tab" onclick="switchTab('baserates',this)">📊 Base Rates</div>
   <div class="tab" onclick="switchTab('verdict',this)">⚡ AI Verdict</div>
   <div class="tab" onclick="switchTab('ipos',this)">IPO Tracker</div>
   <div class="tab" onclick="switchTab('commodities',this)">Commodities</div>
@@ -703,6 +704,21 @@
   </div>
 </div>
 
+<!-- BASE RATES TAB -->
+<div id="tab-baserates" class="tab-content">
+  <div class="container">
+    <div style="margin-bottom:14px">
+      <button class="btn-primary" onclick="runBaseRates()">📊 Analyze Base Rates</button>
+    </div>
+    <div id="baserates-results">
+      <div class="state-empty"><span class="icon">📊</span>
+        What happened historically to stocks that looked like this one does today?
+        Enter a ticker and click <strong>Analyze Base Rates</strong>.
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="tab-verdict" class="tab-content">
   <div class="container">
     <div class="card">
@@ -763,6 +779,93 @@
   }
   function getTicker() { return document.getElementById("ticker").value.trim(); }
   function getMarket()  { return document.getElementById("market").value; }
+
+  async function runBaseRates() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("baserates-results", "Enter a ticker first."); return; }
+    document.getElementById("baserates-results").innerHTML =
+      '<div class="state-empty"><span class="icon">⏳</span>Scanning history for setups like ' + ticker + '…</div>';
+    try {
+      const res = await fetch(`${BASE}/baserates?ticker=${ticker}&market=${market}`);
+      const d = await res.json();
+      if (d.error && !d.signature) { setError("baserates-results", d.error); return; }
+
+      const p = (d.signature && d.signature.percentiles) || {};
+      const pctRow = (label, v, hint) => {
+        if (v == null) return "";
+        return `<div style="margin:8px 0">
+          <div style="display:flex;justify-content:space-between;font-size:0.85rem">
+            <span>${label}</span><span class="mono">${v}th pct</span>
+          </div>
+          <div style="background:rgba(255,255,255,0.08);border-radius:3px;height:6px;margin-top:3px">
+            <div style="width:${v}%;height:6px;border-radius:3px;background:var(--accent)"></div>
+          </div>
+          <div style="font-size:0.72rem;opacity:0.55">${hint}</div>
+        </div>`;
+      };
+
+      const sigHtml = `
+        <div style="font-weight:600;font-size:0.9rem;margin-bottom:6px">
+          Current Setup <span style="opacity:0.55;font-weight:400">
+          (percentile vs all ${market === "india" ? "Indian" : "US"} stocks, as of ${d.signature.as_of})</span>
+        </div>
+        ${pctRow("Position vs 200-day average", p.vs_200dma, "higher = further above its trend")}
+        ${pctRow("Distance from 52-week low", p.from_52wk_low, "low = near its 52-week low")}
+        ${pctRow("Distance from 52-week high", p.from_52wk_high, "high = near its 52-week high")}
+        ${pctRow("12-month momentum", p.momentum_12m, "higher = stronger past year")}
+        ${pctRow("3-month momentum", p.momentum_3m, "higher = stronger recent quarter")}
+        ${pctRow("Volatility", p.volatility, "higher = more volatile than peers")}`;
+
+      let rowsHtml = "";
+      const order = ["1m","3m","6m","12m"];
+      for (const h of order) {
+        const x = (d.horizons || {})[h];
+        if (!x) continue;
+        if (x.confidence === "insufficient") {
+          rowsHtml += `<tr><td>${h}</td><td colspan="4" style="opacity:0.6;font-size:0.8rem">${x.message}</td></tr>`;
+          continue;
+        }
+        const col = x.median_excess_pct > 0 ? "#22c55e" : x.median_excess_pct < 0 ? "#ef4444" : "inherit";
+        rowsHtml += `<tr>
+          <td class="mono">${h}</td>
+          <td class="mono" style="color:${col};font-weight:600">${x.median_excess_pct > 0 ? "+" : ""}${x.median_excess_pct}%</td>
+          <td class="mono">${x.beat_market_pct}%</td>
+          <td class="mono" style="opacity:0.7;font-size:0.8rem">${x.p25_pct}% … ${x.p75_pct}%</td>
+          <td style="font-size:0.75rem;opacity:0.6">n=${x.n_episodes} (${x.confidence})</td>
+        </tr>`;
+      }
+
+      const caveats = (d.caveats || []).map(c =>
+        `<li style="margin:4px 0">${c}</li>`).join("");
+
+      document.getElementById("baserates-results").innerHTML = `
+        <div class="result-card">
+          ${sigHtml}
+          <div style="margin-top:18px;font-weight:600;font-size:0.9rem">
+            What happened next, historically
+          </div>
+          <div style="font-size:0.78rem;opacity:0.6;margin-bottom:8px">
+            ${d.total_episodes} independent episodes where a stock matched this setup
+            (±${d.match_criteria.band_pp} percentile points on three dimensions)
+          </div>
+          <table style="width:100%;border-collapse:collapse;font-size:0.85rem">
+            <thead>
+              <tr style="opacity:0.6;font-size:0.75rem;text-align:left">
+                <th>Horizon</th><th>Median vs market</th><th>Beat market</th>
+                <th>Typical range</th><th></th>
+              </tr>
+            </thead>
+            <tbody>${rowsHtml}</tbody>
+          </table>
+          <div style="margin-top:14px;padding:10px;background:rgba(255,255,255,0.04);border-radius:4px">
+            <div style="font-size:0.78rem;font-weight:600;margin-bottom:4px">How to read this</div>
+            <ul style="margin:0;padding-left:16px;font-size:0.73rem;opacity:0.7">${caveats}</ul>
+          </div>
+        </div>`;
+    } catch (e) {
+      setError("baserates-results", "Base-rate analysis failed: " + e.message);
+    }
+  }
 
   async function runQuality() {
     const ticker = getTicker(), market = getMarket();
