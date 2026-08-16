@@ -30,7 +30,7 @@ import pandas as pd
 import numpy as np
 from data_store import _conn
 
-JOURNAL_BUILD = "2026-07-26a (initial)"
+JOURNAL_BUILD = "2026-07-26b (store-only, no live price calls)"
 
 
 def _connect_with_retry(attempts: int = 3):
@@ -105,7 +105,6 @@ def snapshot_quality_signals(limit: int = None):
     """Record today's Quality grades for every company in the store.
     Quality is deterministic from stored statements, so this can be
     computed in bulk without hitting any external API."""
-    from fmp_data_layer import get_company_data
     conn = _connect_with_retry()
     try:
         with conn.cursor() as cur:
@@ -116,21 +115,41 @@ def snapshot_quality_signals(limit: int = None):
     if limit:
         companies = companies[:limit]
 
-    print(f"Recording Quality signals for {len(companies)} companies...")
+    # Last stored price per ticker — a Quality grade does not depend on
+    # price, so fetching 1,000 live quotes just to stamp one on the record
+    # would be ~30 minutes of API calls and rate-limit failures for nothing.
+    conn = _connect_with_retry()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '120s'")
+            cur.execute("""
+                SELECT DISTINCT ON (ticker) ticker, price
+                FROM stock_signatures ORDER BY ticker, date DESC
+            """)
+            price_map = dict(cur.fetchall())
+    finally:
+        conn.close()
+
+    print(f"Recording Quality signals for {len(companies)} companies "
+          f"(store-only, no external calls)...")
     recorded, failed = 0, 0
     for i, (ticker, market) in enumerate(companies, 1):
         try:
             clean = ticker.replace(".NS", "")
-            # Reuse the same scoring logic the /quality endpoint uses by
-            # calling it through the store — no external calls.
-            info, inc, bal, cf, src = get_company_data(
-                ticker=clean, market=market, source="store")
+            from data_store import get_from_store
+            stored = get_from_store(clean, market)
+            if not stored:
+                failed += 1
+                continue
+            info, inc, bal, cf = stored[0], stored[1], stored[2], stored[3]
             grade, score = _quick_quality(inc, bal, cf, info)
             if grade:
                 record_signal(ticker, market, "quality", grade,
-                              price=info.get("currentPrice"),
+                              price=price_map.get(ticker),
                               detail={"score": score})
                 recorded += 1
+            else:
+                failed += 1
         except Exception:
             failed += 1
         if i % 100 == 0:
