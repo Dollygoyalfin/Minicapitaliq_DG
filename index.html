@@ -558,6 +558,37 @@
         <div class="param-group"><label>Market Return</label><input type="number" id="dcf-mr" value="0.10" step="0.01"/></div>
         <div class="param-group"><label>Margin of Safety</label><input type="number" id="dcf-mos" value="0.25" step="0.05"/></div>
       </div>
+
+      <details style="margin-bottom:14px">
+        <summary style="cursor:pointer;font-size:0.8rem;font-weight:600;padding:6px 0">
+          ⚙️ Modelling guardrails <span style="font-weight:400;opacity:0.6">
+          — deliberately conservative; these lower intrinsic value</span>
+        </summary>
+        <div style="padding:10px 0 4px">
+          <div style="font-size:0.73rem;opacity:0.65;margin-bottom:10px;line-height:1.5">
+            Each guardrail exists to stop a specific failure: unclamped revenue decline
+            compounds into nonsense, opex outgrowing revenue inverts margins, and an
+            implausibly low beta produces an unrealistically low discount rate.
+            They are conservative by design — widen them to see how much of the
+            valuation depends on them.
+          </div>
+          <div class="params-grid">
+            <div class="param-group"><label>Max Revenue Growth</label>
+              <input type="number" id="dcf-maxg" value="0.30" step="0.05"/></div>
+            <div class="param-group"><label>Min Revenue Growth</label>
+              <input type="number" id="dcf-ming" value="-0.05" step="0.05"/></div>
+            <div class="param-group"><label>Beta Floor</label>
+              <input type="number" id="dcf-betamin" value="0.50" step="0.1"/></div>
+            <div class="param-group"><label>Beta Ceiling</label>
+              <input type="number" id="dcf-betamax" value="2.50" step="0.1"/></div>
+            <div class="param-group"><label>Freeze Margins</label>
+              <select id="dcf-freeze" style="width:100%">
+                <option value="true" selected>Yes — opex can't outgrow revenue</option>
+                <option value="false">No — use raw opex growth</option>
+              </select></div>
+          </div>
+        </div>
+      </details>
       <div style="font-size:0.72rem;color:var(--muted);margin-bottom:16px;padding:10px 14px;background:var(--cream);border-radius:2px;border:1px solid var(--line)">
         💡 <strong>India (NSE)</strong> defaults: Risk-Free Rate <strong>0.07</strong>, Market Return <strong>0.13</strong> &nbsp;·&nbsp;
         <strong>US</strong> defaults: Risk-Free Rate <strong>0.04</strong>, Market Return <strong>0.10</strong> &nbsp;·&nbsp;
@@ -1050,11 +1081,41 @@
     const rf       = document.getElementById("dcf-rf").value       || 0.04;
     const mr       = document.getElementById("dcf-mr").value       || 0.10;
     const mos      = document.getElementById("dcf-mos").value      || 0.25;
+    const maxg     = document.getElementById("dcf-maxg").value     || 0.30;
+    const ming     = document.getElementById("dcf-ming").value     || -0.05;
+    const bmin     = document.getElementById("dcf-betamin").value  || 0.50;
+    const bmax     = document.getElementById("dcf-betamax").value  || 2.50;
+    const freeze   = document.getElementById("dcf-freeze").value   || "true";
 
     try {
-      const res = await fetch(`${BASE}/dcf?ticker=${ticker}&market=${market}&projection_years=${years}&terminal_growth_rate=${terminal}&risk_free_rate=${rf}&market_return=${mr}&margin_of_safety=${mos}`);
+      const res = await fetch(`${BASE}/dcf?ticker=${ticker}&market=${market}&projection_years=${years}&terminal_growth_rate=${terminal}&risk_free_rate=${rf}&market_return=${mr}&margin_of_safety=${mos}&max_revenue_growth=${maxg}&min_revenue_growth=${ming}&beta_floor=${bmin}&beta_ceiling=${bmax}&freeze_margins=${freeze}`);
       const d = await res.json();
       if (d.error) { setError("dcf-results", d.error); return; }
+
+      // Transparency: show which guardrails actually bound this valuation
+      let clampHtml = "";
+      const A = d.assumptions_applied;
+      if (A) {
+        const items = [];
+        if (A.revenue_growth && A.revenue_growth.clamped)
+          items.push(`Revenue growth capped: data showed <strong>${(A.revenue_growth.raw_from_data*100).toFixed(1)}%</strong>, model used <strong>${(A.revenue_growth.used*100).toFixed(1)}%</strong>`);
+        if (A.opex_growth && A.opex_growth.clamped)
+          items.push(`Opex growth frozen to revenue: data showed <strong>${(A.opex_growth.raw_from_data*100).toFixed(1)}%</strong>, model used <strong>${(A.opex_growth.used*100).toFixed(1)}%</strong>`);
+        if (A.beta && A.beta.clamped)
+          items.push(`Beta clamped: reported <strong>${A.beta.raw_from_data}</strong>, model used <strong>${A.beta.used}</strong>`);
+        if (items.length) {
+          clampHtml = `<div style="margin:12px 0;padding:10px 12px;background:rgba(234,179,8,0.08);border-left:3px solid #eab308;border-radius:2px">
+            <div style="font-size:0.78rem;font-weight:600;margin-bottom:4px">⚙️ Guardrails changed this valuation</div>
+            <ul style="margin:0;padding-left:16px;font-size:0.75rem;opacity:0.85">
+              ${items.map(i => `<li style="margin:3px 0">${i}</li>`).join("")}
+            </ul>
+            <div style="font-size:0.7rem;opacity:0.6;margin-top:6px">
+              Adjust under "Modelling guardrails" above to test how much the result depends on these.
+            </div>
+          </div>`;
+        }
+      }
+      window._dcfClampHtml = clampHtml;
 
       // Store for AI Verdict tab
       dcfCache = d;
@@ -1125,6 +1186,7 @@
       }).join('');
 
       document.getElementById("dcf-results").innerHTML = `
+        ${window._dcfClampHtml || ""}
         <div class="verdict-strip ${cls}">
           <div>
             <div class="verdict-main">${d.verdict ?? "—"}</div>
