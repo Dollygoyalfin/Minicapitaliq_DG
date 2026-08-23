@@ -2,9 +2,9 @@ name: Nightly Data Refresh
 
 on:
   schedule:
-    # 22:30 UTC = 4:00 AM IST — after US market close, before India opens
+    # 22:30 UTC = 4:00 AM IST — after US close, before India opens
     - cron: "30 22 * * *"
-  workflow_dispatch: {}   # allows manual "Run workflow" button for testing
+  workflow_dispatch: {}
 
 jobs:
   refresh:
@@ -13,23 +13,60 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run nightly refresh
+      # Scheduled runs must always fetch fresh filings — the disk caches are a
+      # local development accelerator, not something that should make
+      # production data stale.
+      - name: Refresh fundamentals (staleness-filtered, 200/night)
+        env:
+          DATABASE_URL:   ${{ secrets.DATABASE_URL }}
+          GROQ_API_KEY:   ${{ secrets.GROQ_API_KEY }}
+          FMP_API_KEY:    ${{ secrets.FMP_API_KEY }}
+          SEC_CACHE_DAYS: "0"
+          NSE_CACHE_DAYS: "0"
+        run: python ingest.py refresh
+
+      - name: Update price signatures (incremental, no full rewrite)
+        if: always()
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          FMP_API_KEY:  ${{ secrets.FMP_API_KEY }}
-        run: python ingest.py refresh
-      - name: Signal journal snapshot
+        run: python signature_engine.py update
+
+      - name: Fetch corporate announcements
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NSE_CACHE_DAYS: "0"
+        run: python news_engine.py fetch --days 3
+
+      - name: Record signal journal snapshot
+        if: always()
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python signal_journal.py snapshot
+
+      # The store re-certifies itself. If extraction quality regresses after a
+      # pipeline change, this surfaces it in the run log rather than waiting
+      # for someone to notice a wrong valuation.
+      - name: Data quality audit
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python audit_store.py > audit.txt 2>&1 || true
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report
+          path: audit.txt
+          retention-days: 30
