@@ -531,7 +531,9 @@
   <div class="tab" onclick="switchTab('screener',this)">Screener</div>
   <div class="tab" onclick="switchTab('convergence',this)">🎯 Convergence</div>
   <div class="tab" onclick="switchTab('quality',this)">🏰 Quality</div>
+  <div class="tab" onclick="switchTab('ideas',this)">💡 Ideas</div>
   <div class="tab" onclick="switchTab('baserates',this)">📊 Base Rates</div>
+  <div class="tab" onclick="switchTab('reversedcf',this)">🔄 Reverse DCF</div>
   <div class="tab" onclick="switchTab('verdict',this)">⚡ AI Verdict</div>
   <div class="tab" onclick="switchTab('ipos',this)">IPO Tracker</div>
   <div class="tab" onclick="switchTab('commodities',this)">Commodities</div>
@@ -590,7 +592,7 @@
         </div>
       </details>
       <div style="font-size:0.72rem;color:var(--muted);margin-bottom:16px;padding:10px 14px;background:var(--cream);border-radius:2px;border:1px solid var(--line)">
-        💡 <strong>India (NSE)</strong> defaults: Risk-Free Rate <strong>0.07</strong>, Market Return <strong>0.13</strong> &nbsp;·&nbsp;
+        💡 <strong>India (NSE)</strong> defaults: Risk-Free Rate <strong>0.04</strong>, Market Return <strong>0.10</strong> &nbsp;·&nbsp;
         <strong>US</strong> defaults: Risk-Free Rate <strong>0.04</strong>, Market Return <strong>0.10</strong> &nbsp;·&nbsp;
         Parameters auto-update when you switch market above.
       </div>
@@ -750,6 +752,60 @@
   </div>
 </div>
 
+<!-- IDEAS TAB -->
+<div id="tab-ideas" class="tab-content">
+  <div class="container">
+    <div style="font-size:0.78rem;opacity:0.75;margin-bottom:12px;line-height:1.55">
+      A <strong>screen</strong>, not a buy list. Each strategy below shows the
+      base rate this app measured on its own five years of data — including when
+      the result was <em>unfavourable</em>. Companies with governance red flags
+      (auditor resignations, promoter pledges, regulatory action) are excluded by
+      default.
+    </div>
+    <div class="params-grid" style="margin-bottom:12px">
+      <div class="param-group"><label>Strategy</label>
+        <select id="ideas-strategy" style="width:100%">
+          <option value="quality_momentum">Quality + Momentum (validated)</option>
+          <option value="clean_compounders">Clean Compounders (no timing)</option>
+          <option value="quality_value">Quality + Value (contrarian — see warning)</option>
+        </select></div>
+      <div class="param-group"><label>Min Quality Score</label>
+        <input type="number" id="ideas-minq" value="65" min="0" max="100" step="5"/></div>
+      <div class="param-group"><label>Exclude Red Flags</label>
+        <select id="ideas-flags" style="width:100%">
+          <option value="true" selected>Yes</option>
+          <option value="false">No</option>
+        </select></div>
+    </div>
+    <button class="btn-primary" onclick="runIdeas()">💡 Run Screen</button>
+    <div id="ideas-results" style="margin-top:14px">
+      <div class="state-empty"><span class="icon">💡</span>
+        Choose a strategy and run the screen.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- REVERSE DCF TAB -->
+<div id="tab-reversedcf" class="tab-content">
+  <div class="container">
+    <div style="font-size:0.78rem;opacity:0.7;margin-bottom:12px;line-height:1.5">
+      A normal DCF asks "what is this worth?". A reverse DCF asks the more useful
+      question: <strong>"what growth rate is the market already assuming?"</strong>
+      If the implied growth looks unachievable, the stock is priced for perfection.
+      If it looks trivially beatable, expectations may be too low.
+    </div>
+    <div style="margin-bottom:14px">
+      <button class="btn-primary" onclick="runReverseDCF()">🔄 Solve for Implied Growth</button>
+    </div>
+    <div id="reversedcf-results">
+      <div class="state-empty"><span class="icon">🔄</span>
+        Enter a ticker and solve for the growth rate implied by today's price.
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="tab-verdict" class="tab-content">
   <div class="container">
     <div class="card">
@@ -837,6 +893,116 @@
     } catch (parseErr) {
       throw new Error(`Server sent an unreadable response (HTTP ${res.status}): `
                     + text.slice(0, 120));
+    }
+  }
+
+  async function runIdeas() {
+    const market = getMarket();
+    const strat  = document.getElementById("ideas-strategy").value;
+    const minq   = document.getElementById("ideas-minq").value || 65;
+    const flags  = document.getElementById("ideas-flags").value;
+    setLoading("ideas-results", "Screening the universe...");
+    try {
+      const d = await safeFetch(`${BASE}/ideas?market=${market}&strategy=${strat}` +
+                                `&min_quality_score=${minq}&exclude_red_flags=${flags}&limit=25`);
+      if (d.error) { setError("ideas-results", d.error); return; }
+
+      const cur = market === "india" ? "₹" : "$";
+      const warn = d.strategy_warning ? `
+        <div style="padding:10px 12px;background:rgba(239,68,68,0.10);border-left:3px solid #ef4444;border-radius:2px;margin-bottom:10px;font-size:0.78rem">
+          <strong>⚠ Contrary evidence:</strong> ${d.strategy_warning}
+        </div>` : "";
+
+      const rows = (d.ideas || []).map((x, i) => `
+        <div style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.07)">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px">
+            <div>
+              <span class="mono" style="font-weight:700">${i+1}. ${x.ticker.replace(".NS","")}</span>
+              <span style="opacity:0.6;font-size:0.78rem"> ${x.name || ""} · ${x.sector || ""}</span>
+            </div>
+            <div class="mono" style="font-size:0.85rem">${cur}${(x.price||0).toLocaleString()}</div>
+          </div>
+          <div style="font-size:0.73rem;opacity:0.75;margin-top:4px">
+            ${(x.reasons||[]).join(" &nbsp;·&nbsp; ")}
+          </div>
+        </div>`).join("");
+
+      document.getElementById("ideas-results").innerHTML = `
+        <div class="result-card">
+          <div style="font-weight:600;font-size:0.9rem">${d.thesis}</div>
+          <div style="margin:8px 0;padding:10px 12px;background:rgba(255,255,255,0.04);border-radius:4px;font-size:0.78rem">
+            <strong>What this setup did historically:</strong><br>${d.historical_base_rate}
+          </div>
+          ${warn}
+          <div style="font-size:0.75rem;opacity:0.6;margin:10px 0 4px">
+            ${d.count} match${d.count===1?"":"es"} · quality ≥ ${d.filters_applied.min_quality_score}
+            ${d.filters_applied.red_flags_excluded ? "· red-flag companies excluded" : ""}
+          </div>
+          ${rows || '<div style="opacity:0.6;font-size:0.8rem;padding:10px 0">No stocks matched. Try lowering the quality threshold.</div>'}
+          <div style="margin-top:14px;padding:10px;background:rgba(255,255,255,0.04);border-radius:4px">
+            <div style="font-size:0.75rem;font-weight:600;margin-bottom:4px">Before acting on any of this</div>
+            <ul style="margin:0;padding-left:16px;font-size:0.71rem;opacity:0.7">
+              ${(d.disclaimers||[]).map(x=>`<li style="margin:3px 0">${x}</li>`).join("")}
+            </ul>
+          </div>
+        </div>`;
+    } catch (e) { setError("ideas-results", e.message); }
+  }
+
+  async function runReverseDCF() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("reversedcf-results", "Enter a ticker first."); return; }
+    setLoading("reversedcf-results", `Solving implied growth for ${ticker.toUpperCase()}...`);
+    try {
+      const d = await safeFetch(
+        `${BASE}/reverse-dcf?ticker=${ticker}&market=${market}` +
+        `&risk_free_rate=0.04&market_return=0.10&terminal_growth_rate=0.03&projection_years=5`);
+      if (d.error) { setError("reversedcf-results", d.error); return; }
+
+      const g   = d.implied_growth_rate;
+      const cur = market === "india" ? "₹" : "$";
+      const col = g == null ? "inherit" : g > 25 ? "#ef4444" : g > 15 ? "#eab308" : "#22c55e";
+      const read = g == null ? "" :
+        g > 25 ? "Very demanding — sustained growth at this rate is rare and usually short-lived."
+        : g > 15 ? "Ambitious — achievable for a strong franchise, but leaves little room for disappointment."
+        : g > 5  ? "Moderate — the market is assuming steady rather than spectacular growth."
+        : "Low — the market is pricing in little growth, or expects decline.";
+
+      const scen = (d.scenarios || []).map(s => `
+        <tr><td class="mono">${s.growth_rate ?? s.growth ?? "—"}%</td>
+            <td class="mono">${cur}${(s.implied_value ?? s.value ?? 0).toLocaleString()}</td>
+            <td style="font-size:0.78rem;opacity:0.7">${s.verdict ?? s.label ?? ""}</td></tr>`).join("");
+
+      document.getElementById("reversedcf-results").innerHTML = `
+        <div class="result-card">
+          <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap">
+            <div class="mono" style="font-size:2.4rem;font-weight:800;color:${col}">
+              ${g == null ? "—" : g + "%"}</div>
+            <div style="font-size:0.82rem;opacity:0.75">
+              implied annual revenue growth<br>
+              <span style="opacity:0.6">needed to justify today's price of
+              ${d.current_price ? cur + d.current_price.toLocaleString() : "—"}</span>
+            </div>
+          </div>
+          <div style="margin-top:10px;font-size:0.82rem">${read}</div>
+          <div style="margin-top:8px;font-size:0.75rem;opacity:0.6">
+            WACC ${d.wacc_used}% · terminal growth ${d.terminal_growth_rate}% ·
+            ${d.projection_years}-year model · source: ${d.data_source}
+          </div>
+          ${d.interpretation ? `<div style="margin-top:10px;padding:10px;background:rgba(255,255,255,0.04);border-radius:4px;font-size:0.8rem">${d.interpretation}</div>` : ""}
+          ${scen ? `<div style="margin-top:16px;font-weight:600;font-size:0.88rem">Scenarios</div>
+            <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-top:6px">
+              <thead><tr style="opacity:0.6;font-size:0.75rem;text-align:left">
+                <th>Growth</th><th>Implied value</th><th></th></tr></thead>
+              <tbody>${scen}</tbody></table>` : ""}
+          <div style="margin-top:12px;font-size:0.7rem;opacity:0.5">
+            Compare the implied rate against the company's actual historical growth
+            (see the Financials tab). A market assuming far more than the business
+            has ever delivered is the classic setup for disappointment.
+          </div>
+        </div>`;
+    } catch (e) {
+      setError("reversedcf-results", e.message);
     }
   }
 
@@ -934,6 +1100,12 @@
       '<div class="state-empty"><span class="icon">⏳</span>Scoring quality for ' + ticker + '…</div>';
     try {
       const __RES = await safeFetch(`${BASE}/quality?ticker=${ticker}&market=${market}`);
+      // Corporate events fetched in parallel — red flags belong next to the
+      // quality checklist, not on a separate screen you have to remember to open
+      let __EV = null;
+      try {
+        __EV = await safeFetch(`${BASE}/events?ticker=${ticker}&market=${market}&days=180`);
+      } catch (evErr) { __EV = null; }
       const d = __RES;
       if (d.error) { setError("quality-results", d.error); return; }
 
@@ -971,6 +1143,58 @@
            </div>`
         : `<div style="margin-top:14px;font-size:0.8rem;opacity:0.7">Owner earnings: ${oe.note || "n/a"}</div>`) : "";
 
+      // ── Corporate events block ──────────────────────────────────────────
+      let evHtml = "";
+      if (__EV && !__EV.error && (__EV.events || []).length) {
+        const cnt = __EV.counts || {};
+        const sevIcon  = { red_flag:"🔴", watch:"🟡", positive:"🟢", info:"⚪", neutral:"⚪" };
+        const sevLabel = { red_flag:"Red flag", watch:"Watch", positive:"Positive", info:"Info", neutral:"Info" };
+        const catName = c => c.replace(/_/g," ").replace(/\b\w/g, s=>s.toUpperCase());
+
+        const banner = (cnt.red_flag > 0)
+          ? `<div style="padding:10px 12px;background:rgba(239,68,68,0.10);border-left:3px solid #ef4444;border-radius:2px;margin-bottom:10px">
+               <div style="font-weight:700;font-size:0.85rem;color:#ef4444">
+                 ⚠ ${cnt.red_flag} red flag${cnt.red_flag>1?"s":""} in the last 180 days</div>
+               ${(__EV.explanations||[]).map(x=>`<div style="font-size:0.75rem;opacity:0.85;margin-top:5px">${x}</div>`).join("")}
+             </div>`
+          : `<div style="padding:8px 12px;background:rgba(34,197,94,0.08);border-left:3px solid #22c55e;border-radius:2px;margin-bottom:10px;font-size:0.8rem">
+               ✓ No red-flag filings in the last 180 days
+               <span style="opacity:0.6">— absence of flags is not a clean bill of health, only that nothing matching was filed.</span>
+             </div>`;
+
+        const list = (__EV.events||[]).slice(0,12).map(e=>`
+          <div style="display:flex;gap:9px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06)">
+            <span style="width:16px">${sevIcon[e.severity]||"⚪"}</span>
+            <div style="flex:1;min-width:0">
+              <div style="font-size:0.78rem">${e.headline.slice(0,150)}</div>
+              <div style="font-size:0.68rem;opacity:0.55">
+                ${e.date} · ${catName(e.category)} · ${sevLabel[e.severity]||"Info"}
+                ${e.url ? ` · <a href="${e.url}" target="_blank" rel="noopener" style="color:var(--accent)">filing</a>` : ""}
+              </div>
+            </div>
+          </div>`).join("");
+
+        evHtml = `
+          <div style="margin-top:18px">
+            <div style="font-weight:600;font-size:0.9rem;margin-bottom:8px">
+              Corporate Events <span style="opacity:0.55;font-weight:400">— last 180 days, NSE filings</span>
+            </div>
+            ${banner}
+            ${list}
+            <div style="font-size:0.68rem;opacity:0.5;margin-top:8px">
+              ${(__EV.caveats||[]).join(" ")}
+            </div>
+          </div>`;
+      } else if (market === "india") {
+        evHtml = `<div style="margin-top:16px;font-size:0.76rem;opacity:0.55">
+                    No corporate filings recorded for this company in the last 180 days.
+                  </div>`;
+      } else {
+        evHtml = `<div style="margin-top:16px;font-size:0.76rem;opacity:0.55">
+                    Corporate event tracking currently covers Indian listings only.
+                  </div>`;
+      }
+
       document.getElementById("quality-results").innerHTML = `
         <div class="result-card">
           <div style="display:flex;align-items:center;gap:18px;margin-bottom:6px">
@@ -982,6 +1206,7 @@
           <div style="margin-top:16px;font-weight:600;font-size:0.9rem">Munger Red-Flag Checklist</div>
           ${flags}
           ${oeHtml}
+          ${evHtml}
           <div style="margin-top:12px;font-size:0.72rem;opacity:0.5">${(d.caveats || []).join(" · ")}</div>
         </div>`;
     } catch (e) {
@@ -992,8 +1217,8 @@
   // Auto-update DCF and Verdict defaults when market changes
   document.getElementById("market").addEventListener("change", function() {
     const isIndia = this.value === "india";
-    const rf  = isIndia ? "0.07" : "0.04";
-    const mr  = isIndia ? "0.13" : "0.10";
+    const rf  = isIndia ? "0.04" : "0.04";
+    const mr  = isIndia ? "0.10" : "0.10";
     const tg  = isIndia ? "0.05" : "0.03";
     document.getElementById("dcf-rf").value      = rf;
     document.getElementById("dcf-mr").value      = mr;
@@ -1318,8 +1543,8 @@
     switchTab("convergence", document.querySelector(".tab-row .tab:nth-child(5)"));
     setLoading("convergence-results", `Running 5 valuation models for ${ticker.toUpperCase()}...`);
 
-    const rf  = document.getElementById("dcf-rf").value      || (market === "india" ? 0.07 : 0.04);
-    const mr  = document.getElementById("dcf-mr").value      || (market === "india" ? 0.13 : 0.10);
+    const rf  = document.getElementById("dcf-rf").value      || 0.04;
+    const mr  = document.getElementById("dcf-mr").value      || 0.10;
     const tg  = document.getElementById("dcf-terminal").value || (market === "india" ? 0.05 : 0.03);
     const mos = document.getElementById("dcf-mos").value      || 0.25;
 
