@@ -478,6 +478,22 @@ def get_live_price(ticker: str, market: str = "us"):
                 return float(str(p).replace(",", ""))
         except Exception:
             pass
+
+    # LAST RESORT: most recent stored close. We hold 1.18M daily closes, so a
+    # blank price (which also blanks P/E, P/B and market cap) is never
+    # justified just because every live quote source is rate-limited or
+    # blocking datacenter IPs. Slightly stale beats missing.
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT close FROM price_history
+                               WHERE ticker = %s ORDER BY date DESC LIMIT 1""",
+                            (raw_ticker,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    return float(row[0])
+    except Exception:
+        pass
     return None
 
 
