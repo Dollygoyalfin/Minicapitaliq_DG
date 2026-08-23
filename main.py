@@ -931,7 +931,17 @@ def get_dcf(
     risk_free_rate: float = Query(0.04, description="Risk-free rate (decimal)"),
     market_return: float = Query(0.10, description="Expected market return (decimal)"),
     terminal_growth_rate: float = Query(0.03, description="Terminal growth rate for perpetuity (decimal)"),
-    margin_of_safety: float = Query(0.25, description="Margin of safety (decimal, e.g. 0.25 = 25%)")
+    margin_of_safety: float = Query(0.25, description="Margin of safety (decimal, e.g. 0.25 = 25%)"),
+    # ── Modelling guardrails, exposed rather than hidden ──────────────────
+    # These were added to stop specific broken outputs (XOM's compounding
+    # revenue decline, TSLA's inverted margins, XOM's 0.16 beta). They are
+    # deliberately conservative, which systematically lowers intrinsic value.
+    # Surfacing them lets the user see and change that conservatism.
+    max_revenue_growth: float = Query(0.30, description="Cap on projected revenue growth"),
+    min_revenue_growth: float = Query(-0.05, description="Floor on projected revenue growth"),
+    freeze_margins: bool      = Query(True,  description="Prevent opex growing faster than revenue"),
+    beta_floor: float         = Query(0.50,  description="Minimum beta used in WACC"),
+    beta_ceiling: float       = Query(2.50,  description="Maximum beta used in WACC")
 ):
     """
     Cash-based FCFF DCF Valuation.
@@ -989,7 +999,8 @@ def get_dcf(
         current_price      = info.get("currentPrice")
         shares_outstanding = info.get("sharesOutstanding")
         beta               = info.get("beta", 1.0) or 1.0
-        beta               = max(0.5, min(float(beta), 2.5))  # sanity clamp
+        raw_beta           = float(beta)
+        beta               = max(beta_floor, min(raw_beta, beta_ceiling))
         market_cap         = info.get("marketCap")
         total_debt         = info.get("totalDebt", 0) or 0
         total_cash         = info.get("totalCash", 0) or 0
@@ -1208,6 +1219,7 @@ def get_dcf(
                 capex_val = depr_series[i]
             capex_series.append(max(capex_val, 0.0))  # CapEx can't be negative
 
+
         # ── Historical ΔNWC ───────────────────────────────────────────────────
         # ΔNWC(i) = WC(i) - WC(i+1)  [i=0 most recent, i+1 prior year]
         delta_nwc_series = []
@@ -1226,8 +1238,11 @@ def get_dcf(
         #   — e.g. commodity peaks — otherwise compound into nonsense)
         # - margin freeze: opex can never compound faster than revenue,
         #   which previously inverted margins for TSLA-type profiles
-        revenue_growth = max(-0.05, min(revenue_growth, 0.30))
-        opex_growth    = min(opex_growth, revenue_growth)
+        raw_revenue_growth = revenue_growth
+        raw_opex_growth    = opex_growth
+        revenue_growth = max(min_revenue_growth, min(revenue_growth, max_revenue_growth))
+        if freeze_margins:
+            opex_growth = min(opex_growth, revenue_growth)
         opex_growth    = max(-0.10, min(opex_growth, 0.30))
         # Cash-based DCF needs a real balance sheet — refuse garbage-in
         if (not any(v for v in ca_series if v)
@@ -1369,7 +1384,13 @@ def get_dcf(
             proj_delta_nwc = proj_wc - prev_wc
             prev_wc        = proj_wc
 
-            # CapEx = Net PPE(this year) - Net PPE(prior year) + Depreciation(this year)
+            # CapEx = Net Fixed Assets(this year) - Net Fixed Assets(prior year)
+            #         + Depreciation(this year)
+            # The standard derivation. Deliberately NOT normalised against a
+            # historical capex/revenue ratio: smoothing would hide genuine
+            # capital intensity, and for a company in a heavy investment cycle
+            # the honest output is a warning (see the all-negative-FCFF guard),
+            # not a comfortable number.
             prior_net_ppe  = proj_net_ppe_list[idx - 1] if idx > 0 else base_net_ppe
             proj_capex     = max(proj_net_ppe - prior_net_ppe + proj_depr, proj_depr)
 
@@ -1503,6 +1524,19 @@ def get_dcf(
             else "Fairly Valued" if upside_pct is not None
             else None
         )
+        # A valuation resting ENTIRELY on terminal value is not a defensible
+        # DCF: if the business is projected to burn cash every single year,
+        # the model cannot simultaneously claim a large terminal worth.
+        _proj_fcffs = [r.get("fcff") for r in projection_table
+                       if r.get("fcff") is not None]
+        if _proj_fcffs and all(f < 0 for f in _proj_fcffs) and not reliability_warning:
+            reliability_warning = (
+                "Every projected year shows negative free cash flow, so the entire "
+                "valuation would rest on terminal value alone. This usually means "
+                "the company is in a heavy investment cycle that the model cannot "
+                "reliably extrapolate — treat the earnings-based models in "
+                "Convergence as primary for this stock.")
+
         if intrinsic_value_per_share < 0 and not reliability_warning:
             reliability_warning = ("Negative intrinsic value — projected cash "
                                    "flows don't support a meaningful DCF for "
@@ -1565,6 +1599,29 @@ def get_dcf(
             "intrinsic_value_per_share":             round(intrinsic_value_per_share, 2),
             "intrinsic_value_with_margin_of_safety": round(intrinsic_value_with_mos,  2),
             "margin_of_safety_used":                 margin_of_safety,
+            "assumptions_applied": {
+                "revenue_growth": {
+                    "raw_from_data": round(raw_revenue_growth, 4),
+                    "used":          round(revenue_growth, 4),
+                    "clamped":       abs(raw_revenue_growth - revenue_growth) > 1e-9,
+                    "bounds":        [min_revenue_growth, max_revenue_growth],
+                },
+                "opex_growth": {
+                    "raw_from_data": round(raw_opex_growth, 4),
+                    "used":          round(opex_growth, 4),
+                    "clamped":       abs(raw_opex_growth - opex_growth) > 1e-9,
+                    "margin_freeze": freeze_margins,
+                },
+                "beta": {
+                    "raw_from_data": round(raw_beta, 3),
+                    "used":          round(beta, 3),
+                    "clamped":       abs(raw_beta - beta) > 1e-9,
+                    "bounds":        [beta_floor, beta_ceiling],
+                },
+                "note": ("These guardrails are deliberately conservative and "
+                         "lower intrinsic value. Adjust them to see how much "
+                         "of the valuation depends on them."),
+            },
             "upside_downside_pct":                   round(upside_pct, 2) if upside_pct is not None else None,
             "verdict":                               verdict,
         }
