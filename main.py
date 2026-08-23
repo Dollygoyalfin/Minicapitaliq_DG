@@ -3006,3 +3006,89 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
             "the earnings-based models in Convergence as primary.")
 
     return True, None, warnings
+# ── NEWS & CORPORATE EVENTS ENDPOINT (paste into main.py) ────────────────────
+# Serves the events collected by news_engine.py. Red flags first, because a
+# pledge creation or auditor resignation matters more than a routine filing.
+
+@app.get("/events")
+def get_events(
+    ticker: str = Query(...),
+    market: str = Query("india"),
+    days: int = Query(180, description="Lookback window"),
+):
+    try:
+        from data_store import _conn
+        from datetime import date, timedelta
+
+        raw = ticker.upper()
+        if market.lower() == "india" and not raw.endswith(".NS"):
+            raw += ".NS"
+        cutoff = date.today() - timedelta(days=days)
+
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT event_date, category, severity, headline, url, sentiment
+                    FROM news_events
+                    WHERE ticker = %s AND event_date >= %s
+                    ORDER BY
+                      CASE severity
+                        WHEN 'red_flag' THEN 0 WHEN 'watch' THEN 1
+                        WHEN 'positive' THEN 2 ELSE 3 END,
+                      event_date DESC
+                    LIMIT 60
+                """, (raw, cutoff))
+                rows = cur.fetchall()
+
+        events, counts = [], {"red_flag": 0, "watch": 0, "positive": 0, "info": 0}
+        for d, cat, sev, head, url, sent in rows:
+            counts[sev] = counts.get(sev, 0) + 1
+            events.append({
+                "date":      str(d),
+                "category":  cat,
+                "severity":  sev,
+                "headline":  head,
+                "url":       url,
+                "sentiment": sent,
+            })
+
+        # Plain-English summary of what the red flags actually mean
+        FLAG_MEANING = {
+            "auditor_change":    "An auditor resignation is one of the highest-signal "
+                                 "warnings in Indian markets — auditors rarely resign "
+                                 "from clean engagements.",
+            "pledge_created":    "Promoters pledging shares means borrowing against "
+                                 "their stake. If the price falls, lenders can force "
+                                 "sales, which accelerates declines.",
+            "regulatory_action": "A regulatory notice or penalty can carry financial "
+                                 "cost and signals governance issues.",
+            "management_exit":   "An abrupt CFO or MD departure often precedes "
+                                 "restatements or strategy reversals.",
+            "rating_downgrade":  "A credit downgrade raises borrowing costs and may "
+                                 "signal deteriorating cash flows.",
+        }
+        explanations = []
+        for e in events:
+            if e["severity"] == "red_flag" and e["category"] in FLAG_MEANING:
+                m = FLAG_MEANING[e["category"]]
+                if m not in explanations:
+                    explanations.append(m)
+
+        return {
+            "ticker": raw,
+            "market": market,
+            "window_days": days,
+            "counts": counts,
+            "events": events,
+            "explanations": explanations,
+            "caveats": [
+                "Sourced from NSE corporate announcements. Categories are assigned "
+                "by keyword rules, so an unusual filing may be miscategorised.",
+                "Absence of red flags is not a clean bill of health — it means "
+                "nothing matching was filed in this window.",
+            ] if market.lower() == "india" else [
+                "Corporate event tracking currently covers Indian listings only."
+            ],
+        }
+    except Exception as e:
+        return {"error": f"Event lookup failed: {e}"}
