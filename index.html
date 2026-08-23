@@ -756,21 +756,34 @@
 <div id="tab-ideas" class="tab-content">
   <div class="container">
     <div style="font-size:0.78rem;opacity:0.75;margin-bottom:12px;line-height:1.55">
-      A <strong>screen</strong>, not a buy list. Each strategy below shows the
-      base rate this app measured on its own five years of data — including when
-      the result was <em>unfavourable</em>. Companies with governance red flags
-      (auditor resignations, promoter pledges, regulatory action) are excluded by
-      default.
+      A <strong>screen</strong>, not a buy list. Each strategy shows the base rate
+      this app measured on its own five years of data — including when the result
+      was <em>unfavourable</em>. Companies with governance red flags (auditor
+      resignations, promoter pledges, regulatory action) are excluded by default.
     </div>
-    <div class="params-grid" style="margin-bottom:12px">
+    <div class="params-grid" style="margin-bottom:10px">
       <div class="param-group"><label>Strategy</label>
         <select id="ideas-strategy" style="width:100%">
           <option value="quality_momentum">Quality + Momentum (validated)</option>
           <option value="clean_compounders">Clean Compounders (no timing)</option>
-          <option value="quality_value">Quality + Value (contrarian — see warning)</option>
+          <option value="quality_value">Quality + Value (contrary evidence)</option>
+          <option value="turnaround_watch">Turnaround Watch (untested)</option>
+          <option value="all">All quality names (no setup)</option>
         </select></div>
+      <div class="param-group"><label>Sector</label>
+        <select id="ideas-sector" style="width:100%"><option value="">All sectors</option></select></div>
       <div class="param-group"><label>Min Quality Score</label>
         <input type="number" id="ideas-minq" value="65" min="0" max="100" step="5"/></div>
+      <div class="param-group"><label>Max P/E (0 = any)</label>
+        <input type="number" id="ideas-maxpe" value="0" min="0" step="5"/></div>
+      <div class="param-group"><label>Sort By</label>
+        <select id="ideas-sort" style="width:100%">
+          <option value="composite">Composite score</option>
+          <option value="quality">Quality score</option>
+          <option value="momentum">Momentum</option>
+          <option value="value">Closest to 52wk low</option>
+          <option value="pe">Lowest P/E</option>
+        </select></div>
       <div class="param-group"><label>Exclude Red Flags</label>
         <select id="ideas-flags" style="width:100%">
           <option value="true" selected>Yes</option>
@@ -899,33 +912,90 @@
   async function runIdeas() {
     const market = getMarket();
     const strat  = document.getElementById("ideas-strategy").value;
-    const minq   = document.getElementById("ideas-minq").value || 65;
+    const sector = document.getElementById("ideas-sector").value;
+    const minq   = document.getElementById("ideas-minq").value  || 65;
+    const maxpe  = document.getElementById("ideas-maxpe").value || 0;
+    const sort   = document.getElementById("ideas-sort").value;
     const flags  = document.getElementById("ideas-flags").value;
     setLoading("ideas-results", "Screening the universe...");
     try {
       const d = await safeFetch(`${BASE}/ideas?market=${market}&strategy=${strat}` +
-                                `&min_quality_score=${minq}&exclude_red_flags=${flags}&limit=25`);
+        `&min_quality_score=${minq}&exclude_red_flags=${flags}&sector=${encodeURIComponent(sector)}` +
+        `&max_pe=${maxpe}&sort_by=${sort}&limit=25`);
       if (d.error) { setError("ideas-results", d.error); return; }
+
+      // populate sector dropdown once
+      const selSec = document.getElementById("ideas-sector");
+      if (selSec && selSec.options.length <= 1 && (d.available_sectors||[]).length) {
+        d.available_sectors.forEach(s => {
+          const o = document.createElement("option"); o.value = s; o.textContent = s;
+          selSec.appendChild(o);
+        });
+        selSec.value = sector;
+      }
 
       const cur = market === "india" ? "₹" : "$";
       const warn = d.strategy_warning ? `
-        <div style="padding:10px 12px;background:rgba(239,68,68,0.10);border-left:3px solid #ef4444;border-radius:2px;margin-bottom:10px;font-size:0.78rem">
+        <div style="padding:10px 12px;background:rgba(239,68,68,0.10);border-left:3px solid #ef4444;border-radius:2px;margin:10px 0;font-size:0.78rem">
           <strong>⚠ Contrary evidence:</strong> ${d.strategy_warning}
         </div>` : "";
 
-      const rows = (d.ideas || []).map((x, i) => `
-        <div style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.07)">
-          <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px">
-            <div>
-              <span class="mono" style="font-weight:700">${i+1}. ${x.ticker.replace(".NS","")}</span>
-              <span style="opacity:0.6;font-size:0.78rem"> ${x.name || ""} · ${x.sector || ""}</span>
-            </div>
-            <div class="mono" style="font-size:0.85rem">${cur}${(x.price||0).toLocaleString()}</div>
+      const bar = (label, val, max, color) => `
+        <div style="display:flex;align-items:center;gap:6px;font-size:0.66rem;margin:2px 0">
+          <span style="width:88px;opacity:0.6">${label}</span>
+          <div style="flex:1;background:rgba(255,255,255,0.07);height:5px;border-radius:3px">
+            <div style="width:${Math.min(100,(val/max)*100)}%;height:5px;border-radius:3px;background:${color}"></div>
           </div>
-          <div style="font-size:0.73rem;opacity:0.75;margin-top:4px">
+          <span class="mono" style="width:34px;text-align:right;opacity:0.7">${val}</span>
+        </div>`;
+
+      const rows = (d.ideas || []).map((x, i) => {
+        const p = x.percentiles || {};
+        const b = x.score_breakdown || {};
+        const gradeCol = x.quality_grade === "A" ? "#22c55e"
+                        : x.quality_grade === "B" ? "#84cc16"
+                        : x.quality_grade === "C" ? "#eab308" : "#f97316";
+        return `
+        <div style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.08)">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+            <div style="flex:1;min-width:200px">
+              <div>
+                <span class="mono" style="font-weight:700;font-size:0.95rem">${i+1}. ${x.ticker.replace(".NS","")}</span>
+                <span style="font-weight:600;font-size:0.86rem;margin-left:6px">${x.company_name}</span>
+              </div>
+              <div style="font-size:0.72rem;opacity:0.6;margin-top:2px">${x.sector}</div>
+            </div>
+            <div style="text-align:right">
+              <div class="mono" style="font-size:0.95rem;font-weight:600">${cur}${(x.price||0).toLocaleString()}</div>
+              <div style="font-size:0.7rem;opacity:0.65">
+                ${x.pe_ratio ? "P/E " + x.pe_ratio : "P/E n/a"} ·
+                <span style="color:${gradeCol};font-weight:700">${x.quality_grade}</span>
+                ${x.quality_score}/100
+              </div>
+            </div>
+            <div style="text-align:right;min-width:70px">
+              <div class="mono" style="font-size:1.15rem;font-weight:800;color:var(--accent)">${x.composite_score ?? "—"}</div>
+              <div style="font-size:0.62rem;opacity:0.5">composite</div>
+            </div>
+          </div>
+          <div style="font-size:0.72rem;opacity:0.78;margin-top:6px">
             ${(x.reasons||[]).join(" &nbsp;·&nbsp; ")}
           </div>
-        </div>`).join("");
+          <details style="margin-top:6px">
+            <summary style="cursor:pointer;font-size:0.68rem;opacity:0.55">why it ranks here</summary>
+            <div style="padding:6px 0 2px">
+              ${bar("Quality (45%)", b.quality ?? 0, 45, "#22c55e")}
+              ${bar("Momentum (30%)", b.momentum_12m ?? 0, 30, "#3b82f6")}
+              ${bar("Trend (15%)", b.trend ?? 0, 15, "#a855f7")}
+              ${bar("Low vol (10%)", b.low_volatility ?? 0, 10, "#eab308")}
+              <div style="font-size:0.65rem;opacity:0.5;margin-top:4px">
+                percentiles — 200DMA ${p.vs_200dma ?? "—"} · from low ${p.from_52wk_low ?? "—"} ·
+                12m mom ${p.momentum_12m ?? "—"} · 3m mom ${p.momentum_3m ?? "—"} · vol ${p.volatility ?? "—"}
+              </div>
+            </div>
+          </details>
+        </div>`;
+      }).join("");
 
       document.getElementById("ideas-results").innerHTML = `
         <div class="result-card">
@@ -934,11 +1004,16 @@
             <strong>What this setup did historically:</strong><br>${d.historical_base_rate}
           </div>
           ${warn}
-          <div style="font-size:0.75rem;opacity:0.6;margin:10px 0 4px">
+          <div style="font-size:0.73rem;opacity:0.6;margin:10px 0 2px">
             ${d.count} match${d.count===1?"":"es"} · quality ≥ ${d.filters_applied.min_quality_score}
-            ${d.filters_applied.red_flags_excluded ? "· red-flag companies excluded" : ""}
+            ${d.filters_applied.sector !== "all" ? " · " + d.filters_applied.sector : ""}
+            ${d.filters_applied.max_pe ? " · P/E ≤ " + d.filters_applied.max_pe : ""}
+            ${d.filters_applied.red_flags_excluded ? " · red-flag companies excluded" : ""}
           </div>
-          ${rows || '<div style="opacity:0.6;font-size:0.8rem;padding:10px 0">No stocks matched. Try lowering the quality threshold.</div>'}
+          <div style="font-size:0.66rem;opacity:0.45;margin-bottom:6px">
+            Composite = ${d.composite_formula}
+          </div>
+          ${rows || '<div style="opacity:0.6;font-size:0.8rem;padding:10px 0">No stocks matched these filters. Try lowering the quality threshold or clearing the sector filter.</div>'}
           <div style="margin-top:14px;padding:10px;background:rgba(255,255,255,0.04);border-radius:4px">
             <div style="font-size:0.75rem;font-weight:600;margin-bottom:4px">Before acting on any of this</div>
             <ul style="margin:0;padding-left:16px;font-size:0.71rem;opacity:0.7">
