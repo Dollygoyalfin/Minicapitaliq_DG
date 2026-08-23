@@ -3092,3 +3092,182 @@ def get_events(
         }
     except Exception as e:
         return {"error": f"Event lookup failed: {e}"}
+# ── IDEAS SCREENER (paste into main.py) ──────────────────────────────────────
+# A shortlist of stocks matching a DEFINED, TESTED setup — not a buy list.
+#
+# Every strategy here is grounded in what this app's own base-rate engine
+# actually measured on your data, and each ships with the measured base rate
+# so the user can see the evidence rather than trust a label:
+#
+#   quality_momentum : +12.4% median excess at 12m, 60% beat market (n=860)
+#   quality_value    : NEGATIVE excess in our sample — included with that
+#                      warning attached, because hiding a contrary result
+#                      would be dishonest
+#   clean_compounders: no timing element; a quality + governance filter only
+#
+# Red flags (auditor resignations, promoter pledges, regulatory action) are
+# used as an EXCLUSION filter — Munger's inversion: avoid the obvious ways to
+# lose rather than chase the clever ways to win.
+
+@app.get("/ideas")
+def get_ideas(
+    market: str = Query("india"),
+    strategy: str = Query("quality_momentum",
+                          description="quality_momentum | quality_value | clean_compounders"),
+    min_quality_score: int = Query(65, description="Minimum quality score (0-100)"),
+    exclude_red_flags: bool = Query(True),
+    limit: int = Query(20),
+):
+    try:
+        from data_store import _conn
+
+        # Measured on this app's own data — shown to the user, not hidden
+        BASE_RATES = {
+            "quality_momentum": {
+                "measured": "+12.4% median excess return at 12 months, beat the "
+                            "market 60% of the time (n=860 independent episodes)",
+                "thesis": "Strong 12-month momentum combined with a durable "
+                          "business. This is the one effect that validated in "
+                          "our own 5-year sample.",
+                "warning": None,
+            },
+            "quality_value": {
+                "measured": "NEGATIVE excess return in our sample: -1.7% median "
+                            "at 12 months, beat the market only 48% of the time "
+                            "(n=1,418 episodes)",
+                "thesis": "High-quality businesses trading near 52-week lows. "
+                          "Classic contrarian value.",
+                "warning": "Our own data does NOT support this setup over the "
+                           "2020-2025 window — value underperformed badly in a "
+                           "growth-led market. Shown because the effect is well "
+                           "documented over longer horizons, but treat it as a "
+                           "hypothesis you are testing, not a validated edge.",
+            },
+            "clean_compounders": {
+                "measured": "Not a timing signal — no forward-return claim is "
+                            "made for this screen",
+                "thesis": "Consistently high returns on equity, strong cash "
+                          "conversion, low leverage, and no governance red "
+                          "flags. A watchlist of durable businesses, not an "
+                          "entry signal.",
+                "warning": None,
+            },
+        }
+        if strategy not in BASE_RATES:
+            return {"error": f"Unknown strategy. Choose from: {list(BASE_RATES)}"}
+
+        # Strategy → signature conditions
+        if strategy == "quality_momentum":
+            cond = "s.rank_mom_12m >= 75 AND s.rank_vs_200dma >= 60"
+            order = "s.rank_mom_12m DESC"
+        elif strategy == "quality_value":
+            cond = "s.rank_from_low <= 30 AND s.rank_vs_200dma <= 40"
+            order = "s.rank_from_low ASC"
+        else:
+            cond = "TRUE"
+            order = "q.score DESC"
+
+        flag_join = """
+            LEFT JOIN (
+                SELECT ticker, COUNT(*) AS red_flags
+                FROM news_events
+                WHERE severity = 'red_flag'
+                  AND event_date >= CURRENT_DATE - INTERVAL '180 days'
+                GROUP BY ticker
+            ) f ON f.ticker = c.ticker"""
+        flag_filter = "AND COALESCE(f.red_flags, 0) = 0" if exclude_red_flags else ""
+
+        sql = f"""
+            WITH latest_sig AS (
+                SELECT DISTINCT ON (ticker) ticker, market, price,
+                       rank_vs_200dma, rank_from_low, rank_from_high,
+                       rank_mom_12m, rank_volatility
+                FROM stock_signatures ORDER BY ticker, date DESC
+            ),
+            latest_q AS (
+                SELECT DISTINCT ON (ticker) ticker, signal AS grade,
+                       (detail->>'score')::float AS score
+                FROM signal_journal WHERE source = 'quality'
+                ORDER BY ticker, signal_date DESC
+            )
+            SELECT c.ticker, c.name, c.sector, q.grade, q.score,
+                   s.price, s.rank_vs_200dma, s.rank_from_low,
+                   s.rank_mom_12m, s.rank_volatility,
+                   COALESCE(f.red_flags, 0) AS red_flags
+            FROM companies c
+            JOIN latest_sig s ON s.ticker = c.ticker
+            JOIN latest_q   q ON q.ticker = c.ticker
+            {flag_join}
+            WHERE c.market = %s
+              AND q.score >= %s
+              AND {cond}
+              {flag_filter}
+            ORDER BY {order}
+            LIMIT %s
+        """
+
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET statement_timeout = '60s'")
+                cur.execute(sql, (market, min_quality_score, limit))
+                rows = cur.fetchall()
+
+        ideas = []
+        for (tkr, name, sector, grade, score, price, r200, rlow,
+             mom12, rvol, flags) in rows:
+            reasons = []
+            if score is not None:
+                reasons.append(f"Quality {grade} ({int(score)}/100)")
+            if mom12 is not None and mom12 >= 75:
+                reasons.append(f"12m momentum in top {100-int(mom12)}% of market")
+            if rlow is not None and rlow <= 30:
+                reasons.append(f"Trading near 52-week low ({int(rlow)}th percentile)")
+            if r200 is not None and r200 >= 60:
+                reasons.append("Above its 200-day trend")
+            if flags == 0:
+                reasons.append("No red-flag filings in 180 days")
+            ideas.append({
+                "ticker": tkr, "name": name, "sector": sector,
+                "quality_grade": grade,
+                "quality_score": int(score) if score is not None else None,
+                "price": price,
+                "percentiles": {
+                    "vs_200dma":    int(r200) if r200 is not None else None,
+                    "from_52wk_low": int(rlow) if rlow is not None else None,
+                    "momentum_12m": int(mom12) if mom12 is not None else None,
+                    "volatility":   int(rvol) if rvol is not None else None,
+                },
+                "red_flags": flags,
+                "reasons": reasons,
+            })
+
+        meta = BASE_RATES[strategy]
+        return {
+            "market": market,
+            "strategy": strategy,
+            "thesis": meta["thesis"],
+            "historical_base_rate": meta["measured"],
+            "strategy_warning": meta["warning"],
+            "filters_applied": {
+                "min_quality_score": min_quality_score,
+                "red_flags_excluded": exclude_red_flags,
+            },
+            "count": len(ideas),
+            "ideas": ideas,
+            "disclaimers": [
+                "This is a SCREEN, not investment advice. It lists stocks that "
+                "match a defined set of conditions — nothing more.",
+                "Base rates describe what happened historically in a ~5-year "
+                "window covering one market regime, on today's index members "
+                "only (survivorship bias). They are not predictions.",
+                "No macro, market-outlook, or news-sentiment input is used. "
+                "Corporate filings are used only to EXCLUDE companies with "
+                "governance red flags.",
+                "Run the DCF, Convergence and Quality tabs on anything here "
+                "before forming a view, and consider your own circumstances "
+                "or speak to a SEBI-registered adviser.",
+            ],
+        }
+
+    except Exception as e:
+        return {"error": f"Idea screen failed: {e}"}
