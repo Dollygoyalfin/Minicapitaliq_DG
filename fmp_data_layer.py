@@ -338,6 +338,24 @@ def get_stooq_price(ticker: str, market: str = "us"):
         return None
 
 
+# ── Ingest-on-demand rate budget ─────────────────────────────────────────────
+# Caps how many NEW companies can be ingested per hour. Protects the shared
+# server IP from being blocked by NSE/SEC if many unknown tickers arrive.
+_INGEST_LOG = []
+_INGEST_MAX_PER_HOUR = 12
+
+
+def _ingest_budget_available() -> bool:
+    now = time.time()
+    while _INGEST_LOG and now - _INGEST_LOG[0] > 3600:
+        _INGEST_LOG.pop(0)
+    return len(_INGEST_LOG) < _INGEST_MAX_PER_HOUR
+
+
+def _mark_ingest_attempt():
+    _INGEST_LOG.append(time.time())
+
+
 def get_company_data(ticker: str, market: str = "us", source: str = "auto"):
     """
     Returns (info, income_df, balance_df, cashflow_df, data_source_label).
@@ -395,6 +413,41 @@ def get_company_data(ticker: str, market: str = "us", source: str = "auto"):
 
         if source == "store":
             raise RuntimeError(f"{ticker} not found in data store.")
+
+        # ── INGEST ON DEMAND ─────────────────────────────────────────────────
+        # The store covers Nifty 500 + S&P 500. Anything else previously fell
+        # through to live APIs on EVERY request and got rate-limited (the AZAD
+        # problem). Instead: ingest it once, then it is permanently fast.
+        # Rate-limited so a typo storm or bot cannot trigger hundreds of NSE
+        # calls from one server IP and get us blocked.
+        if _ingest_budget_available():
+            try:
+                print(f"[ingest-on-demand] {raw_ticker} not in store — ingesting once")
+                _mark_ingest_attempt()
+                if is_india:
+                    from india_data_pipeline import ingest_india_own
+                    ok = ingest_india_own(raw_ticker.replace(".NS", ""))
+                else:
+                    from ingest import ingest_one
+                    ok = ingest_one(raw_ticker, market)
+                if ok:
+                    from data_store import get_from_store, get_live_price
+                    stored = get_from_store(ticker, market)
+                    if stored:
+                        info, inc, bal, cf = stored
+                        lp = get_live_price(ticker, market)
+                        if lp:
+                            info["currentPrice"] = lp
+                            info["regularMarketPrice"] = lp
+                            if info.get("sharesOutstanding"):
+                                info["marketCap"] = lp * info["sharesOutstanding"]
+                            if info.get("trailingEps") and info["trailingEps"] > 0:
+                                info["trailingPE"] = lp / info["trailingEps"]
+                            if info.get("bookValue") and info["bookValue"] > 0:
+                                info["priceToBook"] = lp / info["bookValue"]
+                        return (info, inc, bal, cf, "store (ingested on demand)")
+            except Exception as ing_err:
+                print(f"[ingest-on-demand] failed for {raw_ticker}: {ing_err}")
 
     resolved_source = source
     if source == "auto":
