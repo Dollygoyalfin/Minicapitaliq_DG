@@ -811,14 +811,43 @@
   function getTicker() { return document.getElementById("ticker").value.trim(); }
   function getMarket()  { return document.getElementById("market").value; }
 
+  // Every endpoint call goes through this. Previously a 503 (Render free-tier
+  // cold start) or a 500 returned an empty body, and `res.json()` threw
+  // "JSON.parse: unexpected end of data" — technically accurate, useless to
+  // the user. Now the failure mode is named.
+  async function safeFetch(url, opts) {
+    let res;
+    try {
+      res = await fetch(url, opts);
+    } catch (netErr) {
+      throw new Error("Could not reach the server. Check your connection, or the "
+                    + "service may be starting up — wait ~60 seconds and retry.");
+    }
+    if (res.status === 503 || res.status === 502) {
+      throw new Error("Server is waking up (free tier sleeps when idle). "
+                    + "Wait about a minute and try again — it stays fast afterwards.");
+    }
+    const text = await res.text();
+    if (!text || !text.trim()) {
+      throw new Error(`Server returned an empty response (HTTP ${res.status}). `
+                    + "This usually means it crashed on this request or is still starting.");
+    }
+    try {
+      return JSON.parse(text);
+    } catch (parseErr) {
+      throw new Error(`Server sent an unreadable response (HTTP ${res.status}): `
+                    + text.slice(0, 120));
+    }
+  }
+
   async function runBaseRates() {
     const ticker = getTicker(), market = getMarket();
     if (!ticker) { setError("baserates-results", "Enter a ticker first."); return; }
     document.getElementById("baserates-results").innerHTML =
       '<div class="state-empty"><span class="icon">⏳</span>Scanning history for setups like ' + ticker + '…</div>';
     try {
-      const res = await fetch(`${BASE}/baserates?ticker=${ticker}&market=${market}`);
-      const d = await res.json();
+      const __RES = await safeFetch(`${BASE}/baserates?ticker=${ticker}&market=${market}`);
+      const d = __RES;
       if (d.error && !d.signature) { setError("baserates-results", d.error); return; }
 
       const p = (d.signature && d.signature.percentiles) || {};
@@ -904,8 +933,8 @@
     document.getElementById("quality-results").innerHTML =
       '<div class="state-empty"><span class="icon">⏳</span>Scoring quality for ' + ticker + '…</div>';
     try {
-      const res = await fetch(`${BASE}/quality?ticker=${ticker}&market=${market}`);
-      const d = await res.json();
+      const __RES = await safeFetch(`${BASE}/quality?ticker=${ticker}&market=${market}`);
+      const d = __RES;
       if (d.error) { setError("quality-results", d.error); return; }
 
       const gradeColor = d.grade === "A" ? "#22c55e" : d.grade === "B" ? "#84cc16"
@@ -997,8 +1026,8 @@
     switchTab("valuation", document.querySelectorAll(".tab")[0]);
     setLoading("valuation-results", `Fetching ${ticker.toUpperCase()}...`);
     try {
-      const res = await fetch(`${BASE}/valuation?ticker=${ticker}&market=${market}`);
-      const d = await res.json();
+      const __RES = await safeFetch(`${BASE}/valuation?ticker=${ticker}&market=${market}`);
+      const d = __RES;
       if (d.error) { setError("valuation-results", d.error); return; }
 
       const upside = d.intrinsic_value && d.current_price
@@ -1088,8 +1117,8 @@
     const freeze   = document.getElementById("dcf-freeze").value   || "true";
 
     try {
-      const res = await fetch(`${BASE}/dcf?ticker=${ticker}&market=${market}&projection_years=${years}&terminal_growth_rate=${terminal}&risk_free_rate=${rf}&market_return=${mr}&margin_of_safety=${mos}&max_revenue_growth=${maxg}&min_revenue_growth=${ming}&beta_floor=${bmin}&beta_ceiling=${bmax}&freeze_margins=${freeze}`);
-      const d = await res.json();
+      const __RES = await safeFetch(`${BASE}/dcf?ticker=${ticker}&market=${market}&projection_years=${years}&terminal_growth_rate=${terminal}&risk_free_rate=${rf}&market_return=${mr}&margin_of_safety=${mos}&max_revenue_growth=${maxg}&min_revenue_growth=${ming}&beta_floor=${bmin}&beta_ceiling=${bmax}&freeze_margins=${freeze}`);
+      const d = __RES;
       if (d.error) { setError("dcf-results", d.error); return; }
 
       // Transparency: show which guardrails actually bound this valuation
@@ -1295,11 +1324,10 @@
     const mos = document.getElementById("dcf-mos").value      || 0.25;
 
     try {
-      const res = await fetch(
+      const d = await safeFetch(
         `${BASE}/convergence?ticker=${ticker}&market=${market}` +
         `&risk_free_rate=${rf}&market_return=${mr}&terminal_growth_rate=${tg}&margin_of_safety=${mos}`
       );
-      const d = await res.json();
       if (d.error) { setError("convergence-results", d.error); return; }
 
       const c   = d.consensus || {};
@@ -1495,7 +1523,7 @@
     }
 
     try {
-      const res = await fetch(`${BASE}/ai-verdict`, {
+      const __RES = await safeFetch(`${BASE}/ai-verdict`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1504,7 +1532,7 @@
           dcf_result: dcfCache,
         }),
       });
-      const d = await res.json();
+      const d = __RES;
       if (d.error) { setError("verdict-results", d.error); return; }
 
       const av  = d.ai_verdict || {};
@@ -1716,8 +1744,8 @@
     switchTab("financials", document.querySelector(".tab-row .tab:nth-child(3)"));
     setLoading("financials-results", `Loading financials for ${ticker.toUpperCase()}...`);
     try {
-      const res = await fetch(`${BASE}/financials?ticker=${ticker}&market=${market}`);
-      const d = await res.json();
+      const __RES = await safeFetch(`${BASE}/financials?ticker=${ticker}&market=${market}`);
+      const d = __RES;
       if (d.error) { setError("financials-results", d.error); return; }
       if (!d.income_statement || Object.keys(d.income_statement).length === 0) {
         setError("financials-results", "Financial data not available for this ticker."); return;
@@ -1804,8 +1832,8 @@
     if (mcMax !== null) params.append("max_market_cap", mcMax * 1e9);
 
     try {
-      const res = await fetch(`${BASE}/screener?${params.toString()}`);
-      const d = await res.json();
+      const __RES = await safeFetch(`${BASE}/screener?${params.toString()}`);
+      const d = __RES;
       if (d.error) { setError("screener-results", d.error); return; }
 
       const results = d.results || [];
@@ -1872,8 +1900,8 @@
   async function loadIPOs() {
     setLoading("ipo-results", "Fetching IPO data...");
     try {
-      const res = await fetch(`${BASE}/ipos`);
-      const data = await res.json();
+      const __RES = await safeFetch(`${BASE}/ipos`);
+      const data = __RES;
       let rows = "";
       for (const ipo of data) {
         const g = ipo.gain_pct;
@@ -1897,8 +1925,8 @@
   async function loadCommodities() {
     setLoading("commodity-results", "Fetching spot prices...");
     try {
-      const res = await fetch(`${BASE}/commodities`);
-      const data = await res.json();
+      const __RES = await safeFetch(`${BASE}/commodities`);
+      const data = __RES;
       let rows = "";
       for (const c of data) {
         const chg = c.change;
