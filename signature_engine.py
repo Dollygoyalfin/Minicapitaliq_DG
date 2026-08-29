@@ -21,7 +21,7 @@ import pandas as pd
 import numpy as np
 from data_store import _conn
 
-SIGNATURE_BUILD = "2026-07-27a (RSI-14, 50-DMA)"
+SIGNATURE_BUILD = "2026-07-27b (batched writes, per-batch connections)"
 
 
 def _init_table():
@@ -198,51 +198,106 @@ def backfill_signatures(full_rebuild: bool = True, recent_days: int = None):
 
     print("Writing to store...")
     t0 = time.time()
-    conn = _conn()
-    try:
-        from psycopg2.extras import execute_values
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE stock_signatures")
-            rows = [
-                (r.ticker, r.date.date(), r.market, float(r.close),
-                 _n(r.pct_vs_200dma), _n(r.pct_from_52wk_high), _n(r.pct_from_52wk_low),
-                 _n(r.momentum_3m), _n(r.momentum_12m), _n(r.volatility_20d),
-                 _n(r.rank_vs_200dma), _n(r.rank_from_high), _n(r.rank_from_low),
-                 _n(r.rank_mom_3m), _n(r.rank_mom_12m), _n(r.rank_volatility),
-                 _n(r.rsi_14), _n(r.pct_vs_50dma), _n(r.dma_50), _n(r.dma_200))
-                for r in feats.itertuples()
-            ]
-            execute_values(cur, """
-                INSERT INTO stock_signatures
-                    (ticker, date, market, price, pct_vs_200dma,
-                     pct_from_52wk_high, pct_from_52wk_low, momentum_3m,
-                     momentum_12m, volatility_20d, rank_vs_200dma,
-                     rank_from_high, rank_from_low, rank_mom_3m, rank_mom_12m,
-                     rank_volatility, rsi_14, pct_vs_50dma, dma_50, dma_200)
-                VALUES %s
-                ON CONFLICT (ticker, date) DO UPDATE SET
-                    price=EXCLUDED.price,
-                    pct_vs_200dma=EXCLUDED.pct_vs_200dma,
-                    pct_from_52wk_high=EXCLUDED.pct_from_52wk_high,
-                    pct_from_52wk_low=EXCLUDED.pct_from_52wk_low,
-                    momentum_3m=EXCLUDED.momentum_3m,
-                    momentum_12m=EXCLUDED.momentum_12m,
-                    volatility_20d=EXCLUDED.volatility_20d,
-                    rank_vs_200dma=EXCLUDED.rank_vs_200dma,
-                    rank_from_high=EXCLUDED.rank_from_high,
-                    rank_from_low=EXCLUDED.rank_from_low,
-                    rank_mom_3m=EXCLUDED.rank_mom_3m,
-                    rank_mom_12m=EXCLUDED.rank_mom_12m,
-                    rank_volatility=EXCLUDED.rank_volatility,
-                    rsi_14=EXCLUDED.rsi_14,
-                    pct_vs_50dma=EXCLUDED.pct_vs_50dma,
-                    dma_50=EXCLUDED.dma_50,
-                    dma_200=EXCLUDED.dma_200
-            """, rows, page_size=2000)
-        conn.commit()
-    finally:
-        conn.close()
-    print(f"  {len(rows):,} rows written ({time.time()-t0:.0f}s)")
+
+    rows = [
+        (r.ticker, r.date.date(), r.market, float(r.close),
+         _n(r.pct_vs_200dma), _n(r.pct_from_52wk_high), _n(r.pct_from_52wk_low),
+         _n(r.momentum_3m), _n(r.momentum_12m), _n(r.volatility_20d),
+         _n(r.rank_vs_200dma), _n(r.rank_from_high), _n(r.rank_from_low),
+         _n(r.rank_mom_3m), _n(r.rank_mom_12m), _n(r.rank_volatility),
+         _n(r.rsi_14), _n(r.pct_vs_50dma), _n(r.dma_50), _n(r.dma_200))
+        for r in feats.itertuples()
+    ]
+
+    INSERT_SQL = """
+        INSERT INTO stock_signatures
+            (ticker, date, market, price, pct_vs_200dma,
+             pct_from_52wk_high, pct_from_52wk_low, momentum_3m,
+             momentum_12m, volatility_20d, rank_vs_200dma,
+             rank_from_high, rank_from_low, rank_mom_3m, rank_mom_12m,
+             rank_volatility, rsi_14, pct_vs_50dma, dma_50, dma_200)
+        VALUES %s
+        ON CONFLICT (ticker, date) DO UPDATE SET
+            price=EXCLUDED.price,
+            pct_vs_200dma=EXCLUDED.pct_vs_200dma,
+            pct_from_52wk_high=EXCLUDED.pct_from_52wk_high,
+            pct_from_52wk_low=EXCLUDED.pct_from_52wk_low,
+            momentum_3m=EXCLUDED.momentum_3m,
+            momentum_12m=EXCLUDED.momentum_12m,
+            volatility_20d=EXCLUDED.volatility_20d,
+            rank_vs_200dma=EXCLUDED.rank_vs_200dma,
+            rank_from_high=EXCLUDED.rank_from_high,
+            rank_from_low=EXCLUDED.rank_from_low,
+            rank_mom_3m=EXCLUDED.rank_mom_3m,
+            rank_mom_12m=EXCLUDED.rank_mom_12m,
+            rank_volatility=EXCLUDED.rank_volatility,
+            rsi_14=EXCLUDED.rsi_14,
+            pct_vs_50dma=EXCLUDED.pct_vs_50dma,
+            dma_50=EXCLUDED.dma_50,
+            dma_200=EXCLUDED.dma_200
+    """
+
+    # A single long-lived connection writing 1.19M rows gets killed by the
+    # pooler partway through on a loaded free-tier instance. Write in batches,
+    # each with its own connection and its own retries, so one dropped
+    # connection costs a batch rather than the whole run.
+    from psycopg2.extras import execute_values
+    BATCH = 20000
+
+    if full_rebuild:
+        for attempt in range(3):
+            conn = None
+            try:
+                conn = _connect_with_retry()
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    cur.execute("SET statement_timeout = '300s'")
+                    cur.execute("TRUNCATE stock_signatures")
+                print("  table truncated for full rebuild")
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"  TRUNCATE failed after 3 tries: {e}")
+                    raise
+                time.sleep(5 * (attempt + 1))
+            finally:
+                if conn:
+                    try: conn.close()
+                    except Exception: pass
+
+    written, failed_batches = 0, 0
+    total_batches = (len(rows) + BATCH - 1) // BATCH
+    for i in range(0, len(rows), BATCH):
+        chunk = rows[i:i + BATCH]
+        for attempt in range(3):
+            conn = None
+            try:
+                conn = _connect_with_retry()
+                with conn.cursor() as cur:
+                    cur.execute("SET statement_timeout = '300s'")
+                    execute_values(cur, INSERT_SQL, chunk, page_size=1000)
+                conn.commit()
+                written += len(chunk)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    failed_batches += 1
+                    print(f"  batch {i//BATCH + 1}/{total_batches} failed: "
+                          f"{str(e)[:90]}")
+                else:
+                    time.sleep(5 * (attempt + 1))
+            finally:
+                if conn:
+                    try: conn.close()
+                    except Exception: pass
+        done = i // BATCH + 1
+        if done % 5 == 0 or done == total_batches:
+            print(f"  {written:,}/{len(rows):,} rows ({done}/{total_batches} batches)")
+
+    if failed_batches:
+        print(f"  ⚠ {failed_batches} batch(es) failed — rerun to fill the gaps "
+              f"(upserts are idempotent, so a rerun is safe)")
+    print(f"  {written:,} of {len(rows):,} rows written ({time.time()-t0:.0f}s)")
     print("✅ Signature backfill complete.")
 
 
