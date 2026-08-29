@@ -2933,8 +2933,40 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
     if not revenue:
         return False, "No revenue data available for this company.", warnings
 
+    # ── Structural: a cash-flow DCF is the WRONG MODEL for banks and
+    # insurers, not merely short of data. They have no working-capital cycle
+    # (deposits are not debt, loans are not inventory) and no meaningful capex
+    # cycle. Professionals use dividend-discount or residual-income models
+    # here. Refusing outright is more useful than a number produced by an
+    # inapplicable framework.
+    sector_raw = (info.get("sector") or "")
+    if sector_raw in ("Financial Services", "Financials", "Banking", "Insurance"):
+        return False, (
+            "A cash-flow DCF is not an appropriate framework for banks and "
+            "insurers — they have no working-capital or capex cycle for the "
+            "model to work with, which is why professional analysts use "
+            "dividend-discount or residual-income methods instead. Use the "
+            "Convergence tab (earnings-based models) or the Quality tab for "
+            "this company."), warnings
+
     years = sorted(revenue.keys(), reverse=True)
+
+    # The newest fiscal year is often partial — merged from a secondary source
+    # before the primary filing exists, so it may carry revenue but no expense
+    # line. Refusing the whole company for that would discard three or four
+    # perfectly good years. Instead, fall back to the newest year that has
+    # BOTH revenue and expenses, and note the substitution.
     latest = years[0]
+    if expenses.get(latest) is None:
+        complete = [y for y in years
+                    if revenue.get(y) and expenses.get(y) is not None]
+        if complete:
+            skipped = latest
+            latest = complete[0]
+            warnings.append(
+                f"FY{skipped} has revenue but no expense figure yet (the "
+                f"filing is likely not published). Validation used FY{latest} "
+                f"as the most recent complete year.")
     rev_l = revenue.get(latest)
 
     # ── 1. Revenue must exist and be positive in the latest year ─────────────
@@ -3358,3 +3390,128 @@ def get_ideas(
 
     except Exception as e:
         return {"error": f"Idea screen failed: {e}"}
+# ── TECHNICALS ENDPOINT (paste into main.py) ─────────────────────────────────
+# Serves the price-based indicators the Trader horizon needs. Reads
+# pre-computed values from stock_signatures — no computation at request time.
+#
+# Honest framing, applied throughout: these are DESCRIPTIONS of where price
+# sits, not predictions. The base-rate engine is what turns a description
+# into a measured historical tendency, and the two are shown side by side so
+# the user can see how weak or strong the evidence actually is.
+
+@app.get("/technicals")
+def get_technicals(
+    ticker: str = Query(...),
+    market: str = Query("us"),
+):
+    try:
+        from data_store import _conn
+
+        raw = ticker.upper()
+        if market.lower() == "india" and not raw.endswith(".NS"):
+            raw += ".NS"
+
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT date, price, rsi_14, dma_50, dma_200,
+                           pct_vs_50dma, pct_vs_200dma,
+                           pct_from_52wk_high, pct_from_52wk_low,
+                           momentum_3m, momentum_12m, volatility_20d,
+                           rank_vs_200dma, rank_mom_12m, rank_volatility
+                    FROM stock_signatures WHERE ticker = %s
+                    ORDER BY date DESC LIMIT 1
+                """, (raw,))
+                row = cur.fetchone()
+                if not row:
+                    return {"error": f"No price history for {raw}. Technicals need "
+                                     f"at least 200 trading days of data."}
+                # 30 days of RSI for trend context
+                cur.execute("""
+                    SELECT date, rsi_14, price FROM stock_signatures
+                    WHERE ticker = %s ORDER BY date DESC LIMIT 30
+                """, (raw,))
+                recent = cur.fetchall()
+
+        (d, price, rsi, dma50, dma200, p50, p200, phigh, plow,
+         m3, m12, vol, r200, rm12, rvol) = row
+
+        def pct(v):
+            return round(v * 100, 1) if v is not None else None
+
+        # RSI reading — conventional thresholds, with the honest caveat that
+        # they are conventions, not laws
+        if rsi is None:
+            rsi_state, rsi_note = "unavailable", ""
+        elif rsi >= 70:
+            rsi_state = "overbought"
+            rsi_note = ("Above 70 is conventionally 'overbought'. In practice a "
+                        "strong uptrend can hold above 70 for weeks — this is a "
+                        "description of recent buying pressure, not a sell signal.")
+        elif rsi <= 30:
+            rsi_state = "oversold"
+            rsi_note = ("Below 30 is conventionally 'oversold'. Note that a stock "
+                        "in genuine decline can stay below 30 for a long time.")
+        else:
+            rsi_state = "neutral"
+            rsi_note = "Between 30 and 70 — no extreme in recent price action."
+
+        # Trend structure from the two moving averages
+        if dma50 and dma200:
+            if price > dma50 > dma200:
+                trend = "uptrend"
+                trend_note = "Price above the 50-day, which is above the 200-day."
+            elif price < dma50 < dma200:
+                trend = "downtrend"
+                trend_note = "Price below the 50-day, which is below the 200-day."
+            elif price > dma200:
+                trend = "mixed_above_200"
+                trend_note = "Above the long-term average but the shorter average is not aligned."
+            else:
+                trend = "mixed_below_200"
+                trend_note = "Below the long-term average; trend is not constructive."
+        else:
+            trend, trend_note = "insufficient_history", ""
+
+        rsi_series = [{"date": str(x[0]), "rsi": round(x[1], 1) if x[1] else None,
+                       "price": x[2]} for x in reversed(recent)]
+
+        return {
+            "ticker": raw,
+            "market": market,
+            "as_of": str(d),
+            "price": price,
+            "indicators": {
+                "rsi_14":        round(rsi, 1) if rsi is not None else None,
+                "rsi_state":     rsi_state,
+                "rsi_note":      rsi_note,
+                "dma_50":        round(dma50, 2) if dma50 else None,
+                "dma_200":       round(dma200, 2) if dma200 else None,
+                "pct_vs_50dma":  pct(p50),
+                "pct_vs_200dma": pct(p200),
+                "pct_from_52wk_high": pct(phigh),
+                "pct_from_52wk_low":  pct(plow),
+                "return_3m":     pct(m3),
+                "return_12m":    pct(m12),
+                "volatility_20d_annualised": round(vol * (252 ** 0.5) * 100, 1) if vol else None,
+            },
+            "trend": {"state": trend, "note": trend_note},
+            "peer_percentiles": {
+                "vs_200dma":   int(r200) if r200 is not None else None,
+                "momentum_12m": int(rm12) if rm12 is not None else None,
+                "volatility":  int(rvol) if rvol is not None else None,
+            },
+            "rsi_history_30d": rsi_series,
+            "caveats": [
+                "These indicators describe where price has been. They do not "
+                "forecast where it goes next.",
+                "RSI thresholds of 70/30 are conventions, not laws — strong "
+                "trends routinely persist past them in both directions.",
+                "For a measured historical tendency rather than a convention, "
+                "use the Base Rates tab, which reports what actually followed "
+                "similar setups across this universe.",
+            ],
+        }
+    except Exception as e:
+        return {"error": f"Technicals failed: {e}"}
+        
