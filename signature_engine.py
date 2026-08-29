@@ -21,7 +21,7 @@ import pandas as pd
 import numpy as np
 from data_store import _conn
 
-SIGNATURE_BUILD = "2026-07-27b (batched writes, per-batch connections)"
+SIGNATURE_BUILD = "2026-07-27c (computed beta vs equal-weight index)"
 
 
 def _init_table():
@@ -53,6 +53,8 @@ def _init_table():
                 ALTER TABLE stock_signatures ADD COLUMN IF NOT EXISTS pct_vs_50dma DOUBLE PRECISION;
                 ALTER TABLE stock_signatures ADD COLUMN IF NOT EXISTS dma_50 DOUBLE PRECISION;
                 ALTER TABLE stock_signatures ADD COLUMN IF NOT EXISTS dma_200 DOUBLE PRECISION;
+                ALTER TABLE stock_signatures ADD COLUMN IF NOT EXISTS beta_2y DOUBLE PRECISION;
+                ALTER TABLE stock_signatures ADD COLUMN IF NOT EXISTS beta_r2 DOUBLE PRECISION;
                 CREATE INDEX IF NOT EXISTS idx_sig_date ON stock_signatures(date);
                 CREATE INDEX IF NOT EXISTS idx_sig_market ON stock_signatures(market);
             """)
@@ -173,6 +175,47 @@ def add_cross_sectional_ranks(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_beta(df: pd.DataFrame, window: int = 504) -> pd.DataFrame:
+    """Beta computed from OUR OWN price history, regressed against an
+    equal-weight index of the stock's own market.
+
+    Why compute it rather than take yfinance's value: yfinance reported a
+    beta of 0.162 for ExxonMobil, which drove WACC down to 4.77% and produced
+    a wildly inflated valuation. XOM's actual beta is around 0.9-1.1. Clamping
+    a bad number to a floor still uses a bad number; deriving it from 1.2M
+    daily closes we already hold means it can be verified and explained.
+
+    beta = cov(stock returns, market returns) / var(market returns)
+    over a rolling 2-year (504 trading day) window.
+
+    r_squared is stored alongside: a beta from a regression that explains
+    almost none of the variance is not a number to lean on, and downstream
+    code can see that rather than guess.
+    """
+    df = df.sort_values(["ticker", "date"]).copy()
+    df["ret"] = df.groupby("ticker")["close"].pct_change()
+
+    # Equal-weight market return per market per date
+    mkt = (df.groupby(["market", "date"])["ret"]
+             .mean().rename("mkt_ret").reset_index())
+    df = df.merge(mkt, on=["market", "date"], how="left")
+
+    betas, r2s = [], []
+    for _, g in df.groupby("ticker", sort=False):
+        s, m = g["ret"], g["mkt_ret"]
+        cov = s.rolling(window, min_periods=252).cov(m)
+        var = m.rolling(window, min_periods=252).var()
+        b = cov / var.replace(0, np.nan)
+        # R^2 of a single-variable regression is just the squared correlation
+        corr = s.rolling(window, min_periods=252).corr(m)
+        betas.append(b)
+        r2s.append(corr ** 2)
+
+    df["beta_2y"] = pd.concat(betas).sort_index()
+    df["beta_r2"] = pd.concat(r2s).sort_index()
+    return df.drop(columns=["ret", "mkt_ret"])
+
+
 def backfill_signatures(full_rebuild: bool = True, recent_days: int = None):
     _init_table()
     if recent_days:
@@ -196,6 +239,11 @@ def backfill_signatures(full_rebuild: bool = True, recent_days: int = None):
     feats = add_cross_sectional_ranks(feats)
     print(f"  done ({time.time()-t0:.0f}s)")
 
+    print("Computing beta against the equal-weight market index...")
+    t0 = time.time()
+    feats = add_beta(feats)
+    print(f"  done ({time.time()-t0:.0f}s)")
+
     print("Writing to store...")
     t0 = time.time()
 
@@ -205,7 +253,8 @@ def backfill_signatures(full_rebuild: bool = True, recent_days: int = None):
          _n(r.momentum_3m), _n(r.momentum_12m), _n(r.volatility_20d),
          _n(r.rank_vs_200dma), _n(r.rank_from_high), _n(r.rank_from_low),
          _n(r.rank_mom_3m), _n(r.rank_mom_12m), _n(r.rank_volatility),
-         _n(r.rsi_14), _n(r.pct_vs_50dma), _n(r.dma_50), _n(r.dma_200))
+         _n(r.rsi_14), _n(r.pct_vs_50dma), _n(r.dma_50), _n(r.dma_200),
+         _n(r.beta_2y), _n(r.beta_r2))
         for r in feats.itertuples()
     ]
 
@@ -215,7 +264,8 @@ def backfill_signatures(full_rebuild: bool = True, recent_days: int = None):
              pct_from_52wk_high, pct_from_52wk_low, momentum_3m,
              momentum_12m, volatility_20d, rank_vs_200dma,
              rank_from_high, rank_from_low, rank_mom_3m, rank_mom_12m,
-             rank_volatility, rsi_14, pct_vs_50dma, dma_50, dma_200)
+             rank_volatility, rsi_14, pct_vs_50dma, dma_50, dma_200,
+             beta_2y, beta_r2)
         VALUES %s
         ON CONFLICT (ticker, date) DO UPDATE SET
             price=EXCLUDED.price,
@@ -234,7 +284,9 @@ def backfill_signatures(full_rebuild: bool = True, recent_days: int = None):
             rsi_14=EXCLUDED.rsi_14,
             pct_vs_50dma=EXCLUDED.pct_vs_50dma,
             dma_50=EXCLUDED.dma_50,
-            dma_200=EXCLUDED.dma_200
+            dma_200=EXCLUDED.dma_200,
+            beta_2y=EXCLUDED.beta_2y,
+            beta_r2=EXCLUDED.beta_r2
     """
 
     # A single long-lived connection writing 1.19M rows gets killed by the
