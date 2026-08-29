@@ -21,7 +21,7 @@ import pandas as pd
 import numpy as np
 from data_store import _conn
 
-SIGNATURE_BUILD = "2026-07-26f (avoid unnecessary full-table churn)"
+SIGNATURE_BUILD = "2026-07-27a (RSI-14, 50-DMA)"
 
 
 def _init_table():
@@ -49,6 +49,10 @@ def _init_table():
                     rank_volatility     DOUBLE PRECISION,
                     PRIMARY KEY (ticker, date)
                 );
+                ALTER TABLE stock_signatures ADD COLUMN IF NOT EXISTS rsi_14 DOUBLE PRECISION;
+                ALTER TABLE stock_signatures ADD COLUMN IF NOT EXISTS pct_vs_50dma DOUBLE PRECISION;
+                ALTER TABLE stock_signatures ADD COLUMN IF NOT EXISTS dma_50 DOUBLE PRECISION;
+                ALTER TABLE stock_signatures ADD COLUMN IF NOT EXISTS dma_200 DOUBLE PRECISION;
                 CREATE INDEX IF NOT EXISTS idx_sig_date ON stock_signatures(date);
                 CREATE INDEX IF NOT EXISTS idx_sig_market ON stock_signatures(market);
             """)
@@ -107,6 +111,19 @@ def compute_raw_features(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         dma200   = close.rolling(200, min_periods=150).mean()
+        dma50    = close.rolling(50, min_periods=35).mean()
+
+        # RSI-14 with Wilder's smoothing (the standard formulation — a simple
+        # rolling mean gives visibly different values and would not match what
+        # any charting package shows)
+        _delta = close.diff()
+        _gain  = _delta.clip(lower=0)
+        _loss  = (-_delta).clip(lower=0)
+        _ag    = _gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        _al    = _loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        _rs    = _ag / _al.replace(0, float("nan"))
+        rsi14  = 100 - (100 / (1 + _rs))
+        rsi14  = rsi14.fillna(50)   # neutral when undefined (flat series)
         high52   = close.rolling(252, min_periods=200).max()
         low52    = close.rolling(252, min_periods=200).min()
         ret_3m   = close / close.shift(63) - 1
@@ -123,6 +140,10 @@ def compute_raw_features(df: pd.DataFrame) -> pd.DataFrame:
             "momentum_3m":        ret_3m,
             "momentum_12m":       ret_12m,
             "volatility_20d":     vol20,
+            "rsi_14":             rsi14,
+            "dma_50":             dma50,
+            "dma_200":            dma200,
+            "pct_vs_50dma":       close / dma50 - 1,
         })
         out.append(g2)
     if not out:
@@ -187,11 +208,18 @@ def backfill_signatures(full_rebuild: bool = True, recent_days: int = None):
                  _n(r.pct_vs_200dma), _n(r.pct_from_52wk_high), _n(r.pct_from_52wk_low),
                  _n(r.momentum_3m), _n(r.momentum_12m), _n(r.volatility_20d),
                  _n(r.rank_vs_200dma), _n(r.rank_from_high), _n(r.rank_from_low),
-                 _n(r.rank_mom_3m), _n(r.rank_mom_12m), _n(r.rank_volatility))
+                 _n(r.rank_mom_3m), _n(r.rank_mom_12m), _n(r.rank_volatility),
+                 _n(r.rsi_14), _n(r.pct_vs_50dma), _n(r.dma_50), _n(r.dma_200))
                 for r in feats.itertuples()
             ]
             execute_values(cur, """
-                INSERT INTO stock_signatures VALUES %s
+                INSERT INTO stock_signatures
+                    (ticker, date, market, price, pct_vs_200dma,
+                     pct_from_52wk_high, pct_from_52wk_low, momentum_3m,
+                     momentum_12m, volatility_20d, rank_vs_200dma,
+                     rank_from_high, rank_from_low, rank_mom_3m, rank_mom_12m,
+                     rank_volatility, rsi_14, pct_vs_50dma, dma_50, dma_200)
+                VALUES %s
                 ON CONFLICT (ticker, date) DO UPDATE SET
                     price=EXCLUDED.price,
                     pct_vs_200dma=EXCLUDED.pct_vs_200dma,
@@ -205,7 +233,11 @@ def backfill_signatures(full_rebuild: bool = True, recent_days: int = None):
                     rank_from_low=EXCLUDED.rank_from_low,
                     rank_mom_3m=EXCLUDED.rank_mom_3m,
                     rank_mom_12m=EXCLUDED.rank_mom_12m,
-                    rank_volatility=EXCLUDED.rank_volatility
+                    rank_volatility=EXCLUDED.rank_volatility,
+                    rsi_14=EXCLUDED.rsi_14,
+                    pct_vs_50dma=EXCLUDED.pct_vs_50dma,
+                    dma_50=EXCLUDED.dma_50,
+                    dma_200=EXCLUDED.dma_200
             """, rows, page_size=2000)
         conn.commit()
     finally:
