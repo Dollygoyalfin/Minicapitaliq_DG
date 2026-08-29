@@ -531,6 +531,7 @@
   <div class="tab" onclick="switchTab('screener',this)">Screener</div>
   <div class="tab" onclick="switchTab('convergence',this)">🎯 Convergence</div>
   <div class="tab" onclick="switchTab('quality',this)">🏰 Quality</div>
+  <div class="tab" onclick="switchTab('technicals',this)">📈 Technicals</div>
   <div class="tab" onclick="switchTab('ideas',this)">💡 Ideas</div>
   <div class="tab" onclick="switchTab('baserates',this)">📊 Base Rates</div>
   <div class="tab" onclick="switchTab('reversedcf',this)">🔄 Reverse DCF</div>
@@ -752,6 +753,27 @@
   </div>
 </div>
 
+<!-- TECHNICALS TAB -->
+<div id="tab-technicals" class="tab-content">
+  <div class="container">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+      <span style="font-size:0.78rem;opacity:0.7">Horizon:</span>
+      <button class="btn-ghost" id="horizon-investor" onclick="setHorizon('investor')"
+              style="padding:5px 12px;font-size:0.76rem">🏛 Investor</button>
+      <button class="btn-ghost" id="horizon-trader" onclick="setHorizon('trader')"
+              style="padding:5px 12px;font-size:0.76rem">⚡ Trader</button>
+    </div>
+    <div id="horizon-note" style="font-size:0.75rem;opacity:0.7;margin-bottom:12px;line-height:1.5"></div>
+    <button class="btn-primary" onclick="runTechnicals()">📈 Load Technicals</button>
+    <div id="technicals-results" style="margin-top:14px">
+      <div class="state-empty"><span class="icon">📈</span>
+        Price-based indicators — RSI, moving averages, and where price sits
+        versus its own range.
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- IDEAS TAB -->
 <div id="tab-ideas" class="tab-content">
   <div class="container">
@@ -880,6 +902,10 @@
   function getTicker() { return document.getElementById("ticker").value.trim(); }
   function getMarket()  { return document.getElementById("market").value; }
 
+  window.addEventListener("DOMContentLoaded", function () {
+    try { setHorizon(loadHorizon()); } catch (e) {}
+  });
+
   // Every endpoint call goes through this. Previously a 503 (Render free-tier
   // cold start) or a 500 returned an empty body, and `res.json()` threw
   // "JSON.parse: unexpected end of data" — technically accurate, useless to
@@ -907,6 +933,114 @@
       throw new Error(`Server sent an unreadable response (HTTP ${res.status}): `
                     + text.slice(0, 120));
     }
+  }
+
+  // Jhunjhunwala ran two separate books: a long-term investment book and a
+  // short-term trading book, with different rules for each. The horizon
+  // toggle applies that idea — same data, different emphasis, so the user is
+  // never mixing a 12-month thesis with a 2-week one.
+  function loadHorizon() {
+    try { return window.localStorage.getItem("mtq_horizon") || "investor"; }
+    catch (e) { return "investor"; }
+  }
+  function saveHorizon(h) {
+    try { window.localStorage.setItem("mtq_horizon", h); } catch (e) {}
+  }
+  let HORIZON = loadHorizon();
+
+  const HORIZON_NOTES = {
+    investor: "<strong>Investor view.</strong> Weight the Quality grade, DCF and "
+            + "owner earnings, the Munger red-flag checklist, and the 12-month base "
+            + "rate. Technicals below are context only — at this horizon, business "
+            + "quality and price paid dominate returns.",
+    trader:   "<strong>Trader view.</strong> Weight RSI, position versus the 50- and "
+            + "200-day averages, recent momentum, and the 1-month base rate. Be aware "
+            + "that our own validation found short-horizon signals to be weak — the "
+            + "1-month median excess return for most setups is close to zero."
+  };
+
+  function setHorizon(h) {
+    HORIZON = h;
+    saveHorizon(h);
+    const inv = document.getElementById("horizon-investor");
+    const trd = document.getElementById("horizon-trader");
+    if (inv && trd) {
+      inv.style.background = h === "investor" ? "var(--accent)" : "";
+      inv.style.color      = h === "investor" ? "#fff" : "";
+      trd.style.background = h === "trader"   ? "var(--accent)" : "";
+      trd.style.color      = h === "trader"   ? "#fff" : "";
+    }
+    const note = document.getElementById("horizon-note");
+    if (note) note.innerHTML = HORIZON_NOTES[h];
+  }
+
+  async function runTechnicals() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("technicals-results", "Enter a ticker first."); return; }
+    setLoading("technicals-results", `Loading technicals for ${ticker.toUpperCase()}...`);
+    try {
+      const d = await safeFetch(`${BASE}/technicals?ticker=${ticker}&market=${market}`);
+      if (d.error) { setError("technicals-results", d.error); return; }
+      const cur = market === "india" ? "₹" : "$";
+      const I = d.indicators || {};
+
+      const rsiCol = I.rsi_state === "overbought" ? "#ef4444"
+                   : I.rsi_state === "oversold"   ? "#22c55e" : "var(--accent)";
+      const trendCol = d.trend.state === "uptrend" ? "#22c55e"
+                     : d.trend.state === "downtrend" ? "#ef4444" : "#eab308";
+
+      const metric = (label, val, suffix) => `
+        <div style="padding:7px 0;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-between;font-size:0.82rem">
+          <span style="opacity:0.7">${label}</span>
+          <span class="mono">${val == null ? "—" : val + (suffix||"")}</span>
+        </div>`;
+
+      document.getElementById("technicals-results").innerHTML = `
+        <div class="result-card">
+          <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start">
+            <div style="flex:1;min-width:170px">
+              <div style="font-size:0.72rem;opacity:0.6">RSI (14)</div>
+              <div class="mono" style="font-size:2.2rem;font-weight:800;color:${rsiCol}">
+                ${I.rsi_14 ?? "—"}</div>
+              <div style="font-size:0.76rem;text-transform:capitalize;color:${rsiCol}">${I.rsi_state}</div>
+            </div>
+            <div style="flex:1;min-width:170px">
+              <div style="font-size:0.72rem;opacity:0.6">Trend</div>
+              <div style="font-size:1.25rem;font-weight:700;color:${trendCol};text-transform:capitalize">
+                ${(d.trend.state||"").replace(/_/g," ")}</div>
+              <div style="font-size:0.72rem;opacity:0.7">${d.trend.note}</div>
+            </div>
+            <div style="flex:1;min-width:150px">
+              <div style="font-size:0.72rem;opacity:0.6">Price</div>
+              <div class="mono" style="font-size:1.4rem;font-weight:700">${cur}${(d.price||0).toLocaleString()}</div>
+              <div style="font-size:0.7rem;opacity:0.55">as of ${d.as_of}</div>
+            </div>
+          </div>
+
+          <div style="font-size:0.75rem;opacity:0.75;margin:10px 0;padding:8px 10px;background:rgba(255,255,255,0.04);border-radius:4px">
+            ${I.rsi_note || ""}
+          </div>
+
+          <div style="margin-top:12px;font-weight:600;font-size:0.88rem">Moving Averages</div>
+          ${metric("50-day average", I.dma_50 ? cur + I.dma_50.toLocaleString() : null)}
+          ${metric("200-day average", I.dma_200 ? cur + I.dma_200.toLocaleString() : null)}
+          ${metric("Price vs 50-day", I.pct_vs_50dma, "%")}
+          ${metric("Price vs 200-day", I.pct_vs_200dma, "%")}
+
+          <div style="margin-top:12px;font-weight:600;font-size:0.88rem">Range &amp; Momentum</div>
+          ${metric("From 52-week high", I.pct_from_52wk_high, "%")}
+          ${metric("From 52-week low", I.pct_from_52wk_low, "%")}
+          ${metric("3-month return", I.return_3m, "%")}
+          ${metric("12-month return", I.return_12m, "%")}
+          ${metric("Volatility (annualised)", I.volatility_20d_annualised, "%")}
+
+          <div style="margin-top:14px;padding:10px;background:rgba(255,255,255,0.04);border-radius:4px">
+            <ul style="margin:0;padding-left:16px;font-size:0.71rem;opacity:0.7">
+              ${(d.caveats||[]).map(x=>`<li style="margin:3px 0">${x}</li>`).join("")}
+            </ul>
+          </div>
+        </div>`;
+    } catch (e) { setError("technicals-results", e.message); }
   }
 
   async function runIdeas() {
