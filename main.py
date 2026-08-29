@@ -937,11 +937,18 @@ def get_dcf(
     # revenue decline, TSLA's inverted margins, XOM's 0.16 beta). They are
     # deliberately conservative, which systematically lowers intrinsic value.
     # Surfacing them lets the user see and change that conservatism.
-    max_revenue_growth: float = Query(0.30, description="Cap on projected revenue growth"),
-    min_revenue_growth: float = Query(-0.05, description="Floor on projected revenue growth"),
-    freeze_margins: bool      = Query(True,  description="Prevent opex growing faster than revenue"),
     beta_floor: float         = Query(0.50,  description="Minimum beta used in WACC"),
-    beta_ceiling: float       = Query(2.50,  description="Maximum beta used in WACC")
+    beta_ceiling: float       = Query(2.50,  description="Maximum beta used in WACC"),
+    # ── Operating margin assumption ───────────────────────────────────────
+    # Costs are projected as a FUNCTION OF REVENUE, not as an independent
+    # exponential series. Projecting the two separately let their different
+    # growth rates silently expand or compress the margin every year — for
+    # NALCO it drove a 40.7% margin to 52.4% by year 5 and 61.8% by year 10,
+    # far outside anything the company has ever achieved, with no assumption
+    # having been made anywhere. Now the margin is an explicit input.
+    margin_basis: str    = Query("current",
+                                 description="current | average | median | custom"),
+    custom_margin: float = Query(0.0, description="Used when margin_basis=custom")
 ):
     """
     Cash-based FCFF DCF Valuation.
@@ -999,8 +1006,37 @@ def get_dcf(
         current_price      = info.get("currentPrice")
         shares_outstanding = info.get("sharesOutstanding")
         beta               = info.get("beta", 1.0) or 1.0
-        raw_beta           = float(beta)
-        beta               = max(beta_floor, min(raw_beta, beta_ceiling))
+        # ── Beta: prefer OUR OWN computed value over the external one ───────
+        # yfinance reported beta 0.162 for ExxonMobil (real: ~0.9-1.1), which
+        # produced a 4.77% WACC and a wildly inflated valuation. Rather than
+        # clamp a bad number, use one regressed from our own 2 years of daily
+        # returns against an equal-weight index of the same market — verifiable
+        # and explainable. The external value remains the fallback.
+        raw_beta      = float(beta)
+        beta_source   = "external (yfinance)"
+        beta_r2       = None
+        computed_beta = None
+        try:
+            from data_store import _conn as _bconn
+            _bt = raw_ticker
+            with _bconn() as _bc:
+                with _bc.cursor() as _bcur:
+                    _bcur.execute("""SELECT beta_2y, beta_r2 FROM stock_signatures
+                                     WHERE ticker = %s AND beta_2y IS NOT NULL
+                                     ORDER BY date DESC LIMIT 1""", (_bt,))
+                    _br = _bcur.fetchone()
+            if _br and _br[0] is not None:
+                computed_beta, beta_r2 = float(_br[0]), (float(_br[1]) if _br[1] else None)
+                # A beta from a regression explaining almost nothing is not
+                # more trustworthy than the external figure — require the
+                # market to explain at least 10% of the stock's variance.
+                if beta_r2 is not None and beta_r2 >= 0.10:
+                    raw_beta    = computed_beta
+                    beta_source = "computed from own price history (2y daily)"
+        except Exception:
+            pass
+
+        beta = max(beta_floor, min(raw_beta, beta_ceiling))
         market_cap         = info.get("marketCap")
         total_debt         = info.get("totalDebt", 0) or 0
         total_cash         = info.get("totalCash", 0) or 0
@@ -1240,9 +1276,26 @@ def get_dcf(
         #   which previously inverted margins for TSLA-type profiles
         raw_revenue_growth = revenue_growth
         raw_opex_growth    = opex_growth
-        revenue_growth = max(min_revenue_growth, min(revenue_growth, max_revenue_growth))
-        if freeze_margins:
-            opex_growth = min(opex_growth, revenue_growth)
+
+        # Growth FADE replaces the old hard clamp of -5%..+30%.
+        #
+        # The clamp was wrong in both directions: the +30% ceiling arbitrarily
+        # penalised genuinely fast growers, and the -5% FLOOR made declining
+        # businesses look BETTER than their own data — the opposite of
+        # conservative. The real defect was never the rate itself, it was
+        # holding ANY observed rate constant for five years, which turns a
+        # cyclical window into a permanent trend.
+        #
+        # Standard practice instead: growth decays from the observed rate
+        # toward terminal growth across the horizon. A 40% grower is allowed
+        # to be a 40% grower in year one without being capped, and a company
+        # in a downcycle is not assumed to shrink forever.
+        #
+        # The bound below is a DATA-ERROR guard, not a view on growth: a
+        # reading beyond +-60% almost always means a near-zero base year or a
+        # merger artefact rather than a real trend.
+        if revenue_growth > 0.60 or revenue_growth < -0.60:
+            revenue_growth = max(-0.60, min(revenue_growth, 0.60))
         opex_growth    = max(-0.10, min(opex_growth, 0.30))
         # Cash-based DCF needs a real balance sheet — refuse garbage-in
         if (not any(v for v in ca_series if v)
@@ -1357,8 +1410,49 @@ def get_dcf(
         proj_cpltd_list   = project_line(base_cpltd,   cpltd_growth,   projection_years)
         proj_net_ppe_list = project_line(base_net_ppe, net_ppe_growth, projection_years)
         proj_depr_list    = project_line(base_depr,    depr_growth,    projection_years)
-        proj_rev_list     = project_line(base_rev,     revenue_growth, projection_years)
-        proj_opex_list    = project_line(base_opex,    opex_growth,    projection_years)
+        def project_fading(base, start_g, end_g, years):
+            """Growth decays linearly from the observed rate to terminal
+            growth. Year 1 uses the observed rate; the final year uses
+            terminal growth."""
+            out, v = [], base
+            for i in range(years):
+                g = (start_g if years == 1
+                     else start_g + (end_g - start_g) * (i / (years - 1)))
+                v = v * (1 + g)
+                out.append(v)
+            return out
+
+        proj_rev_list  = project_fading(base_rev, revenue_growth,
+                                        terminal_growth_rate, projection_years)
+        growth_path    = [round((start_g := (revenue_growth if projection_years == 1
+                          else revenue_growth + (terminal_growth_rate - revenue_growth)
+                               * (i / (projection_years - 1)))), 4)
+                          for i in range(projection_years)]
+
+        # ── Operating margin: forecast the MARGIN, derive the cost line ──────
+        # Historical margins, newest first
+        hist_margins = []
+        for i in range(min(len(revenue_series), len(opex_series))):
+            r_i, o_i = revenue_series[i], opex_series[i]
+            if r_i and r_i > 0 and o_i is not None:
+                hist_margins.append((r_i - o_i) / r_i)
+
+        base_margin = (base_rev - base_opex) / base_rev if base_rev else 0.0
+        if margin_basis == "average" and hist_margins:
+            margin_used = sum(hist_margins) / len(hist_margins)
+        elif margin_basis == "median" and hist_margins:
+            s = sorted(hist_margins)
+            margin_used = s[len(s) // 2]
+        elif margin_basis == "custom" and custom_margin:
+            margin_used = custom_margin
+        else:
+            margin_basis = "current"
+            margin_used = base_margin
+
+        # Costs follow revenue at the assumed margin. Holding the margin flat
+        # makes NO claim that the business improves — any change now has to be
+        # chosen deliberately rather than emerging from compounding.
+        proj_opex_list = [r * (1 - margin_used) for r in proj_rev_list]
 
         # ── Build projection table ────────────────────────────────────────────
         projection_table = []
@@ -1428,8 +1522,18 @@ def get_dcf(
         # ── Terminal Year ─────────────────────────────────────────────────────────
         # Revenue & OpEx: grow at terminal_growth_rate from last projected year
         # BS lines: rolling avg of last 5 projected years (mean-reverting)
+        # Economic constraint (Damodaran): no company outgrows the economy in
+        # perpetuity, and the risk-free rate is the standard proxy for
+        # long-run nominal economic growth. This replaces the arbitrary
+        # "WACC - g >= 4%" floor with the actual reason such a floor existed.
+        if terminal_growth_rate > risk_free_rate:
+            terminal_growth_capped = True
+            terminal_growth_rate = risk_free_rate
+        else:
+            terminal_growth_capped = False
+
         term_rev     = proj_rev_list[-1]  * (1 + terminal_growth_rate)
-        term_opex    = proj_opex_list[-1] * (1 + terminal_growth_rate)
+        term_opex    = term_rev * (1 - margin_used)
         term_ca      = rolling_avg_terminal(proj_ca_list)
         term_cl      = rolling_avg_terminal(proj_cl_list)
         term_cash    = rolling_avg_terminal(proj_cash_list)
@@ -1601,22 +1705,66 @@ def get_dcf(
             "margin_of_safety_used":                 margin_of_safety,
             "assumptions_applied": {
                 "revenue_growth": {
-                    "raw_from_data": round(raw_revenue_growth, 4),
-                    "used":          round(revenue_growth, 4),
-                    "clamped":       abs(raw_revenue_growth - revenue_growth) > 1e-9,
-                    "bounds":        [min_revenue_growth, max_revenue_growth],
+                    "raw_from_data":  round(raw_revenue_growth, 4),
+                    "year_one_used":  round(revenue_growth, 4),
+                    "data_error_guard_applied":
+                        abs(raw_revenue_growth - revenue_growth) > 1e-9,
+                    "note": ("No growth cap is applied. The +-60% bound is a "
+                             "data-error guard for near-zero base years and "
+                             "merger artefacts, not a view on achievable growth."),
                 },
-                "opex_growth": {
-                    "raw_from_data": round(raw_opex_growth, 4),
-                    "used":          round(opex_growth, 4),
-                    "clamped":       abs(raw_opex_growth - opex_growth) > 1e-9,
-                    "margin_freeze": freeze_margins,
-                },
+                "opex_growth_note": (
+                    "Operating expenses are no longer projected with their own "
+                    "growth rate. They are derived from revenue at the margin "
+                    "shown below, which is why the old 'margin freeze' setting "
+                    "has been removed — it can no longer be needed."
+                ),
                 "beta": {
+                    "source":        beta_source,
                     "raw_from_data": round(raw_beta, 3),
                     "used":          round(beta, 3),
                     "clamped":       abs(raw_beta - beta) > 1e-9,
                     "bounds":        [beta_floor, beta_ceiling],
+                    "computed_beta": (round(computed_beta, 3)
+                                      if computed_beta is not None else None),
+                    "regression_r2": (round(beta_r2, 3)
+                                      if beta_r2 is not None else None),
+                    "note": ("Beta is regressed from our own daily returns "
+                             "against an equal-weight index of the same market. "
+                             "R² shows how much of this stock's movement the "
+                             "market explains — a low R² means beta is a weak "
+                             "descriptor for this company regardless of its value."),
+                },
+                "growth_fade": {
+                    "observed_rate":  round(raw_revenue_growth, 4),
+                    "year_by_year":   growth_path,
+                    "fades_to":       round(terminal_growth_rate, 4),
+                    "note": ("Growth decays from the observed rate toward "
+                             "terminal growth rather than being held flat, so "
+                             "a single cyclical window is not projected as a "
+                             "permanent trend."),
+                },
+                "terminal_growth": {
+                    "used":    round(terminal_growth_rate, 4),
+                    "capped_at_risk_free": terminal_growth_capped,
+                    "note": ("Terminal growth cannot exceed the risk-free rate — "
+                             "no company outgrows the economy in perpetuity."),
+                },
+                "operating_margin": {
+                    "basis":            margin_basis,
+                    "used":             round(margin_used, 4),
+                    "latest_year":      round(base_margin, 4),
+                    "historical_range": ([round(min(hist_margins), 4),
+                                          round(max(hist_margins), 4)]
+                                         if hist_margins else None),
+                    "historical_avg":   (round(sum(hist_margins)/len(hist_margins), 4)
+                                         if hist_margins else None),
+                    "note": ("Costs are projected as a function of revenue at "
+                             "this margin, so margins stay flat unless you "
+                             "change the basis. Previously revenue and costs "
+                             "were projected independently, which let margins "
+                             "drift far outside anything the company had "
+                             "achieved."),
                 },
                 "note": ("These guardrails are deliberately conservative and "
                          "lower intrinsic value. Adjust them to see how much "
