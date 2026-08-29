@@ -569,26 +569,24 @@
         </summary>
         <div style="padding:10px 0 4px">
           <div style="font-size:0.73rem;opacity:0.65;margin-bottom:10px;line-height:1.5">
-            Each guardrail exists to stop a specific failure: unclamped revenue decline
-            compounds into nonsense, opex outgrowing revenue inverts margins, and an
-            implausibly low beta produces an unrealistically low discount rate.
-            They are conservative by design — widen them to see how much of the
-            valuation depends on them.
+            Revenue growth is no longer capped — it now <strong>fades</strong> from the
+            observed rate toward terminal growth, so a fast grower is not penalised and
+            a company in a downcycle is not assumed to shrink forever. Operating costs
+            are derived from revenue at the margin basis you choose, so margins cannot
+            drift on their own. The beta bounds remain because beta comes from an
+            external source that occasionally reports implausible values.
           </div>
           <div class="params-grid">
-            <div class="param-group"><label>Max Revenue Growth</label>
-              <input type="number" id="dcf-maxg" value="0.30" step="0.05"/></div>
-            <div class="param-group"><label>Min Revenue Growth</label>
-              <input type="number" id="dcf-ming" value="-0.05" step="0.05"/></div>
+            <div class="param-group"><label>Operating Margin Basis</label>
+              <select id="dcf-marginbasis" style="width:100%">
+                <option value="current" selected>Current — latest year's margin</option>
+                <option value="average">Average of available years</option>
+                <option value="median">Median of available years</option>
+              </select></div>
             <div class="param-group"><label>Beta Floor</label>
               <input type="number" id="dcf-betamin" value="0.50" step="0.1"/></div>
             <div class="param-group"><label>Beta Ceiling</label>
               <input type="number" id="dcf-betamax" value="2.50" step="0.1"/></div>
-            <div class="param-group"><label>Freeze Margins</label>
-              <select id="dcf-freeze" style="width:100%">
-                <option value="true" selected>Yes — opex can't outgrow revenue</option>
-                <option value="false">No — use raw opex growth</option>
-              </select></div>
           </div>
         </div>
       </details>
@@ -1544,14 +1542,13 @@
     const rf       = document.getElementById("dcf-rf").value       || 0.04;
     const mr       = document.getElementById("dcf-mr").value       || 0.10;
     const mos      = document.getElementById("dcf-mos").value      || 0.25;
-    const maxg     = document.getElementById("dcf-maxg").value     || 0.30;
-    const ming     = document.getElementById("dcf-ming").value     || -0.05;
+    const mbasis   = document.getElementById("dcf-marginbasis").value || "current";
     const bmin     = document.getElementById("dcf-betamin").value  || 0.50;
     const bmax     = document.getElementById("dcf-betamax").value  || 2.50;
-    const freeze   = document.getElementById("dcf-freeze").value   || "true";
+
 
     try {
-      const __RES = await safeFetch(`${BASE}/dcf?ticker=${ticker}&market=${market}&projection_years=${years}&terminal_growth_rate=${terminal}&risk_free_rate=${rf}&market_return=${mr}&margin_of_safety=${mos}&max_revenue_growth=${maxg}&min_revenue_growth=${ming}&beta_floor=${bmin}&beta_ceiling=${bmax}&freeze_margins=${freeze}`);
+      const __RES = await safeFetch(`${BASE}/dcf?ticker=${ticker}&market=${market}&projection_years=${years}&terminal_growth_rate=${terminal}&risk_free_rate=${rf}&market_return=${mr}&margin_of_safety=${mos}&beta_floor=${bmin}&beta_ceiling=${bmax}&margin_basis=${mbasis}`);
       const d = __RES;
       if (d.error) { setError("dcf-results", d.error); return; }
 
@@ -1560,15 +1557,30 @@
       const A = d.assumptions_applied;
       if (A) {
         const items = [];
-        if (A.revenue_growth && A.revenue_growth.clamped)
-          items.push(`Revenue growth capped: data showed <strong>${(A.revenue_growth.raw_from_data*100).toFixed(1)}%</strong>, model used <strong>${(A.revenue_growth.used*100).toFixed(1)}%</strong>`);
-        if (A.opex_growth && A.opex_growth.clamped)
-          items.push(`Opex growth frozen to revenue: data showed <strong>${(A.opex_growth.raw_from_data*100).toFixed(1)}%</strong>, model used <strong>${(A.opex_growth.used*100).toFixed(1)}%</strong>`);
-        if (A.beta && A.beta.clamped)
-          items.push(`Beta clamped: reported <strong>${A.beta.raw_from_data}</strong>, model used <strong>${A.beta.used}</strong>`);
+        if (A.revenue_growth && A.revenue_growth.data_error_guard_applied)
+          items.push(`Revenue growth bounded by the data-error guard: data showed <strong>${(A.revenue_growth.raw_from_data*100).toFixed(1)}%</strong>, model used <strong>${(A.revenue_growth.year_one_used*100).toFixed(1)}%</strong>`);
+        if (A.operating_margin) {
+          const m = A.operating_margin;
+          const rng = m.historical_range
+            ? ` (this company's history: ${(m.historical_range[0]*100).toFixed(1)}% to ${(m.historical_range[1]*100).toFixed(1)}%)` : "";
+          items.push(`Operating margin held at <strong>${(m.used*100).toFixed(1)}%</strong> (${m.basis})${rng} — costs are derived from revenue, so margins do not drift`);
+        }
+        if (A.growth_fade)
+          items.push(`Revenue growth fades from <strong>${(A.growth_fade.observed_rate*100).toFixed(1)}%</strong> to <strong>${(A.growth_fade.fades_to*100).toFixed(1)}%</strong> across the projection`);
+        if (A.terminal_growth && A.terminal_growth.capped_at_risk_free)
+          items.push(`Terminal growth reduced to the risk-free rate (<strong>${(A.terminal_growth.used*100).toFixed(1)}%</strong>) — no company outgrows the economy in perpetuity`);
+        if (A.beta) {
+          const src = A.beta.source && A.beta.source.startsWith("computed")
+            ? `computed from this stock's own 2-year price history` : `from an external source`;
+          const r2  = A.beta.regression_r2 != null
+            ? ` (R² ${A.beta.regression_r2} — how much of its movement the market explains)` : "";
+          items.push(`Beta <strong>${A.beta.used}</strong> ${src}${r2}`);
+          if (A.beta.clamped)
+            items.push(`Beta was bounded: raw value <strong>${A.beta.raw_from_data}</strong> fell outside [${A.beta.bounds[0]}, ${A.beta.bounds[1]}]`);
+        }
         if (items.length) {
           clampHtml = `<div style="margin:12px 0;padding:10px 12px;background:rgba(234,179,8,0.08);border-left:3px solid #eab308;border-radius:2px">
-            <div style="font-size:0.78rem;font-weight:600;margin-bottom:4px">⚙️ Guardrails changed this valuation</div>
+            <div style="font-size:0.78rem;font-weight:600;margin-bottom:4px">⚙️ Assumptions behind this valuation</div>
             <ul style="margin:0;padding-left:16px;font-size:0.75rem;opacity:0.85">
               ${items.map(i => `<li style="margin:3px 0">${i}</li>`).join("")}
             </ul>
