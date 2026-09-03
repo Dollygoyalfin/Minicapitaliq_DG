@@ -102,6 +102,16 @@ def init_db():
         PRIMARY KEY (ticker, fiscal_year)
     );
 
+    -- Working-capital components. Without these, DeltaNWC had to be derived
+    -- from four independently-projected aggregate lines, which is arbitrary.
+    -- With them, receivables can be driven by revenue (DSO) and inventory /
+    -- payables by cost of revenue (DIO / DPO), which is how the balance
+    -- sheet actually behaves.
+    ALTER TABLE balance_sheets ADD COLUMN IF NOT EXISTS accounts_receivable DOUBLE PRECISION;
+    ALTER TABLE balance_sheets ADD COLUMN IF NOT EXISTS inventory DOUBLE PRECISION;
+    ALTER TABLE balance_sheets ADD COLUMN IF NOT EXISTS accounts_payable DOUBLE PRECISION;
+    ALTER TABLE income_statements ADD COLUMN IF NOT EXISTS cost_of_revenue DOUBLE PRECISION;
+
     CREATE TABLE IF NOT EXISTS cash_flows (
         ticker          TEXT REFERENCES companies(ticker) ON DELETE CASCADE,
         fiscal_year     INTEGER,
@@ -262,8 +272,9 @@ def _upsert_statements_inner(ticker: str, income_df: pd.DataFrame,
                     INSERT INTO income_statements
                         (ticker, fiscal_year, revenue, total_expenses,
                          operating_income, pretax_income, tax_provision,
-                         interest_expense, net_income, depreciation)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         interest_expense, net_income, depreciation,
+                         cost_of_revenue)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (ticker, fiscal_year) DO UPDATE SET
                         revenue = EXCLUDED.revenue,
                         total_expenses = EXCLUDED.total_expenses,
@@ -272,7 +283,8 @@ def _upsert_statements_inner(ticker: str, income_df: pd.DataFrame,
                         tax_provision = EXCLUDED.tax_provision,
                         interest_expense = EXCLUDED.interest_expense,
                         net_income = EXCLUDED.net_income,
-                        depreciation = EXCLUDED.depreciation;
+                        depreciation = EXCLUDED.depreciation,
+                        cost_of_revenue = EXCLUDED.cost_of_revenue;
                 """, (
                     ticker, fy,
                     gv(income_df, "Total Revenue", i),
@@ -283,6 +295,7 @@ def _upsert_statements_inner(ticker: str, income_df: pd.DataFrame,
                     gv(income_df, "Interest Expense", i),
                     gv(income_df, "Net Income", i),
                     gv(income_df, "Reconciled Depreciation", i),
+                    gv(income_df, "Cost Of Revenue", i),
                 ))
 
                 # Balance sheet
@@ -290,8 +303,9 @@ def _upsert_statements_inner(ticker: str, income_df: pd.DataFrame,
                     INSERT INTO balance_sheets
                         (ticker, fiscal_year, current_assets, current_liabilities,
                          cash, cpltd, net_ppe, long_term_investments,
-                         minority_interest, total_debt, total_equity)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         minority_interest, total_debt, total_equity,
+                         accounts_receivable, inventory, accounts_payable)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (ticker, fiscal_year) DO UPDATE SET
                         current_assets = EXCLUDED.current_assets,
                         current_liabilities = EXCLUDED.current_liabilities,
@@ -300,6 +314,9 @@ def _upsert_statements_inner(ticker: str, income_df: pd.DataFrame,
                         net_ppe = EXCLUDED.net_ppe,
                         long_term_investments = EXCLUDED.long_term_investments,
                         minority_interest = EXCLUDED.minority_interest,
+                        accounts_receivable = EXCLUDED.accounts_receivable,
+                        inventory = EXCLUDED.inventory,
+                        accounts_payable = EXCLUDED.accounts_payable,
                         total_debt = EXCLUDED.total_debt,
                         total_equity = EXCLUDED.total_equity;
                 """, (
@@ -313,6 +330,9 @@ def _upsert_statements_inner(ticker: str, income_df: pd.DataFrame,
                     gv(balance_df, "Minority Interest", i),
                     gv(balance_df, "Total Debt", i),
                     gv(balance_df, "Total Stockholders Equity", i),
+                    gv(balance_df, "Accounts Receivable", i),
+                    gv(balance_df, "Inventory", i),
+                    gv(balance_df, "Accounts Payable", i),
                 ))
 
                 # Cash flow
@@ -384,6 +404,7 @@ def get_from_store(ticker: str, market: str = "us"):
         "Interest Expense":        "interest_expense",
         "Net Income":              "net_income",
         "Reconciled Depreciation": "depreciation",
+        "Cost Of Revenue":         "cost_of_revenue",
     })
 
     balance_df = build_df(balance_rows, {
@@ -396,6 +417,9 @@ def get_from_store(ticker: str, market: str = "us"):
         "Minority Interest":                 "minority_interest",
         "Total Debt":                        "total_debt",
         "Total Stockholders Equity":         "total_equity",
+        "Accounts Receivable":               "accounts_receivable",
+        "Inventory":                         "inventory",
+        "Accounts Payable":                  "accounts_payable",
     }) if balance_rows else pd.DataFrame()
 
     cashflow_df = build_df(cashflow_rows, {
@@ -538,6 +562,67 @@ def get_price_history(ticker: str, market: str = "us", days: int = 1825) -> list
                 (raw_ticker, days),
             )
             return cur.fetchall()
+
+
+_SECTOR_DEPR_CACHE = {"data": None, "time": 0}
+
+
+def get_sector_depreciation_rates(max_age_hours: float = 12.0) -> dict:
+    """Median depreciation rate (depreciation / net PPE) by sector, computed
+    from every company in the store that reports both.
+
+    Why this exists: the DCF previously assumed a flat 5% depreciation rate
+    whenever the figure was missing. 5% is arbitrary — real rates run 4-7%
+    for heavy industry, 20-30% for IT and software, 6-10% for telecom. With
+    1,000 companies already in the store, a sector median derived from actual
+    peers is both defensible and verifiable, and it is far better than a
+    single constant applied to everything.
+    """
+    import time as _t
+    now = _t.time()
+    if (_SECTOR_DEPR_CACHE["data"] is not None
+            and (now - _SECTOR_DEPR_CACHE["time"]) < max_age_hours * 3600):
+        return _SECTOR_DEPR_CACHE["data"]
+
+    rates = {}
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET statement_timeout = '60s'")
+                cur.execute("""
+                    SELECT c.sector,
+                           i.depreciation / NULLIF(b.net_ppe, 0) AS rate
+                    FROM income_statements i
+                    JOIN balance_sheets b
+                      ON b.ticker = i.ticker AND b.fiscal_year = i.fiscal_year
+                    JOIN companies c ON c.ticker = i.ticker
+                    WHERE i.depreciation > 0
+                      AND b.net_ppe > 0
+                      AND c.sector IS NOT NULL
+                      AND c.sector <> 'Unknown'
+                """)
+                buckets = {}
+                for sector, rate in cur.fetchall():
+                    if rate is None:
+                        continue
+                    r = float(rate)
+                    # Discard implausible values — these indicate a bad
+                    # extraction rather than an unusual asset base
+                    if 0.005 <= r <= 0.60:
+                        buckets.setdefault(sector, []).append(r)
+                for sector, vals in buckets.items():
+                    if len(vals) >= 3:          # need a real peer group
+                        vals.sort()
+                        rates[sector] = {
+                            "median": vals[len(vals) // 2],
+                            "n_companies": len(vals),
+                        }
+    except Exception:
+        pass
+
+    _SECTOR_DEPR_CACHE["data"] = rates
+    _SECTOR_DEPR_CACHE["time"] = now
+    return rates
 
 
 def store_has_ticker(ticker: str, market: str = "us") -> bool:
