@@ -718,6 +718,28 @@ def _build_dataframes(facts: dict):
     # ── Balance sheet concepts (instantaneous) ────────────────────────────────
     current_assets      = _get_concept_instant(facts, "AssetsCurrent")
     current_liabilities = _get_concept_instant(facts, "LiabilitiesCurrent")
+    # ── Working-capital components ───────────────────────────────────────
+    # Receivables scale with revenue; inventory and payables scale with cost
+    # of revenue. Without these three lines, working capital had to be
+    # projected from aggregate current assets/liabilities as independent
+    # growth curves, which is arbitrary.
+    accounts_receivable = _compose_instant(facts, [
+        "AccountsReceivableNetCurrent",
+        "ReceivablesNetCurrent",
+        "AccountsAndOtherReceivablesNetCurrent",
+        "AccountsReceivableGrossCurrent",
+    ])
+    inventory = _compose_instant(facts, [
+        "InventoryNet",
+        "InventoryGross",
+        "InventoryFinishedGoodsNetOfReserves",
+    ])
+    accounts_payable = _compose_instant(facts, [
+        "AccountsPayableCurrent",
+        "AccountsPayableTradeCurrent",
+        "AccountsPayableAndAccruedLiabilitiesCurrent",
+    ])
+
     _bs_rules = BALANCE_RULES.get(profile, BALANCE_RULES["standard"])
     cash                = _compose_instant(facts, _bs_rules["cash"])
     short_term_debt     = _get_concept_instant(facts, "LongTermDebtCurrent", "DebtCurrent")
@@ -848,6 +870,7 @@ def _build_dataframes(facts: dict):
         "Interest Expense":        row(interest_exp),
         "Net Income":              row(net_income),
         "Reconciled Depreciation": row(depreciation),
+        "Cost Of Revenue":         row(cost_revenue),
     }
     income_df = pd.DataFrame(income_data, index=col_labels).T
 
@@ -869,6 +892,9 @@ def _build_dataframes(facts: dict):
         "Minority Interest":                 row(minority_interest),
         "Total Debt":                        total_debt_row,
         "Total Stockholders Equity":         row(total_equity),
+        "Accounts Receivable":               row(accounts_receivable),
+        "Inventory":                         row(inventory),
+        "Accounts Payable":                  row(accounts_payable),
     }
     balance_df = pd.DataFrame(balance_data, index=col_labels).T
 
