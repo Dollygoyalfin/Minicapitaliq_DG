@@ -1,56 +1,78 @@
 name: Full Universe Backfill
 
+# Fundamentals only. Signatures, news and shareholding are deliberately NOT
+# here — those are run locally, because they write in large batches and
+# Supabase's free tier caps the connection pool at 15. Hitting that limit
+# from a GitHub runner means discovering lost batches in a log an hour later;
+# running them locally means seeing it immediately and rerunning (the upserts
+# are idempotent, so a rerun simply fills the gaps).
+
 on:
   workflow_dispatch:
     inputs:
       target:
         description: "Which universe to backfill"
         required: true
-        default: "both"
+        default: "us"
         type: choice
         options:
-          - us
-          - india
-          - both
-          - prices
+          - us       # S&P 500 fundamentals   (~20 min)
+          - india    # Nifty 500 fundamentals (~60 min)
 
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 300
+
+    env:
+      DATABASE_URL:   ${{ secrets.DATABASE_URL }}
+      GROQ_API_KEY:   ${{ secrets.GROQ_API_KEY }}
+      FMP_API_KEY:    ${{ secrets.FMP_API_KEY }}
+      # A scheduled run must always fetch fresh filings; the disk caches are
+      # a local development accelerator, not a production data source.
+      SEC_CACHE_DAYS: "0"
+      NSE_CACHE_DAYS: "0"
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Backfill US (S&P 500)
-        if: ${{ inputs.target == 'us' || inputs.target == 'both' }}
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          FMP_API_KEY:  ${{ secrets.FMP_API_KEY }}
+      # Confirms the runner is executing the code you think it is — this
+      # project has lost several cycles to stale files.
+      - name: Show build stamps
+        run: |
+          python - <<'PY'
+          for mod, attr in [("sec_edgar_layer", "SEC_LAYER_BUILD"),
+                            ("india_data_pipeline", "INDIA_PIPELINE_BUILD")]:
+              try:
+                  m = __import__(mod)
+                  print(f"{mod}: {getattr(m, attr, 'NO STAMP')}")
+              except Exception as e:
+                  print(f"{mod}: import failed ({e})")
+          PY
+
+      - name: Backfill US fundamentals
+        if: ${{ inputs.target == 'us' }}
         run: python ingest.py backfill_us_full
 
-      - name: Backfill Prices (5y daily, both markets)
-        if: ${{ inputs.target == 'prices' }}
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          FMP_API_KEY:  ${{ secrets.FMP_API_KEY }}
-        run: python ingest.py backfill_prices both
-
-      - name: Backfill India (Nifty 500)
-        if: ${{ inputs.target == 'india' || inputs.target == 'both' }}
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          FMP_API_KEY:  ${{ secrets.FMP_API_KEY }}
+      - name: Backfill India fundamentals
+        if: ${{ inputs.target == 'india' }}
         run: python ingest.py backfill_india_full
+
+      - name: Data quality audit
+        if: always()
+        run: python audit_store.py > audit.txt 2>&1 || true
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report-${{ inputs.target }}
+          path: audit.txt
+          retention-days: 30
