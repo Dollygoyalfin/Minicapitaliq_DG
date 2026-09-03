@@ -253,19 +253,53 @@ def get_valuation(
         # Gordon Growth with a denominator floor — growth is capped so the
         # spread (wacc - g) never drops below 4%, preventing absurd values
         # (e.g. the old ₹4,472 base case from a 1.3% denominator)
-        g_eff = min(growth_rate, wacc - 0.04)
+        # ── Gordon Growth on NORMALISED earnings ────────────────────────────
+        # This previously capitalised the LATEST year's EPS in perpetuity. For
+        # a cyclical at peak profitability that values a peak year forever —
+        # the same defect corrected in the DCF. NALCO's ₹836 came from one
+        # exceptional year's ₹31.56 EPS against a 5-year average near ₹19.
+        eps_history = []
+        if income_df is not None and not income_df.empty and shares:
+            for idx in income_df.index:
+                if "net income" in idx.lower():
+                    for col in income_df.columns[:6]:
+                        try:
+                            v = float(income_df.loc[idx, col])
+                            if v == v and v > 0:
+                                eps_history.append(v / shares)
+                        except Exception:
+                            pass
+                    break
+
+        eps_used, eps_basis = eps, "latest year"
+        if len(eps_history) >= 3 and eps:
+            avg_eps = sum(eps_history) / len(eps_history)
+            # More than 40% above the company's own multi-year average means
+            # the latest year is an outlier, not a run rate.
+            if avg_eps > 0 and eps > avg_eps * 1.4:
+                eps_used = avg_eps
+                eps_basis = (f"{len(eps_history)}-year average — the latest "
+                             f"year was {eps/avg_eps:.1f}x that average")
+
+        # Terminal growth cannot exceed the risk-free rate; no company
+        # outgrows the economy in perpetuity. This replaces the arbitrary
+        # "wacc - g >= 4%" floor with the reason it existed.
+        g_eff = min(growth_rate, risk_free_rate)
+        if wacc - g_eff < 0.02:
+            g_eff = wacc - 0.02
+
         intrinsic_value = None
-        if eps and eps > 0 and wacc > g_eff:
-            intrinsic_value = (eps * (1 + g_eff)) / (wacc - g_eff)
+        if eps_used and eps_used > 0 and wacc > g_eff:
+            intrinsic_value = (eps_used * (1 + g_eff)) / (wacc - g_eff)
 
         valuation_low = valuation_high = None
-        if eps and eps > 0:
+        if eps_used and eps_used > 0:
             g_low,  d_low  = g_eff - 0.02, wacc + 0.02
             g_high, d_high = g_eff + 0.01, max(wacc - 0.01, g_eff + 0.04)
             if d_low > g_low:
-                valuation_low = (eps * (1 + g_low)) / (d_low - g_low)
+                valuation_low = (eps_used * (1 + g_low)) / (d_low - g_low)
             if d_high > g_high:
-                valuation_high = (eps * (1 + g_high)) / (d_high - g_high)
+                valuation_high = (eps_used * (1 + g_high)) / (d_high - g_high)
 
         return {
             "ticker":          ticker.upper(),
@@ -284,6 +318,9 @@ def get_valuation(
             "intrinsic_value": round(intrinsic_value, 2) if intrinsic_value else None,
             "valuation_low":   round(valuation_low, 2) if valuation_low else None,
             "valuation_high":  round(valuation_high, 2) if valuation_high else None,
+            "eps_used":           round(eps_used, 2) if eps_used else None,
+            "eps_basis":          eps_basis,
+            "eps_latest":         round(eps, 2) if eps else None,
             "growth_rate_used":   round(g_eff, 4),
             "discount_rate_used": round(wacc, 4),
             "wacc":               round(wacc, 4),
@@ -291,6 +328,80 @@ def get_valuation(
             "fii_holding":        None,
             "dii_holding":        None,
             "retail_holding":     None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/financials")
+def get_financials(
+    ticker: str = Query(...),
+    market: str = Query("us"),
+    advanced: bool = Query(False),          # kept for URL compatibility
+    source: str = Query("auto"),
+):
+    try:
+        info, income_df, balance_df, cashflow_df, data_source = get_company_data(
+            ticker=ticker, market=market, source=source
+        )
+        shares = info.get("sharesOutstanding")
+
+        def df_to_serializable(df, n=6):
+            if df is None or df.empty:
+                return {}
+            out = {}
+            for col in df.columns[:n]:
+                try:
+                    yr = str(col.year)
+                except Exception:
+                    yr = str(col)
+                row = {}
+                for idx in df.index:
+                    try:
+                        v = float(df.loc[idx, col])
+                        row[idx] = None if (math.isnan(v) or math.isinf(v)) else v
+                    except Exception:
+                        row[idx] = None
+                out[yr] = row
+            return out
+
+        income        = df_to_serializable(income_df)
+        cashflow      = df_to_serializable(cashflow_df)
+        balance_sheet = df_to_serializable(balance_df)
+
+        # Per-year Basic EPS derived from NI / shares (store has no EPS rows)
+        if shares:
+            for yr, row in income.items():
+                ni = row.get("Net Income")
+                if ni and "Basic EPS" not in row:
+                    row["Basic EPS"] = round(ni / shares, 2)
+
+        # ROE per year: DuPont when total assets exist, plain NI/equity otherwise
+        roe_dupont = {}
+        for year, row in income.items():
+            ni  = row.get("Net Income") or 0
+            bal = balance_sheet.get(year, {})
+            equity = (bal.get("Total Stockholders Equity")
+                      or bal.get("Stockholders Equity") or 0)
+            assets = bal.get("Total Assets")
+            try:
+                if assets and equity and row.get("Total Revenue"):
+                    rev = row["Total Revenue"]
+                    roe_val = (ni / rev) * (rev / assets) * (assets / equity)
+                elif equity:
+                    roe_val = ni / equity
+                else:
+                    roe_val = 0.0
+                roe_dupont[year] = 0.0 if (math.isnan(roe_val) or math.isinf(roe_val)) else roe_val
+            except (ZeroDivisionError, TypeError):
+                roe_dupont[year] = 0.0
+
+        return {
+            "data_source":      data_source,
+            "income_statement": income,
+            "cash_flow":        cashflow,
+            "balance_sheet":    balance_sheet,
+            "dupont_roe":       roe_dupont,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -948,6 +1059,12 @@ def get_dcf(
     # having been made anywhere. Now the margin is an explicit input.
     margin_basis: str    = Query("current",
                                  description="current | average | median | custom"),
+    # Fitting a fixed/variable cost split on 4-6 annual observations can clear
+    # an R2 threshold by chance, and when it fires it reintroduces margin drift
+    # through operating leverage — the very effect the margin fix removed.
+    # Off unless explicitly requested.
+    use_cost_split: bool = Query(False,
+                                 description="Fit fixed+variable costs instead of a flat margin"),
     custom_margin: float = Query(0.0, description="Used when margin_basis=custom")
 ):
     """
@@ -1096,22 +1213,45 @@ def get_dcf(
                     continue
                 rates.append((v_new - v_old) / v_old)
             if rates:
-                return sum(rates) / len(rates)
+                # MEDIAN, not mean. A single distorted year — a merger, a
+                # demerger, or a near-zero base — dominates an average and
+                # was the real reason a +-60% bound seemed necessary. The
+                # median is robust to one bad observation, so the outlier is
+                # ignored rather than clamped, and no magic number is needed.
+                rates.sort()
+                n_r = len(rates)
+                return (rates[n_r // 2] if n_r % 2
+                        else (rates[n_r // 2 - 1] + rates[n_r // 2]) / 2)
             valid = [v for v in series if v is not None and v > 0]
             if len(valid) >= 2:
                 n = len(valid) - 1
                 return (valid[0] / valid[-1]) ** (1 / n) - 1
             return 0.0
 
+        def _bs_value(df, keyword, idx):
+            if df is None or df.empty or idx >= len(df.columns):
+                return None
+            for r in df.index:
+                if keyword.lower() in r.lower():
+                    try:
+                        v = float(df.iloc[df.index.get_loc(r), idx])
+                        return None if v != v else v
+                    except Exception:
+                        return None
+            return None
+
         def project_line(base: float, growth: float, years: int) -> list:
             """Project a single line item N years forward by compounding.
             If base is 0, returns flat zero series (can't grow from zero).
-            Caps growth at 100% per year to prevent runaway projections.
+
+            No clamp here. Growth rates are already computed with a median
+            (robust to outliers) and bounded once at the point of use. Two
+            layers of clamping in different places made it impossible to say
+            what the model had actually assumed.
             """
-            g = max(min(growth, 1.0), -0.5)  # cap: -50% to +100% per year
             if base == 0.0:
                 return [0.0] * years
-            return [base * ((1 + g) ** y) for y in range(1, years + 1)]
+            return [base * ((1 + growth) ** y) for y in range(1, years + 1)]
 
         def rolling_avg_terminal(projected: list) -> float:
             """
@@ -1194,7 +1334,17 @@ def get_dcf(
 
             # Effective tax rate
             if pretax and pretax != 0 and tax_prov is not None and tax_prov != 0:
-                yr_tax = max(0.05, min(abs(tax_prov / pretax), 0.40))
+                # Effective rates genuinely fall outside a normal band in a
+                # single year (loss carry-forwards, one-off credits, deferred
+                # tax reversals), but those are transient accounting events,
+                # not the rate a business pays in perpetuity. Bounds are set
+                # to the plausible statutory range for the market rather than
+                # an arbitrary 5-40%: India's headline corporate rate is
+                # ~25% post-2019 and the US federal rate is 21%, so a
+                # sustained effective rate above ~35% or below ~10% reflects
+                # something temporary.
+                _tax_lo, _tax_hi = (0.10, 0.35)
+                yr_tax = max(_tax_lo, min(abs(tax_prov / pretax), _tax_hi))
             else:
                 yr_tax = 0.25
 
@@ -1291,12 +1441,10 @@ def get_dcf(
         # to be a 40% grower in year one without being capped, and a company
         # in a downcycle is not assumed to shrink forever.
         #
-        # The bound below is a DATA-ERROR guard, not a view on growth: a
-        # reading beyond +-60% almost always means a near-zero base year or a
-        # merger artefact rather than a real trend.
-        if revenue_growth > 0.60 or revenue_growth < -0.60:
-            revenue_growth = max(-0.60, min(revenue_growth, 0.60))
-        opex_growth    = max(-0.10, min(opex_growth, 0.30))
+        # No bound is applied. Growth is now a MEDIAN of year-on-year rates,
+        # so a merger year or a near-zero base year no longer drags the
+        # estimate — the outlier is simply not the middle observation. That
+        # removes the reason the +-60% guard existed.
         # Cash-based DCF needs a real balance sheet — refuse garbage-in
         if (not any(v for v in ca_series if v)
                 and not any(v for v in cl_series if v)
@@ -1314,12 +1462,72 @@ def get_dcf(
         net_ppe_growth = avg_yoy_growth(net_ppe_series)
         depr_growth    = avg_yoy_growth(depr_series)
 
-        # If depreciation data is missing (all zeros), estimate as % of Net PPE
-        # Must run BEFORE caps so depr_growth gets capped correctly
+        # ── Depreciation: derive the rate, never assume a constant ──────────
+        # This previously assumed a flat 5% of net PPE whenever depreciation
+        # was missing. 5% is arbitrary — real rates run roughly 4-7% for heavy
+        # industry, 20-30% for IT and software, 6-10% for telecom. Worse, the
+        # fabricated figure flows straight into capex (capex = dPPE + depr),
+        # so a guess compounds into the valuation.
+        #
+        # Hierarchy, best evidence first:
+        #   1. the company's own reported depreciation
+        #   2. the company's own historical rate (depr / prior-year net PPE)
+        #   3. the median rate among sector peers ALREADY IN OUR STORE
+        #   4. no estimate at all — the DCF then refuses rather than inventing
+        # Rate at which the company depreciates its opening asset base
+        _dr = []
+        for _i in range(len(depr_series) - 1):
+            _d, _p = depr_series[_i], net_ppe_series[_i + 1]
+            if _d and _p and _p > 0:
+                _r = _d / _p
+                if 0.005 <= _r <= 0.60:
+                    _dr.append(_r)
+        _dr.sort()
+        _depr_rate_on_ppe = _dr[len(_dr) // 2] if _dr else None
+
+        depr_basis = "reported"
+        depr_rate_used = None
+        depr_peer_n = None
+
         if all(d == 0.0 for d in depr_series) and any(p > 0 for p in net_ppe_series):
-            avg_depr_rate = 0.05  # assume 5% depreciation rate on Net PPE
-            depr_series   = [n * avg_depr_rate for n in net_ppe_series]
-            depr_growth   = net_ppe_growth  # depr grows with PPE
+            own_rates = []
+            for i in range(len(depr_series) - 1):
+                d_i, p_prev = depr_series[i], net_ppe_series[i + 1]
+                if d_i and p_prev and p_prev > 0:
+                    r = d_i / p_prev
+                    if 0.005 <= r <= 0.60:
+                        own_rates.append(r)
+
+            if own_rates:
+                own_rates.sort()
+                depr_rate_used = own_rates[len(own_rates) // 2]
+                depr_basis = "company's own historical rate"
+            else:
+                try:
+                    from data_store import get_sector_depreciation_rates
+                    sector_rates = get_sector_depreciation_rates()
+                    entry = sector_rates.get(info.get("sector") or "")
+                    if entry:
+                        depr_rate_used = entry["median"]
+                        depr_peer_n = entry["n_companies"]
+                        depr_basis = (f"sector median ({info.get('sector')}, "
+                                      f"{depr_peer_n} peers)")
+                except Exception:
+                    pass
+
+            if depr_rate_used is None:
+                return {"error": (
+                    "Depreciation is not reported in any year, and no peer "
+                    "estimate is available for this sector. A cash-flow DCF "
+                    "cannot be built without it, because capital expenditure "
+                    "is derived from depreciation. The earnings-based models "
+                    "in the Convergence tab do not need this figure and will "
+                    "still work for this company."),
+                    "ticker": ticker.upper(), "market": market,
+                    "data_source": data_source}
+
+            depr_series = [n * depr_rate_used for n in net_ppe_series]
+            depr_growth = net_ppe_growth
 
         # Cap all BS line growth rates at revenue growth
         # No balance sheet line can sustainably outgrow the business itself
@@ -1372,9 +1580,24 @@ def get_dcf(
 
         interest_expense = abs(safe_float(income_df, interest_row, 0) or 0.0)
         if total_debt > 0 and interest_expense > 0:
-            cost_of_debt = max(0.03, min(interest_expense / total_debt, 0.15))
+            # Interest expense accrues across the whole year, but total debt
+            # is a point-in-time balance. Dividing by the CLOSING balance
+            # misstates the rate whenever debt was raised or repaid during
+            # the year — which is what made a 3-15% bound necessary. Using
+            # AVERAGE debt matches the numerator's period to the denominator's
+            # and the bound then rarely binds.
+            _debt_series = []
+            for _idx in range(len(revenue_series)):
+                _d = _bs_value(balance_df, "total debt", _idx)
+                if _d and _d > 0:
+                    _debt_series.append(_d)
+            _avg_debt = ((_debt_series[0] + _debt_series[1]) / 2
+                         if len(_debt_series) >= 2 else total_debt)
+            cost_of_debt = max(0.03, min(interest_expense / _avg_debt, 0.15))
         else:
-            cost_of_debt = 0.06
+            # Debt-free: the value barely matters because its weight in WACC
+            # is ~0, but a plausible market rate is used rather than nothing.
+            cost_of_debt = risk_free_rate + 0.02
 
         if market_cap:
             equity_val = market_cap
@@ -1416,17 +1639,23 @@ def get_dcf(
             terminal growth."""
             out, v = [], base
             for i in range(years):
-                g = (start_g if years == 1
-                     else start_g + (end_g - start_g) * (i / (years - 1)))
+                # Divide by `years`, not `years - 1`, so the final projected
+                # year is still one step ABOVE terminal growth and the
+                # business only reaches steady state in the terminal year.
+                # Fading fully to terminal by year five assumes a durable
+                # franchise decays to economy-level growth within five years,
+                # which costs a stable compounder ~13% of its value for no
+                # good reason.
+                g = start_g if years == 1 else start_g + (end_g - start_g) * (i / years)
                 v = v * (1 + g)
                 out.append(v)
             return out
 
         proj_rev_list  = project_fading(base_rev, revenue_growth,
                                         terminal_growth_rate, projection_years)
-        growth_path    = [round((start_g := (revenue_growth if projection_years == 1
+        growth_path    = [round(revenue_growth if projection_years == 1
                           else revenue_growth + (terminal_growth_rate - revenue_growth)
-                               * (i / (projection_years - 1)))), 4)
+                               * (i / projection_years), 4)
                           for i in range(projection_years)]
 
         # ── Operating margin: forecast the MARGIN, derive the cost line ──────
@@ -1449,14 +1678,120 @@ def get_dcf(
             margin_basis = "current"
             margin_used = base_margin
 
-        # Costs follow revenue at the assumed margin. Holding the margin flat
-        # makes NO claim that the business improves — any change now has to be
-        # chosen deliberately rather than emerging from compounding.
-        proj_opex_list = [r * (1 - margin_used) for r in proj_rev_list]
+        # ── Fixed vs variable cost decomposition ────────────────────────────
+        # Textbook practice splits costs into a variable part that moves with
+        # revenue and a fixed part that grows with inflation. Fitted by least
+        # squares: opex = fixed + variable_rate * revenue.
+        #
+        # It is applied ONLY when the fit is economically sensible. For a
+        # commodity producer like NALCO, revenue moves with OUTPUT prices
+        # while costs move with INPUT prices (alumina, power, coal) — the two
+        # are not mechanically linked, and the regression returns a negative
+        # variable rate, which is meaningless. In that case the model falls
+        # back to a flat margin and says so.
+        cost_model = "flat margin"
+        fixed_cost = variable_rate = None
+        _pairs = [(revenue_series[i], opex_series[i])
+                  for i in range(min(len(revenue_series), len(opex_series)))
+                  if revenue_series[i] and opex_series[i] is not None
+                  and revenue_series[i] > 0]
+        if use_cost_split and len(_pairs) >= 4:
+            _n = len(_pairs)
+            _sx = sum(p[0] for p in _pairs)
+            _sy = sum(p[1] for p in _pairs)
+            _sxx = sum(p[0] * p[0] for p in _pairs)
+            _sxy = sum(p[0] * p[1] for p in _pairs)
+            _den = _n * _sxx - _sx * _sx
+            if _den:
+                _slope = (_n * _sxy - _sx * _sy) / _den
+                _icept = (_sy - _slope * _sx) / _n
+                _ybar = _sy / _n
+                _ss_tot = sum((p[1] - _ybar) ** 2 for p in _pairs)
+                _ss_res = sum((p[1] - (_icept + _slope * p[0])) ** 2 for p in _pairs)
+                _r2 = 1 - (_ss_res / _ss_tot) if _ss_tot else 0
+                # Sensible only if costs genuinely rise with revenue, the
+                # fixed component is not negative, and the fit explains most
+                # of the variation.
+                if 0.05 < _slope < 1.0 and _icept >= 0 and _r2 >= 0.70:
+                    variable_rate, fixed_cost = _slope, _icept
+                    cost_model = (f"fixed + variable (variable {_slope*100:.0f}% "
+                                  f"of revenue, R² {_r2:.2f})")
+
+        if variable_rate is not None:
+            # Fixed costs grow with inflation, proxied by terminal growth
+            proj_opex_list = [fixed_cost * ((1 + terminal_growth_rate) ** (i + 1))
+                              + variable_rate * r
+                              for i, r in enumerate(proj_rev_list)]
+        else:
+            # Costs follow revenue at the assumed margin. Holding the margin
+            # flat makes NO claim that the business improves.
+            proj_opex_list = [r * (1 - margin_used) for r in proj_rev_list]
 
         # ── Build projection table ────────────────────────────────────────────
         projection_table = []
         pv_fcffs         = []
+        # ── Working capital: driven by activity, not by four growth curves ──
+        # Current assets, current liabilities, cash and CPLTD were each
+        # projected with their own compounding growth rate. Nothing tied them
+        # to the business, so DeltaNWC was effectively arbitrary.
+        #
+        # Standard practice instead: receivables scale with REVENUE (days
+        # sales outstanding) while inventory and payables scale with COST OF
+        # REVENUE (days inventory / days payable outstanding). Those ratios
+        # are computed from the company's own history and held constant.
+        def _series_from(df, *keywords):
+            if df is None or df.empty:
+                return []
+            for idx in df.index:
+                if all(k.lower() in idx.lower() for k in keywords):
+                    out = []
+                    for col in df.columns:
+                        try:
+                            v = float(df.loc[idx, col])
+                            out.append(None if v != v else v)
+                        except Exception:
+                            out.append(None)
+                    return out
+            return []
+
+        ar_series   = _series_from(balance_df, "accounts receivable")
+        inv_series  = _series_from(balance_df, "inventory")
+        ap_series   = _series_from(balance_df, "accounts payable")
+        cogs_series = _series_from(income_df,  "cost of revenue")
+
+        def _median_ratio(numer, denom):
+            vals = []
+            for i in range(min(len(numer), len(denom))):
+                n_i, d_i = numer[i], denom[i]
+                if n_i is not None and d_i and d_i > 0:
+                    r = n_i / d_i
+                    if 0 < r < 3:            # discard extraction errors
+                        vals.append(r)
+            if not vals:
+                return None
+            vals.sort()
+            return vals[len(vals) // 2]
+
+        dso_ratio = _median_ratio(ar_series,  revenue_series)      # AR / revenue
+        dio_ratio = _median_ratio(inv_series, cogs_series or opex_series)
+        dpo_ratio = _median_ratio(ap_series,  cogs_series or opex_series)
+
+        wc_method = "components (DSO/DIO/DPO)" if (
+            dso_ratio is not None and dio_ratio is not None
+            and dpo_ratio is not None) else "aggregate current assets/liabilities"
+
+        # Asset intensity: net PP&E per unit of revenue, from this company's
+        # own history. Median, so one heavy-capex year does not set the norm.
+        _ai = []
+        for _i in range(min(len(net_ppe_series), len(revenue_series))):
+            _p, _r = net_ppe_series[_i], revenue_series[_i]
+            if _p and _r and _r > 0:
+                _ratio = _p / _r
+                if 0.01 <= _ratio <= 10:
+                    _ai.append(_ratio)
+        _ai.sort()
+        asset_intensity = _ai[len(_ai) // 2] if _ai else None
+
         prev_wc          = wc_series[0]   # base WC = most recent historical year
 
         for year in range(projection_years):
@@ -1467,12 +1802,30 @@ def get_dcf(
             proj_csh     = proj_cash_list[idx]
             proj_cpltd   = proj_cpltd_list[idx]
             proj_net_ppe = proj_net_ppe_list[idx]
-            proj_depr    = proj_depr_list[idx]
+            # Depreciation is charged against the asset base that exists at
+            # the START of the year, which is the standard schedule:
+            #   Ending PP&E = Beginning PP&E + CapEx - Depreciation
+            # Projecting it with its own independent growth rate let it drift
+            # away from the PP&E it is supposed to be depreciating.
+            _begin_ppe = proj_net_ppe_list[idx - 1] if idx > 0 else base_net_ppe
+            if _depr_rate_on_ppe and _begin_ppe:
+                proj_depr = _depr_rate_on_ppe * _begin_ppe
+            else:
+                proj_depr = proj_depr_list[idx]
             proj_rev     = proj_rev_list[idx]
             proj_opex    = proj_opex_list[idx]
 
             # WC derived from projected BS lines
-            proj_wc = proj_ca - proj_cl - proj_csh - proj_cpltd
+            if wc_method.startswith("components"):
+                # Receivables follow revenue; inventory and payables follow
+                # cost of revenue, which is what they actually scale with.
+                _cogs_proj = proj_rev * (1 - margin_used)
+                _ar  = dso_ratio * proj_rev
+                _inv = dio_ratio * _cogs_proj
+                _ap  = dpo_ratio * _cogs_proj
+                proj_wc = _ar + _inv - _ap
+            else:
+                proj_wc = proj_ca - proj_cl - proj_csh - proj_cpltd
 
             # ΔNWC = WC(this year) - WC(prior year)
             proj_delta_nwc = proj_wc - prev_wc
@@ -1480,13 +1833,29 @@ def get_dcf(
 
             # CapEx = Net Fixed Assets(this year) - Net Fixed Assets(prior year)
             #         + Depreciation(this year)
+            #
+            # The identity is right; the INPUT was wrong. Net PP&E used to be
+            # projected with its own independent growth rate, so a company in
+            # a build-out phase (VBL, DOMS) had that phase extrapolated for
+            # ever: PP&E compounded faster than revenue, capex followed it,
+            # and free cash flow was negative in every year by construction.
+            #
+            # PP&E is now tied to revenue through ASSET INTENSITY (PP&E per
+            # rupee of revenue), held at the company's own historical level.
+            # Because revenue growth fades, PP&E growth fades with it, and
+            # capex falls toward maintenance level naturally rather than
+            # assuming perpetual construction.
             # The standard derivation. Deliberately NOT normalised against a
             # historical capex/revenue ratio: smoothing would hide genuine
             # capital intensity, and for a company in a heavy investment cycle
             # the honest output is a warning (see the all-negative-FCFF guard),
             # not a comfortable number.
-            prior_net_ppe  = proj_net_ppe_list[idx - 1] if idx > 0 else base_net_ppe
-            proj_capex     = max(proj_net_ppe - prior_net_ppe + proj_depr, proj_depr)
+            prior_net_ppe = proj_net_ppe_list[idx - 1] if idx > 0 else base_net_ppe
+            if asset_intensity:
+                # PP&E follows revenue at constant asset intensity
+                proj_net_ppe = asset_intensity * proj_rev
+                proj_net_ppe_list[idx] = proj_net_ppe
+            proj_capex = max(proj_net_ppe - prior_net_ppe + proj_depr, proj_depr)
 
             proj_nop    = proj_rev - proj_opex
             proj_nop_at = proj_nop * (1 - avg_tax_rate)
@@ -1547,9 +1916,18 @@ def get_dcf(
         # If rolling avg pulls it down, use last projected WC grown at terminal_growth_rate
         last_proj_wc   = proj_ca_list[-1] - proj_cl_list[-1] - proj_cash_list[-1] - proj_cpltd_list[-1]
         term_wc        = max(term_wc_raw, last_proj_wc * (1 + terminal_growth_rate))
+        if wc_method.startswith("components"):
+            _term_cogs = term_rev * (1 - margin_used)
+            term_wc = (dso_ratio * term_rev + dio_ratio * _term_cogs
+                       - dpo_ratio * _term_cogs)
         term_delta_nwc = term_wc - prev_wc   # prev_wc = WC at end of last projected year
         # CapEx floor = depreciation (minimum maintenance CapEx)
-        term_capex     = max(term_net_ppe - proj_net_ppe_list[-1] + term_depr, term_depr)
+        # In perpetuity a business cannot keep investing above replacement
+        # level. Terminal capex = depreciation (replace what wears out) plus
+        # only what is needed to support terminal growth in the asset base.
+        if asset_intensity:
+            term_net_ppe = asset_intensity * term_rev
+        term_capex = max(term_net_ppe - proj_net_ppe_list[-1] + term_depr, term_depr)
 
         term_nop    = term_rev - term_opex
         term_nop_at = term_nop * (1 - avg_tax_rate)
@@ -1749,6 +2127,56 @@ def get_dcf(
                     "capped_at_risk_free": terminal_growth_capped,
                     "note": ("Terminal growth cannot exceed the risk-free rate — "
                              "no company outgrows the economy in perpetuity."),
+                },
+                "capital_intensity": {
+                    "net_ppe_to_revenue": (round(asset_intensity, 3)
+                                           if asset_intensity else None),
+                    "note": ("Net PP&E is projected at this company's own asset "
+                             "intensity rather than an independent growth rate, "
+                             "so investment scales with the business and falls "
+                             "back toward replacement level as growth fades. "
+                             "Previously a build-out phase was extrapolated "
+                             "indefinitely, which made free cash flow negative "
+                             "in every year by construction."),
+                },
+                "working_capital": {
+                    "method": wc_method,
+                    "ar_to_revenue":   round(dso_ratio, 4) if dso_ratio else None,
+                    "inv_to_cogs":     round(dio_ratio, 4) if dio_ratio else None,
+                    "ap_to_cogs":      round(dpo_ratio, 4) if dpo_ratio else None,
+                    "days_sales_outstanding": (round(dso_ratio * 365)
+                                               if dso_ratio else None),
+                    "days_inventory":         (round(dio_ratio * 365)
+                                               if dio_ratio else None),
+                    "days_payable":           (round(dpo_ratio * 365)
+                                               if dpo_ratio else None),
+                    "note": ("Receivables are driven by revenue and inventory / "
+                             "payables by cost of revenue, using this company's "
+                             "own historical ratios. Where those components are "
+                             "not available the model falls back to aggregate "
+                             "current assets and liabilities, which is weaker."),
+                },
+                "depreciation": {
+                    "basis":      depr_basis,
+                    "rate_used":  (round(depr_rate_used, 4)
+                                   if depr_rate_used is not None else None),
+                    "peer_count": depr_peer_n,
+                    "note": ("Where depreciation is not reported, the rate is "
+                             "derived from the company's own history or from "
+                             "sector peers in the store — never from a fixed "
+                             "constant, because the figure flows directly into "
+                             "projected capital expenditure."),
+                },
+                "cost_model": {
+                    "method":        cost_model,
+                    "fixed_cost":    round(fixed_cost, 0) if fixed_cost else None,
+                    "variable_rate": round(variable_rate, 4) if variable_rate else None,
+                    "note": ("A fixed/variable split is used only when costs "
+                             "demonstrably rise with revenue (positive variable "
+                             "rate, non-negative fixed component, R² >= 0.70). "
+                             "For commodity producers, revenue moves with output "
+                             "prices while costs move with input prices, so the "
+                             "fit fails and a flat margin is used instead."),
                 },
                 "operating_margin": {
                     "basis":            margin_basis,
@@ -2797,8 +3225,49 @@ def get_quality(
                  f"current {margins_desc[0]*100:.1f}% vs peak {max(margins_desc)*100:.1f}%"
                  if collapse else "margins near historical range")
 
-        flag("Promoter share pledging", "na",
-             "not yet tracked — planned data source (India)")
+        # ── Promoter pledging (India) ────────────────────────────────────
+        # One of the highest-signal governance checks in Indian markets:
+        # promoters borrowing against their own stake means a price fall can
+        # force liquidation, which accelerates the fall.
+        if market.lower() == "india":
+            try:
+                from data_store import _conn as _shconn
+                with _shconn() as _shc:
+                    with _shc.cursor() as _shcur:
+                        _shcur.execute("""SELECT quarter_end, promoter_pct, pledged_pct
+                                          FROM shareholding WHERE ticker = %s
+                                          ORDER BY quarter_end DESC LIMIT 4""",
+                                       (ticker.upper() if ticker.upper().endswith(".NS")
+                                        else ticker.upper() + ".NS",))
+                        _shrows = _shcur.fetchall()
+            except Exception:
+                _shrows = []
+
+            if _shrows and _shrows[0][2] is not None:
+                _pl = _shrows[0][2]
+                _status = ("pass" if _pl < 5 else
+                           "warn" if _pl < 25 else "fail")
+                _trend = ""
+                if len(_shrows) > 1 and _shrows[1][2] is not None:
+                    _chg = _pl - _shrows[1][2]
+                    if abs(_chg) >= 1:
+                        _trend = (f", {'up' if _chg > 0 else 'down'} "
+                                  f"{abs(_chg):.1f}pp from prior quarter")
+                        if _chg > 0:
+                            _status = "fail" if _pl >= 10 else "warn"
+                flag("Promoter shares not pledged", _status,
+                     f"{_pl:.1f}% of promoter holding pledged"
+                     f" (as of {_shrows[0][0]}){_trend}")
+                if _shrows[0][1] is not None:
+                    caveats.append(f"Promoter holding {_shrows[0][1]:.1f}% "
+                                   f"as of {_shrows[0][0]}.")
+            else:
+                flag("Promoter shares not pledged", "na",
+                     "shareholding data not yet fetched for this company — "
+                     "run: python news_engine.py shareholding")
+        else:
+            flag("Promoter share pledging", "na",
+                 "applies to Indian listings only")
 
         fail_count = sum(1 for f_ in flags if f_["status"] == "fail")
 
