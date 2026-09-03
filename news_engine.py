@@ -36,7 +36,7 @@ import time
 from datetime import date, timedelta
 from data_store import _conn
 
-NEWS_BUILD = "2026-07-26c (fix NSE date parsing)"
+NEWS_BUILD = "2026-07-27a (promoter shareholding + pledging)"
 
 
 # ── Rule-based classification ────────────────────────────────────────────────
@@ -250,6 +250,121 @@ def fetch_india_announcements(days: int = 7):
     return stored
 
 
+def init_shareholding_table():
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS shareholding (
+                    ticker        TEXT,
+                    quarter_end   DATE,
+                    promoter_pct  DOUBLE PRECISION,
+                    pledged_pct   DOUBLE PRECISION,
+                    fii_pct       DOUBLE PRECISION,
+                    dii_pct       DOUBLE PRECISION,
+                    public_pct    DOUBLE PRECISION,
+                    fetched_at    TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (ticker, quarter_end)
+                );
+                CREATE INDEX IF NOT EXISTS idx_sh_ticker ON shareholding(ticker);
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+    print("shareholding table ready.")
+
+
+def fetch_shareholding(limit: int = None, sleep: float = 1.2):
+    """Quarterly shareholding pattern per company from NSE.
+
+    Promoter pledging is one of the highest-signal governance red flags in
+    Indian markets — promoters borrowing against their own stake means a
+    price fall can force liquidation, which accelerates the fall. It is the
+    check Jhunjhunwala was known for, and until now the app could only say
+    'not yet tracked'.
+
+    Unlike announcements there is no bulk endpoint, so this walks companies
+    one at a time and is meant to run weekly, not nightly.
+    """
+    from india_data_pipeline import _nse_get_json, _q
+    init_shareholding_table()
+
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT ticker FROM companies WHERE market='india'
+                           ORDER BY ticker""")
+            tickers = [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+    if limit:
+        tickers = tickers[:limit]
+
+    stored, failed = 0, 0
+    for i, tkr in enumerate(tickers, 1):
+        sym = tkr.replace(".NS", "")
+        try:
+            data = _nse_get_json(
+                f"https://www.nseindia.com/api/quote-equity?symbol={_q(sym)}"
+                "&section=corp_info")
+            sh = (data or {}).get("shareholdingPatterns", {}) or {}
+            rows = sh.get("data") or sh.get("Shareholding Pattern") or {}
+            if not rows:
+                failed += 1
+                continue
+
+            for period, entries in list(rows.items())[:4]:
+                vals = {}
+                if isinstance(entries, list):
+                    for e in entries:
+                        for k, v in (e or {}).items():
+                            kl = str(k).lower()
+                            try:
+                                fv = float(str(v).replace("%", "").strip())
+                            except Exception:
+                                continue
+                            if "promoter" in kl and "pledge" not in kl:
+                                vals["promoter"] = fv
+                            elif "pledge" in kl or "encumber" in kl:
+                                vals["pledged"] = fv
+                            elif "foreign" in kl or kl.startswith("fii"):
+                                vals["fii"] = fv
+                            elif "domestic" in kl or kl.startswith("dii"):
+                                vals["dii"] = fv
+                            elif "public" in kl:
+                                vals["public"] = fv
+                if not vals:
+                    continue
+
+                q_end = _parse_nse_date(period)
+                conn = _conn()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO shareholding
+                                (ticker, quarter_end, promoter_pct, pledged_pct,
+                                 fii_pct, dii_pct, public_pct)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (ticker, quarter_end) DO UPDATE SET
+                                promoter_pct = EXCLUDED.promoter_pct,
+                                pledged_pct  = EXCLUDED.pledged_pct,
+                                fii_pct      = EXCLUDED.fii_pct,
+                                dii_pct      = EXCLUDED.dii_pct,
+                                public_pct   = EXCLUDED.public_pct
+                        """, (tkr, q_end, vals.get("promoter"), vals.get("pledged"),
+                              vals.get("fii"), vals.get("dii"), vals.get("public")))
+                    conn.commit()
+                    stored += 1
+                finally:
+                    conn.close()
+        except Exception:
+            failed += 1
+        time.sleep(sleep)
+        if i % 50 == 0:
+            print(f"  {i}/{len(tickers)} ({stored} rows, {failed} unavailable)")
+    print(f"✅ shareholding: {stored} rows stored, {failed} companies unavailable")
+
+
 def score_sentiment(limit: int = 50):
     """OPTIONAL: LLM sentiment on unscored headlines. Deliberately secondary —
     the event category above is the reliable signal; this is texture, and
@@ -359,6 +474,11 @@ if __name__ == "__main__":
         if "--days" in sys.argv:
             d = int(sys.argv[sys.argv.index("--days") + 1])
         fetch_india_announcements(days=d)
+    elif cmd == "shareholding":
+        lim = None
+        if "--limit" in sys.argv:
+            lim = int(sys.argv[sys.argv.index("--limit") + 1])
+        fetch_shareholding(limit=lim)
     elif cmd == "sentiment":
         lim = 50
         if "--limit" in sys.argv:
