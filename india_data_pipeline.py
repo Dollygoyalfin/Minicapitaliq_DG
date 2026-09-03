@@ -19,7 +19,7 @@ Requirements: httpx, pdfplumber (fallback only)
 Env: GROQ_API_KEY (fallback only)
 """
 
-INDIA_PIPELINE_BUILD = "2026-07-25c (disk cache)"
+INDIA_PIPELINE_BUILD = "2026-07-27a (working capital components)"
 
 import os
 import io
@@ -457,6 +457,32 @@ def extract_financials_from_xbrl(xml_bytes: bytes, period_end: date) -> dict:
     if borrow_cur is not None or borrow_nc is not None:
         total_debt = (borrow_cur or 0) + (borrow_nc or 0)
 
+    # ── Working-capital components (Ind-AS) ─────────────────────────────
+    # Indian filings use "Trade Receivables" / "Trade Payables"; note that
+    # "recievables" is a persistent misspelling in real NSE filings, so both
+    # spellings are matched.
+    receivables = _pick(f, "TradeReceivablesCurrent", "TradeReceivables",
+                        contains="tradereceivable")
+    if receivables is None:
+        receivables = _pick(f, contains="traderecievable")   # filing typo
+    inventories = _pick(f, "Inventories", "InventoriesCurrent",
+                        contains="inventor")
+    payables    = _pick(f, "TradePayablesCurrent", "TradePayables",
+                        contains="tradepayable")
+    if payables is None:
+        payables = _pick(f, contains="tradepaybles")         # filing typo
+
+    # Cost of revenue: Ind-AS reports components rather than a single line,
+    # so sum the ones that constitute cost of goods sold.
+    _cor_parts = [
+        _pick(f, "CostOfMaterialsConsumed", contains="costofmaterial"),
+        _pick(f, "PurchasesOfStockInTrade", contains="purchasesofstock"),
+        _pick(f, "ChangesInInventoriesOfFinishedGoodsWorkInProgressAndStockInTrade",
+              contains="changesininventories"),
+    ]
+    _cor_parts = [p for p in _cor_parts if p is not None]
+    cost_of_revenue = sum(_cor_parts) if _cor_parts else None
+
     # Cash flow (present in annual filings)
     # Exact tags first; the old loose contains="operatingactivities" could
     # first-match unrelated small facts (e.g. adjustments lines), which
@@ -494,6 +520,10 @@ def extract_financials_from_xbrl(xml_bytes: bytes, period_end: date) -> dict:
         "minority_interest":   minority,
         "long_term_investments": investments,
         # Cash flow
+        "accounts_receivable": receivables,
+        "inventory":           inventories,
+        "accounts_payable":    payables,
+        "cost_of_revenue":     cost_of_revenue,
         "operating_cash_flow": ocf,
         "capex":               abs(capex) if capex is not None else None,
         # Diagnostics
@@ -692,6 +722,12 @@ def ingest_india_own(ticker: str) -> bool:
                         "total_debt":         _yfv(bal, i, "total debt"),
                         "minority_interest":  _yfv(bal, i, "minority interest"),
                         "long_term_investments": _yfv(bal, i, "long term", "investment"),
+                        "accounts_receivable": _yfv(bal, i, "accounts receivable")
+                                               or _yfv(bal, i, "receivables"),
+                        "inventory":           _yfv(bal, i, "inventory"),
+                        "accounts_payable":    _yfv(bal, i, "accounts payable")
+                                               or _yfv(bal, i, "payables"),
+                        "cost_of_revenue":     _yfv(inc, i, "cost of revenue"),
                         "operating_cash_flow": _yfv(cf, i, "operating cash flow"),
                         "capex":              abs(_yfv(cf, i, "capital expenditure") or 0) or None,
                         "_facts_found":       0,
@@ -720,6 +756,7 @@ def ingest_india_own(ticker: str) -> bool:
         "Net Income":              row("net_income"),
         "Interest Expense":        row("interest_expense"),
         "Reconciled Depreciation": row("depreciation"),
+        "Cost Of Revenue":         row("cost_of_revenue"),
         "Operating Income":        [None] * len(got_years),
         "EBIT":                    [None] * len(got_years),
     }, index=cols).T
@@ -748,6 +785,9 @@ def ingest_india_own(ticker: str) -> bool:
         "Minority Interest":                 row("minority_interest"),
         "Total Debt":                        row("total_debt"),
         "Total Stockholders Equity":         row("total_equity"),
+        "Accounts Receivable":               row("accounts_receivable"),
+        "Inventory":                         row("inventory"),
+        "Accounts Payable":                  row("accounts_payable"),
     }, index=cols).T
 
     cashflow_df = pd.DataFrame({
