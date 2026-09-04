@@ -694,10 +694,11 @@ def _build_dataframes(facts: dict):
     tax_expense  = _get_concept_annual(facts, "IncomeTaxExpenseBenefit")
     interest_exp = _get_concept_annual(facts, "InterestExpense", "InterestExpenseDebt",
                                        "InterestExpenseBorrowings")
-    # Interest income is REVENUE for a bank but other income for a corporate —
-    # captured separately so downstream models never conflate the two
-    interest_inc = _get_concept_annual(facts, "InvestmentIncomeInterest",
-                                       "InterestAndDividendIncomeOperating")
+    # Interest income is REVENUE for a bank but other income for a corporate.
+    # Extracted but not yet consumed downstream — a bank-specific valuation
+    # model would need it; the cash-flow DCF correctly refuses banks instead.
+    _interest_income_unused = _get_concept_annual(
+        facts, "InvestmentIncomeInterest", "InterestAndDividendIncomeOperating")
     # Net income: NetIncomeLoss is the standard tag, but REITs and companies
     # with non-controlling interests frequently report only ProfitLoss (total
     # incl. NCI) or the available-to-common variant. AvalonBay had NI for just
@@ -870,7 +871,6 @@ def _build_dataframes(facts: dict):
         "Interest Expense":        row(interest_exp),
         "Net Income":              row(net_income),
         "Reconciled Depreciation": row(depreciation),
-        "Cost Of Revenue":         row(cost_revenue),
     }
     income_df = pd.DataFrame(income_data, index=col_labels).T
 
