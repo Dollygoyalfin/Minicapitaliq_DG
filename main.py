@@ -1425,6 +1425,8 @@ def get_dcf(
         # - margin freeze: opex can never compound faster than revenue,
         #   which previously inverted margins for TSLA-type profiles
         raw_revenue_growth = revenue_growth
+        # opex growth is retained for the diagnostic report only — costs are
+        # now derived from revenue at an explicit margin, not grown separately
         raw_opex_growth    = opex_growth
 
         # Growth FADE replaces the old hard clamp of -5%..+30%.
@@ -3337,9 +3339,12 @@ def get_base_rates(
         import pandas as pd
 
         MIN_EPISODES    = 15
-        MIN_EPISODE_GAP = 60
+        MIN_EPISODE_GAP = 12        # weeks (~60 trading days)
         MAX_SELECTIVITY = 0.15
-        HORIZONS = {"1m": 21, "3m": 63, "6m": 126, "12m": 252}
+        # Signatures are sampled WEEKLY, so these offsets are in WEEKS, not
+        # trading days. Using trading-day counts against a weekly series
+        # would silently make every horizon five times longer than its label.
+        HORIZONS = {"1m": 4, "3m": 13, "6m": 26, "12m": 52}
 
         raw = ticker.upper()
         if market.lower() == "india" and not raw.endswith(".NS"):
@@ -3416,19 +3421,26 @@ def get_base_rates(
                 cur.execute("""SELECT ticker, date, price FROM stock_signatures
                                WHERE ticker = ANY(%s)""", (tickers,))
                 prows = cur.fetchall()
-                cur.execute("""SELECT date, AVG(price) FROM stock_signatures
-                               WHERE market = %s GROUP BY date""", (market,))
+                # Equal-weight index from per-stock RETURNS, not from the
+                # average price. Averaging prices makes a high-priced stock
+                # ENTERING the sample look like a market-wide move, which
+                # corrupts every excess return computed against it.
+                cur.execute("""SELECT ticker, date, price FROM stock_signatures
+                               WHERE market = %s AND price IS NOT NULL""",
+                            (market,))
                 brows = cur.fetchall()
 
         prices = pd.DataFrame(prows, columns=["ticker", "date", "price"])
         prices["date"] = pd.to_datetime(prices["date"])
         prices = prices.sort_values(["ticker", "date"])
 
-        bench = pd.DataFrame(brows, columns=["date", "avg_price"])
+        bench = pd.DataFrame(brows, columns=["ticker", "date", "price"])
         bench["date"] = pd.to_datetime(bench["date"])
-        bench = bench.sort_values("date")
-        bench["idx"] = (1 + bench["avg_price"].pct_change().fillna(0)).cumprod()
-        bmap = dict(zip(bench["date"], bench["idx"]))
+        bench = bench.sort_values(["ticker", "date"])
+        bench["ret"] = bench.groupby("ticker")["price"].pct_change()
+        _daily = bench.groupby("date")["ret"].mean().sort_index()
+        _idx = (1 + _daily.fillna(0)).cumprod()
+        bmap = dict(zip(_idx.index, _idx.values))
 
         # ── 4. Episodes → forward excess returns ─────────────────────────────
         results = {h: [] for h in HORIZONS}
@@ -3513,6 +3525,7 @@ def get_base_rates(
 
     except Exception as e:
         return {"error": f"Base-rate analysis failed: {e}"}
+        
 # ── DATA QUALITY GATE (paste into main.py, ABOVE the /dcf block) ─────────────
 # You cannot guarantee perfect XBRL extraction across 1,000 filers. You CAN
 # guarantee that no valuation is ever published from inputs that fail
