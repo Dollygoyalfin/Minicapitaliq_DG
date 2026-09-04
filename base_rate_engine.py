@@ -30,12 +30,16 @@ import pandas as pd
 import numpy as np
 from data_store import _conn
 
-BASE_RATE_BUILD = "2026-07-26f (benchmark-relative, strict episodes)"
+BASE_RATE_BUILD = "2026-07-27a (equal-weight index from returns, weekly)"
 
 MIN_EPISODES    = 15
-MIN_EPISODE_GAP = 60
+MIN_EPISODE_GAP = 12        # weeks (~60 trading days)
 MAX_SELECTIVITY = 0.15
-HORIZONS = {"1m": 21, "3m": 63, "6m": 126, "12m": 252}
+# Signatures are sampled WEEKLY, so these offsets are in WEEKS, not trading
+# days. Using trading-day counts against a weekly series would silently make
+# every horizon five times longer than its label — a "1 month" return would
+# actually measure five months, with no error raised anywhere.
+HORIZONS = {"1m": 4, "3m": 13, "6m": 26, "12m": 52}
 
 
 def _connect_with_retry(attempts: int = 3):
@@ -53,26 +57,42 @@ def _connect_with_retry(attempts: int = 3):
 
 
 def load_benchmark() -> pd.DataFrame:
-    """Equal-weight market proxy per market per date."""
+    """Equal-weight market proxy: the mean of per-stock RETURNS.
+
+    This previously chained the percentage change of the AVERAGE PRICE across
+    stocks, which is not an index — it is an artefact. Companies have
+    different history start dates, so when a high-priced stock enters the
+    sample the average price jumps and the "index" records a large fake
+    return. In testing, a universe whose true average move was +1.5% produced
+    a +4974% index that way. Since excess return = stock return minus market
+    return, that corrupted every base rate the engine reported.
+    """
     conn = _connect_with_retry()
     try:
         with conn.cursor() as cur:
             cur.execute("SET statement_timeout = '300s'")
             cur.execute("""
-                SELECT market, date, AVG(price) AS avg_price
-                FROM stock_signatures GROUP BY market, date
+                SELECT ticker, market, date, price
+                FROM stock_signatures WHERE price IS NOT NULL
             """)
             rows = cur.fetchall()
     finally:
         conn.close()
-    df = pd.DataFrame(rows, columns=["market", "date", "avg_price"])
+    df = pd.DataFrame(rows, columns=["ticker", "market", "date", "price"])
     df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values(["ticker", "date"])
+    df["ret"] = df.groupby("ticker")["price"].pct_change()
+
     out = []
     for mkt, g in df.groupby("market"):
-        g = g.sort_values("date").copy()
-        g["mkt_index"] = (1 + g["avg_price"].pct_change().fillna(0)).cumprod()
-        out.append(g[["market", "date", "mkt_index"]])
-    return pd.concat(out)
+        # Mean of returns on each date = equal-weight index return. A stock
+        # entering the sample contributes NaN on its first date and is simply
+        # excluded from that day's mean, so entry cannot fabricate a move.
+        daily = g.groupby("date")["ret"].mean().sort_index()
+        idx = (1 + daily.fillna(0)).cumprod()
+        out.append(pd.DataFrame({"market": mkt, "date": idx.index,
+                                 "mkt_index": idx.values}))
+    return pd.concat(out, ignore_index=True)
 
 
 def load_filtered_signatures(filters: dict, market: str = None) -> pd.DataFrame:
@@ -207,7 +227,7 @@ def print_summary(s: dict):
         print(f"  {s['error']}")
         return
     print(f"  selectivity : {s['selectivity_pct']}% of all stock-days")
-    print(f"  episodes    : {s['n_episodes']} (min {MIN_EPISODE_GAP} trading days apart)")
+    print(f"  episodes    : {s['n_episodes']} (min {MIN_EPISODE_GAP} weeks apart)")
     if s.get("warning"):
         print(f"\n  WARNING: {s['warning']}")
     print("\n  Forward EXCESS return vs equal-weight market:")
