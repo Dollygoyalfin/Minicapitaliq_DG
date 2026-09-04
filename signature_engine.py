@@ -21,7 +21,7 @@ import pandas as pd
 import numpy as np
 from data_store import _conn
 
-SIGNATURE_BUILD = "2026-07-27c (computed beta vs equal-weight index)"
+SIGNATURE_BUILD = "2026-07-27d (weekly sampling, ~80% smaller)"
 
 
 def _init_table():
@@ -56,7 +56,9 @@ def _init_table():
                 ALTER TABLE stock_signatures ADD COLUMN IF NOT EXISTS beta_2y DOUBLE PRECISION;
                 ALTER TABLE stock_signatures ADD COLUMN IF NOT EXISTS beta_r2 DOUBLE PRECISION;
                 CREATE INDEX IF NOT EXISTS idx_sig_date ON stock_signatures(date);
-                CREATE INDEX IF NOT EXISTS idx_sig_market ON stock_signatures(market);
+                -- idx_sig_market removed: an index on a two-value column
+                -- (us/india) cannot narrow a scan usefully and cost ~15MB.
+                DROP INDEX IF EXISTS idx_sig_market;
             """)
         conn.commit()
     finally:
@@ -216,7 +218,8 @@ def add_beta(df: pd.DataFrame, window: int = 504) -> pd.DataFrame:
     return df.drop(columns=["ret", "mkt_ret"])
 
 
-def backfill_signatures(full_rebuild: bool = True, recent_days: int = None):
+def backfill_signatures(full_rebuild: bool = True, recent_days: int = None,
+                        sample_weekly: bool = True):
     _init_table()
     if recent_days:
         print(f"Incremental update: recomputing last {recent_days} days only.")
@@ -243,6 +246,23 @@ def backfill_signatures(full_rebuild: bool = True, recent_days: int = None):
     t0 = time.time()
     feats = add_beta(feats)
     print(f"  done ({time.time()-t0:.0f}s)")
+
+    # ── Weekly sampling ──────────────────────────────────────────────────
+    # Daily signatures are far more resolution than anything consumes: base
+    # rate episodes require 60 trading days' separation, and no query reads
+    # consecutive days. Keeping one observation per week preserves every
+    # analysis we run while cutting this table — which was 63% of the whole
+    # database — by roughly 80%.
+    #
+    # The most recent date is always kept, so "today's signature" stays exact.
+    if sample_weekly:
+        before = len(feats)
+        feats = feats.sort_values(["ticker", "date"])
+        latest_date = feats["date"].max()
+        keep = (feats["date"].dt.dayofweek == 4) | (feats["date"] == latest_date)
+        feats = feats[keep]
+        print(f"  weekly sampling: {before:,} → {len(feats):,} rows "
+              f"({100 - len(feats)/before*100:.0f}% smaller)")
 
     print("Writing to store...")
     t0 = time.time()
