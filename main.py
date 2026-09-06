@@ -3279,15 +3279,26 @@ def get_quality(
             try:
                 with _shconn() as _pc:
                     with _pc.cursor() as _pcur:
-                        _pcur.execute("""SELECT quarter_end, pledged_pct
+                        _pcur.execute("""SELECT quarter_end, pledged_pct,
+                                                encumbrance_declared
                                          FROM shareholding
-                                         WHERE ticker = %s AND pledged_pct IS NOT NULL
+                                         WHERE ticker = %s
+                                           AND (pledged_pct IS NOT NULL
+                                                OR encumbrance_declared IS NOT NULL)
                                          ORDER BY quarter_end DESC LIMIT 4""", (_t,))
                         _plrows = _pcur.fetchall()
             except Exception:
                 _plrows = []
 
-            if _plrows:
+            if _plrows and _plrows[0][1] is None and _plrows[0][2]:
+                # The filing declares encumbrance but reports no percentage.
+                # Saying "0%" here would contradict the company's own
+                # disclosure, so the honest output is that it exists but is
+                # unquantified in the filing.
+                flag("Promoter shares not encumbered", "warn",
+                     f"encumbrance declared in the {_plrows[0][0]} filing, but "
+                     f"no percentage is reported in it — check the filing directly")
+            elif _plrows and _plrows[0][1] is not None:
                 _pl = _plrows[0][1]
                 _pst = "pass" if _pl < 5 else "warn" if _pl < 25 else "fail"
                 _ptrend = ""
