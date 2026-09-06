@@ -3227,45 +3227,83 @@ def get_quality(
                  f"current {margins_desc[0]*100:.1f}% vs peak {max(margins_desc)*100:.1f}%"
                  if collapse else "margins near historical range")
 
-        # ── Promoter pledging (India) ────────────────────────────────────
-        # One of the highest-signal governance checks in Indian markets:
-        # promoters borrowing against their own stake means a price fall can
-        # force liquidation, which accelerates the fall.
+        # ── Promoter holding trend (India) ───────────────────────────────
+        # NSE's public feed publishes promoter/public percentages but NOT the
+        # pledged percentage (verified against the live API — pledging appears
+        # only in the quarterly shareholding-pattern PDFs). So this tracks
+        # what is actually available: the direction of promoter ownership.
+        # A promoter stake that keeps falling is a governance signal in its
+        # own right, and it is not measured anywhere else in the app.
         if market.lower() == "india":
             try:
                 from data_store import _conn as _shconn
+                _t = ticker.upper()
+                if not _t.endswith(".NS"):
+                    _t += ".NS"
                 with _shconn() as _shc:
                     with _shc.cursor() as _shcur:
-                        _shcur.execute("""SELECT quarter_end, promoter_pct, pledged_pct
-                                          FROM shareholding WHERE ticker = %s
-                                          ORDER BY quarter_end DESC LIMIT 4""",
-                                       (ticker.upper() if ticker.upper().endswith(".NS")
-                                        else ticker.upper() + ".NS",))
+                        _shcur.execute("""SELECT quarter_end, promoter_pct
+                                          FROM shareholding
+                                          WHERE ticker = %s AND promoter_pct IS NOT NULL
+                                          ORDER BY quarter_end DESC LIMIT 6""", (_t,))
                         _shrows = _shcur.fetchall()
             except Exception:
                 _shrows = []
 
-            if _shrows and _shrows[0][2] is not None:
-                _pl = _shrows[0][2]
-                _status = ("pass" if _pl < 5 else
-                           "warn" if _pl < 25 else "fail")
-                _trend = ""
-                if len(_shrows) > 1 and _shrows[1][2] is not None:
-                    _chg = _pl - _shrows[1][2]
-                    if abs(_chg) >= 1:
-                        _trend = (f", {'up' if _chg > 0 else 'down'} "
-                                  f"{abs(_chg):.1f}pp from prior quarter")
-                        if _chg > 0:
-                            _status = "fail" if _pl >= 10 else "warn"
-                flag("Promoter shares not pledged", _status,
-                     f"{_pl:.1f}% of promoter holding pledged"
-                     f" (as of {_shrows[0][0]}){_trend}")
-                if _shrows[0][1] is not None:
-                    caveats.append(f"Promoter holding {_shrows[0][1]:.1f}% "
-                                   f"as of {_shrows[0][0]}.")
+            if len(_shrows) >= 2:
+                _now, _then = _shrows[0][1], _shrows[-1][1]
+                _chg = _now - _then
+                _quarters = len(_shrows)
+                if _chg <= -3:
+                    _st = "fail"
+                elif _chg <= -1:
+                    _st = "warn"
+                else:
+                    _st = "pass"
+                flag("Promoter holding not declining", _st,
+                     f"{_now:.2f}% now vs {_then:.2f}% {_quarters} quarters ago "
+                     f"({_chg:+.2f}pp)")
+            elif _shrows:
+                flag("Promoter holding not declining", "na",
+                     f"only one quarter on record ({_shrows[0][1]:.2f}%) — "
+                     f"trend needs at least two")
             else:
-                flag("Promoter shares not pledged", "na",
-                     "shareholding data not yet fetched for this company — "
+                flag("Promoter holding not declining", "na",
+                     "shareholding data not fetched yet — "
+                     "run: python news_engine.py shareholding")
+
+            # Encumbrance, now available exactly from the shareholding-pattern
+            # XBRL. Covers pledges, non-disposal undertakings and other
+            # encumbrances together — Vedanta reports zero pledges but real
+            # NDUs, and treating only "pledge" as the risk would miss that.
+            try:
+                with _shconn() as _pc:
+                    with _pc.cursor() as _pcur:
+                        _pcur.execute("""SELECT quarter_end, pledged_pct
+                                         FROM shareholding
+                                         WHERE ticker = %s AND pledged_pct IS NOT NULL
+                                         ORDER BY quarter_end DESC LIMIT 4""", (_t,))
+                        _plrows = _pcur.fetchall()
+            except Exception:
+                _plrows = []
+
+            if _plrows:
+                _pl = _plrows[0][1]
+                _pst = "pass" if _pl < 5 else "warn" if _pl < 25 else "fail"
+                _ptrend = ""
+                if len(_plrows) > 1 and _plrows[1][1] is not None:
+                    _pchg = _pl - _plrows[1][1]
+                    if abs(_pchg) >= 1:
+                        _ptrend = (f", {'up' if _pchg > 0 else 'down'} "
+                                   f"{abs(_pchg):.1f}pp from prior quarter")
+                        if _pchg > 0 and _pl >= 10:
+                            _pst = "fail"
+                flag("Promoter shares not encumbered", _pst,
+                     f"{_pl:.2f}% encumbered (pledge, non-disposal undertaking "
+                     f"or other) as of {_plrows[0][0]}{_ptrend}")
+            else:
+                flag("Promoter shares not encumbered", "na",
+                     "shareholding data not fetched yet — "
                      "run: python news_engine.py shareholding")
         else:
             flag("Promoter share pledging", "na",
