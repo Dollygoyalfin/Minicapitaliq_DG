@@ -36,7 +36,7 @@ import time
 from datetime import date, timedelta
 from data_store import _conn
 
-NEWS_BUILD = "2026-07-27a (promoter shareholding + pledging)"
+NEWS_BUILD = "2026-07-27j (fraction scaling + NumberOfShares denominator)"
 
 
 # ── Rule-based classification ────────────────────────────────────────────────
@@ -48,7 +48,11 @@ EVENT_RULES = [
         r"casual vacancy.*auditor",
     ]),
     ("pledge_created", "red_flag", [
-        r"creation of (encumbrance|pledge)", r"pledge.*creat", r"invocation of pledge",
+        # Real NSE wording varies; "encumbrance" is the term used in SAST
+        # filings, and invocation means a lender has actually sold the stock.
+        r"creation of (encumbrance|pledge)", r"pledge.*creat",
+        r"invocation of pledge", r"encumbrance.*creat", r"shares? pledged",
+        r"pledge of (equity )?shares",
     ]),
     ("pledge_released", "positive", [
         r"release of (encumbrance|pledge)", r"revocation of (encumbrance|pledge)",
@@ -84,6 +88,38 @@ EVENT_RULES = [
         r"financial results", r"quarterly results", r"audited results",
     ]),
     ("board_meeting", "info", [r"board meeting"]),
+
+    # ── NSE subject-line prefixes ────────────────────────────────────────────
+    # NSE stamps every announcement with its own subject category before the
+    # em-dash. Matching that prefix is deterministic — the same reason the US
+    # engine keys off 8-K item numbers instead of headline text. Without these
+    # rules 82% of filings fell into "other".
+    ("takeover_disclosure", "watch", [
+        # SEBI SAST filings cover substantial acquisitions AND encumbrances.
+        # Deliberately "watch", not "red_flag": the heading alone does not
+        # tell us whether shares were pledged, bought or sold, and marking
+        # every one red would make the red-flag count meaningless.
+        r"disclosure under sebi takeover regulations",
+        r"disclosure under regulation 29", r"regulation 31",
+    ]),
+    ("analyst_meet",       "info", [
+        r"analysts?/institutional investor meet", r"con\.? call",
+        r"earnings call", r"investor presentation",
+    ]),
+    ("order_win", "positive", [
+        r"bagging/receiving of orders", r"receiving of orders/contracts",
+    ]),
+    ("monitoring_report",  "info", [r"monitoring agency report"]),
+    ("trading_window",     "info", [r"trading window", r"closure of trading"]),
+    ("general_update",     "info", [
+        r"^general updates", r"^updates —", r"newspaper publication",
+        r"press release", r"investor complaint",
+    ]),
+    ("compliance_filing",  "info", [
+        r"reconciliation of share capital", r"certificate under regulation",
+        r"compliance certificate", r"related party transaction",
+        r"corporate governance report", r"shareholding pattern",
+    ]),
 ]
 
 COMPILED = [(cat, sev, [re.compile(p, re.I) for p in pats])
@@ -263,9 +299,16 @@ def init_shareholding_table():
                     fii_pct       DOUBLE PRECISION,
                     dii_pct       DOUBLE PRECISION,
                     public_pct    DOUBLE PRECISION,
+                    -- A filing can DECLARE encumbrance while reporting no
+                    -- usable percentage. Storing 0 for that case reads as
+                    -- "nothing encumbered", which is the opposite of what the
+                    -- company disclosed — so the flag is kept separately.
+                    encumbrance_declared BOOLEAN,
                     fetched_at    TIMESTAMP DEFAULT NOW(),
                     PRIMARY KEY (ticker, quarter_end)
                 );
+                ALTER TABLE shareholding
+                    ADD COLUMN IF NOT EXISTS encumbrance_declared BOOLEAN;
                 CREATE INDEX IF NOT EXISTS idx_sh_ticker ON shareholding(ticker);
             """)
         conn.commit()
@@ -274,19 +317,151 @@ def init_shareholding_table():
     print("shareholding table ready.")
 
 
-def fetch_shareholding(limit: int = None, sleep: float = 1.2):
-    """Quarterly shareholding pattern per company from NSE.
+def _parse_shp_xbrl(xml_bytes, promoter_pct_hint=None):
+    """Promoter encumbrance from a shareholding-pattern XBRL.
 
-    Promoter pledging is one of the highest-signal governance red flags in
-    Indian markets — promoters borrowing against their own stake means a
-    price fall can force liquidation, which accelerates the fall. It is the
-    check Jhunjhunwala was known for, and until now the app could only say
-    'not yet tracked'.
+    Ground truth from Ashok Leyland's actual filing, checked against a known
+    real-world figure rather than a synthetic test:
 
-    Unlike announcements there is no bulk endpoint, so this walks companies
-    one at a time and is meant to run weekly, not nightly.
+        EncumberedSharesHeldAsPercentageOfTotalNumberOfShares = 0.401
+        (inside context ShareholdingOfPromoterAndPromoterGroup_ContextI)
+
+    0.401 means 0.401%, NOT 40.1%. Two earlier versions of this parser both
+    produced wrong answers on real filings:
+      - treating any value <= 1.0 as "already a fraction, times 100" turned
+        0.401% into 40.1%
+      - deriving from NumberOfSharesEncumbered / NumberOfFullyPaidUpEquityShares
+        used the wrong denominator (the promoter context ALSO contains
+        NumberOfShares, which includes depository receipts, and the two
+        counts differ enough to swing the answer from 0.4% to 51%)
+
+    The correct approach: read the percentage tag directly from the EXACT
+    promoter-group context, take the value at face value (the tag's own
+    definition is "a percentage figure," i.e. already scaled 0-100, not a
+    0-1 fraction) and do not derive it from counts at all — the counts in
+    this context are not guaranteed to be the matching pair.
+
+    The ONE context that matters is ShareholdingOfPromoterAndPromoterGroup_*
+    specifically — not "Foreign", not "OtherForeignShareholders", not any
+    sub-grouping context, which report different (irrelevant) percentages
+    for the same tag name.
     """
-    from india_data_pipeline import _nse_get_json, _q
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml_bytes)
+
+    def local(t):
+        return t.split("}")[-1]
+
+    PROMOTER_MEMBER = "shareholdingofpromoterandpromotergroupmember"
+
+    # Find contexts whose dimension member is EXACTLY the promoter-group
+    # member — not merely containing the word "promoter" (which also matches
+    # "ShareholdingByCompaniesOrBodiesCorporateWhereGovernmentIsPromoter").
+    promoter_ctx = set()
+    for el in root.iter():
+        if local(el.tag) != "context":
+            continue
+        cid = el.get("id")
+        for ch in el.iter():
+            if local(ch.tag) in ("explicitMember", "typedMember"):
+                member = (ch.text or "").strip().lower()
+                if member.endswith(PROMOTER_MEMBER) or member == PROMOTER_MEMBER:
+                    promoter_ctx.add(cid)
+    if not promoter_ctx:
+        for el in root.iter():
+            if local(el.tag) == "context" and "shareholdingofpromoterandpromotergroup" in (el.get("id") or "").lower():
+                promoter_ctx.add(el.get("id"))
+
+    flags = {}
+    pct_vals = []
+    counts = {}
+    for el in root.iter():
+        tag = local(el.tag)
+        txt = (el.text or "").strip()
+        if not txt:
+            continue
+        low = txt.lower()
+        if low in ("true", "false"):
+            flags[tag] = flags.get(tag, False) or (low == "true")
+            continue
+        if el.get("contextRef") not in promoter_ctx:
+            continue
+        if tag == "EncumberedSharesHeldAsPercentageOfTotalNumberOfShares":
+            try:
+                pct_vals.append(float(txt))
+            except ValueError:
+                pass
+        elif tag in ("NumberOfSharesEncumbered", "NumberOfShares"):
+            try:
+                counts.setdefault(tag, []).append(float(txt))
+            except ValueError:
+                pass
+
+    any_encumbered = any(flags.get(k) for k in (
+        "WhetherAnySharesHeldByPromotersAreEncumberedUnderPledged",
+        "WhetherAnySharesHeldByPromotersAreEncumberedUnderPledgedForPromoterAndPromoterGroup",
+        "WhetherAnySharesHeldByPromotersAreEncumberedUnderNonDisposalUndertaking",
+        "WhetherAnySharesHeldByPromotersAreEncumberedUnderNonDisposalUndertakingForPromoterAndPromoterGroup",
+        "WhetherAnySharesHeldByPromotersAreEncumberedOtherThanByWayOfPledgeOrNDU",
+        "WhetherAnySharesHeldByPromotersAreEncumberedOtherThanByWayOfPledgeOrNDUForPromoterAndPromoterGroup",
+    ))
+
+    pct, basis = None, None
+    if pct_vals:
+        # The tag is a FRACTION of the promoter's total holding: Ashok
+        # Leyland reports 0.401, and the publicly quoted figure is 40.1%.
+        #
+        # Verified against the filing's own counts:
+        #     encumbered 1,203,500,000 / NumberOfShares 3,001,320,522 = 40.1%
+        #
+        # Note the denominator: NumberOfShares (3,001,320,522), NOT
+        # NumberOfFullyPaidUpEquityShares (2,342,920,242). The difference is
+        # 658,400,280 depository receipts the promoters also hold, and using
+        # the smaller figure inflated the answer to 51.4%.
+        raw = max(pct_vals)
+        pct = raw * 100.0 if raw <= 1.0 else raw
+        basis = "reported fraction from the exact promoter-group context"
+        if not (0 <= pct <= 100):
+            pct, basis = None, "reported value out of range — not used"
+    if pct is None and any_encumbered:
+        basis = "encumbrance declared, but no percentage found in the exact promoter context"
+    if pct is None and not any_encumbered:
+        pct, basis = 0.0, "no encumbrance declared"
+
+    # Cross-check against the filing's own counts, using NumberOfShares as
+    # the denominator (the promoter's TOTAL holding, including depository
+    # receipts). Reported and derived should agree closely; if they do not,
+    # say so rather than presenting one silently.
+    derived = None
+    enc = max(counts.get("NumberOfSharesEncumbered", []), default=None)
+    tot = max(counts.get("NumberOfShares", []), default=None)
+    if enc is not None and tot:
+        derived = enc / tot * 100.0
+        if pct is not None and abs(derived - pct) > 2:
+            basis = (f"{basis}; counts imply {derived:.2f}% — figures disagree")
+        elif pct is not None:
+            basis = "reported fraction, confirmed by the filing's share counts"
+        else:
+            pct, basis = derived, "derived from share counts"
+
+    return {
+        "promoter_pct": None,      # taken from the API header, which is reliable
+        "pledged_pct":  round(pct, 3) if pct is not None else None,
+        "encumbrance_declared": any_encumbered,
+        "basis": basis,
+        "derived_from_counts": round(derived, 3) if derived is not None else None,
+    }
+
+
+def fetch_shareholding(limit: int = None, sleep: float = 1.0, quarters: int = 6):
+    """Quarterly promoter holding AND encumbrance, parsed from NSE's
+    shareholding-pattern XBRL.
+
+    One call to share-holdings-master returns the full filing history with
+    XBRL links; each XBRL is then parsed for the exact figures. XBRL files
+    are immutable, so the disk cache makes re-runs almost free.
+    """
+    from india_data_pipeline import _nse_get, _nse_get_json, _q
     init_shareholding_table()
 
     conn = _conn()
@@ -300,69 +475,81 @@ def fetch_shareholding(limit: int = None, sleep: float = 1.2):
     if limit:
         tickers = tickers[:limit]
 
-    stored, failed = 0, 0
+    stored, failed, encumbered_cos = 0, 0, 0
     for i, tkr in enumerate(tickers, 1):
         sym = tkr.replace(".NS", "")
         try:
-            data = _nse_get_json(
-                f"https://www.nseindia.com/api/quote-equity?symbol={_q(sym)}"
-                "&section=corp_info")
-            sh = (data or {}).get("shareholdingPatterns", {}) or {}
-            rows = sh.get("data") or sh.get("Shareholding Pattern") or {}
-            if not rows:
+            filings = _nse_get_json(
+                "https://www.nseindia.com/api/corporate-share-holdings-master"
+                f"?index=equities&symbol={_q(sym)}")
+            if not isinstance(filings, list) or not filings:
                 failed += 1
                 continue
 
-            for period, entries in list(rows.items())[:4]:
-                vals = {}
-                if isinstance(entries, list):
-                    for e in entries:
-                        for k, v in (e or {}).items():
-                            kl = str(k).lower()
-                            try:
-                                fv = float(str(v).replace("%", "").strip())
-                            except Exception:
-                                continue
-                            if "promoter" in kl and "pledge" not in kl:
-                                vals["promoter"] = fv
-                            elif "pledge" in kl or "encumber" in kl:
-                                vals["pledged"] = fv
-                            elif "foreign" in kl or kl.startswith("fii"):
-                                vals["fii"] = fv
-                            elif "domestic" in kl or kl.startswith("dii"):
-                                vals["dii"] = fv
-                            elif "public" in kl:
-                                vals["public"] = fv
-                if not vals:
+            rows, saw_enc = [], False
+            for f_ in filings[:quarters]:
+                xbrl = f_.get("xbrl")
+                qdate = _parse_nse_date(f_.get("date"))
+                if not xbrl:
+                    # header values still give promoter/public
+                    try:
+                        rows.append((tkr, qdate, float(f_.get("pr_and_prgrp")),
+                                     None, None, None,
+                                     float(f_.get("public_val")), None))
+                    except (TypeError, ValueError):
+                        pass
                     continue
+                try:
+                    hdr_prom = float(f_.get("pr_and_prgrp"))
+                except (TypeError, ValueError):
+                    hdr_prom = None
+                try:
+                    parsed = _parse_shp_xbrl(_nse_get(xbrl).content,
+                                             promoter_pct_hint=hdr_prom)
+                except Exception:
+                    parsed = {}
+                try:
+                    hdr_pub = float(f_.get("public_val"))
+                except (TypeError, ValueError):
+                    hdr_pub = None
+                if parsed.get("encumbrance_declared"):
+                    saw_enc = True
+                rows.append((tkr, qdate, hdr_prom,
+                             parsed.get("pledged_pct"), None, None, hdr_pub,
+                             bool(parsed.get("encumbrance_declared"))))
 
-                q_end = _parse_nse_date(period)
+            if saw_enc:
+                encumbered_cos += 1
+            if rows:
                 conn = _conn()
                 try:
                     with conn.cursor() as cur:
-                        cur.execute("""
-                            INSERT INTO shareholding
-                                (ticker, quarter_end, promoter_pct, pledged_pct,
-                                 fii_pct, dii_pct, public_pct)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s)
-                            ON CONFLICT (ticker, quarter_end) DO UPDATE SET
-                                promoter_pct = EXCLUDED.promoter_pct,
-                                pledged_pct  = EXCLUDED.pledged_pct,
-                                fii_pct      = EXCLUDED.fii_pct,
-                                dii_pct      = EXCLUDED.dii_pct,
-                                public_pct   = EXCLUDED.public_pct
-                        """, (tkr, q_end, vals.get("promoter"), vals.get("pledged"),
-                              vals.get("fii"), vals.get("dii"), vals.get("public")))
+                        for r in rows:
+                            cur.execute("""
+                                INSERT INTO shareholding
+                                    (ticker, quarter_end, promoter_pct, pledged_pct,
+                                     fii_pct, dii_pct, public_pct,
+                                     encumbrance_declared)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                                ON CONFLICT (ticker, quarter_end) DO UPDATE SET
+                                    promoter_pct = EXCLUDED.promoter_pct,
+                                    pledged_pct  = EXCLUDED.pledged_pct,
+                                    public_pct   = EXCLUDED.public_pct,
+                                    encumbrance_declared = EXCLUDED.encumbrance_declared
+                            """, r)
                     conn.commit()
-                    stored += 1
+                    stored += len(rows)
                 finally:
                     conn.close()
         except Exception:
             failed += 1
         time.sleep(sleep)
-        if i % 50 == 0:
-            print(f"  {i}/{len(tickers)} ({stored} rows, {failed} unavailable)")
-    print(f"✅ shareholding: {stored} rows stored, {failed} companies unavailable")
+        if i % 25 == 0:
+            print(f"  {i}/{len(tickers)} ({stored} rows, {encumbered_cos} with "
+                  f"encumbrance, {failed} unavailable)")
+
+    print(f"✅ shareholding: {stored} rows, {encumbered_cos} companies with "
+          f"declared encumbrance, {failed} unavailable")
 
 
 def score_sentiment(limit: int = 50):
