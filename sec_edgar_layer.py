@@ -20,7 +20,7 @@ Usage:
     info, income_df, balance_df, cashflow_df = get_sec_company_data("AAPL")
 """
 
-SEC_LAYER_BUILD = "2026-07-25j (net income fallbacks)"
+SEC_LAYER_BUILD = "2026-07-27a (working capital components)"
 
 
 import time
