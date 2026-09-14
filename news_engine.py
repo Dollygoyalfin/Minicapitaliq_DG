@@ -36,7 +36,7 @@ import time
 from datetime import date, timedelta
 from data_store import _conn
 
-NEWS_BUILD = "2026-07-27j (fraction scaling + NumberOfShares denominator)"
+NEWS_BUILD = "2026-07-27k (FII/DII from the same XBRL)"
 
 
 # ── Rule-based classification ────────────────────────────────────────────────
@@ -444,12 +444,93 @@ def _parse_shp_xbrl(xml_bytes, promoter_pct_hint=None):
         else:
             pct, basis = derived, "derived from share counts"
 
+    # ── Institutional ownership, from the same file ──────────────────────
+    # The shareholding pattern reports every shareholder category in its own
+    # context. NSE's summary JSON gives only promoter/public/employee-trust,
+    # but the XBRL we already download carries the full breakdown, so FII and
+    # DII need no extra request.
+    inst = _extract_institutional(root, local)
+
     return {
         "promoter_pct": None,      # taken from the API header, which is reliable
         "pledged_pct":  round(pct, 3) if pct is not None else None,
         "encumbrance_declared": any_encumbered,
         "basis": basis,
         "derived_from_counts": round(derived, 3) if derived is not None else None,
+        "fii_pct": inst["fii_pct"],
+        "dii_pct": inst["dii_pct"],
+        "institutional_breakdown": inst["breakdown"],
+    }
+
+
+# Context-name fragments for each bucket. Matched against the context ID,
+# which is how these filings name the category (MutualFundsOrUTI_ContextI,
+# ForeignPortfolioInvestorsCategoryI_ContextI, and so on).
+_DII_PARTS = (
+    "mutualfunds", "alternativeinvestmentfunds", "banks", "insurancecompanies",
+    "providentfundsorpensionfunds", "sovereignwealthfundsdomestic",
+    "assetreconstructioncompanies", "nbfcregisteredwithrbi",
+    "otherfinancialinstitutions", "indianinstitutions",
+)
+_FII_PARTS = (
+    "foreignportfolioinvestor", "foreigninstitutionalinvestor",
+    "foreignventurecapitalinvestors", "sovereignwealthfundsforeign",
+    "foreignnationals", "overseasdepositories",
+)
+# Excluded so a parent total is never added to its own children
+_EXCLUDE_PARTS = ("promoter", "shareholdingpattern_", "public_context",
+                  "nonpromoternonpublic", "total")
+
+
+def _extract_institutional(root, local):
+    """Sum shareholding percentages into FII and DII buckets.
+
+    Percentages in these filings are fractions (0.1011 = 10.11%), the same
+    convention as the encumbrance figures. Each category appears once in its
+    own context, so summing the leaf categories is correct — parent totals
+    are excluded by name so nothing is double counted.
+    """
+    ctx_pct = {}
+    for el in root.iter():
+        if local(el.tag) != "ShareholdingAsAPercentageOfTotalNumberOfShares":
+            continue
+        cref = el.get("contextRef") or ""
+        txt = (el.text or "").strip()
+        if not txt:
+            continue
+        try:
+            v = float(txt)
+        except ValueError:
+            continue
+        # Keep the first value seen per context; duplicates are restatements
+        ctx_pct.setdefault(cref, v)
+
+    fii = dii = 0.0
+    breakdown = {}
+    for cref, v in ctx_pct.items():
+        cl = cref.lower()
+        if any(x in cl for x in _EXCLUDE_PARTS):
+            continue
+        pct = v * 100.0 if v <= 1.0 else v
+        if pct <= 0:
+            continue
+        label = cref.split("_")[0]
+        if any(p in cl for p in _DII_PARTS):
+            dii += pct
+            breakdown[label] = round(pct, 3)
+        elif any(p in cl for p in _FII_PARTS):
+            fii += pct
+            breakdown[label] = round(pct, 3)
+
+    # A total above 100 means the name matching caught a parent row; report
+    # nothing rather than an impossible figure.
+    if fii > 100 or dii > 100 or (fii + dii) > 100:
+        return {"fii_pct": None, "dii_pct": None, "breakdown": breakdown}
+
+    return {
+        "fii_pct": round(fii, 2) if fii else None,
+        "dii_pct": round(dii, 2) if dii else None,
+        "breakdown": breakdown,
     }
 
 
@@ -515,7 +596,9 @@ def fetch_shareholding(limit: int = None, sleep: float = 1.0, quarters: int = 6)
                 if parsed.get("encumbrance_declared"):
                     saw_enc = True
                 rows.append((tkr, qdate, hdr_prom,
-                             parsed.get("pledged_pct"), None, None, hdr_pub,
+                             parsed.get("pledged_pct"),
+                             parsed.get("fii_pct"), parsed.get("dii_pct"),
+                             hdr_pub,
                              bool(parsed.get("encumbrance_declared"))))
 
             if saw_enc:
@@ -534,6 +617,8 @@ def fetch_shareholding(limit: int = None, sleep: float = 1.0, quarters: int = 6)
                                 ON CONFLICT (ticker, quarter_end) DO UPDATE SET
                                     promoter_pct = EXCLUDED.promoter_pct,
                                     pledged_pct  = EXCLUDED.pledged_pct,
+                                    fii_pct      = EXCLUDED.fii_pct,
+                                    dii_pct      = EXCLUDED.dii_pct,
                                     public_pct   = EXCLUDED.public_pct,
                                     encumbrance_declared = EXCLUDED.encumbrance_declared
                             """, r)
