@@ -30,13 +30,14 @@ Usage:
 
 import os
 import re
+import json
 import sys
 import json
 import time
 from datetime import date, timedelta
 from data_store import _conn
 
-NEWS_BUILD = "2026-07-27k (FII/DII from the same XBRL)"
+NEWS_BUILD = "2026-07-27l (store full category breakdown)"
 
 
 # ── Rule-based classification ────────────────────────────────────────────────
@@ -304,11 +305,17 @@ def init_shareholding_table():
                     -- "nothing encumbered", which is the opposite of what the
                     -- company disclosed — so the flag is kept separately.
                     encumbrance_declared BOOLEAN,
+                    -- Full category breakdown from the filing. The aggregates
+                    -- above are sums of these; keeping the detail means the UI
+                    -- can show WHO owns the company, not just "institutions".
+                    breakdown JSONB,
                     fetched_at    TIMESTAMP DEFAULT NOW(),
                     PRIMARY KEY (ticker, quarter_end)
                 );
                 ALTER TABLE shareholding
                     ADD COLUMN IF NOT EXISTS encumbrance_declared BOOLEAN;
+                ALTER TABLE shareholding
+                    ADD COLUMN IF NOT EXISTS breakdown JSONB;
                 CREATE INDEX IF NOT EXISTS idx_sh_ticker ON shareholding(ticker);
             """)
         conn.commit()
@@ -482,6 +489,35 @@ _EXCLUDE_PARTS = ("promoter", "shareholdingpattern_", "public_context",
                   "nonpromoternonpublic", "total")
 
 
+_CATEGORY_LABELS = {
+    "MutualFundsOrUTI":                    "Mutual Funds",
+    "AlternativeInvestmentFunds":          "Alternative Investment Funds",
+    "Banks":                               "Banks",
+    "InsuranceCompanies":                  "Insurance",
+    "ProvidentFundsOrPensionFunds":        "Provident / Pension Funds",
+    "SovereignWealthFundsDomestic":        "Sovereign Wealth (Domestic)",
+    "SovereignWealthFundsForeign":         "Sovereign Wealth (Foreign)",
+    "AssetReconstructionCompanies":        "Asset Reconstruction Cos",
+    "NBFCRegisteredWithRBI":               "NBFCs",
+    "OtherFinancialInstitutions":          "Other Financial Institutions",
+    "ForeignPortfolioInvestorsCategoryI":  "FPI Category I",
+    "ForeignPortfolioInvestorsCategoryII": "FPI Category II",
+    "ForeignInstitutionalInvestors":       "Foreign Institutional Investors",
+    "ForeignVentureCapitalInvestors":      "Foreign Venture Capital",
+    "ForeignNationals":                    "Foreign Nationals",
+    "OverseasDepositories":                "Overseas Depositories",
+}
+
+
+def _pretty_category(raw: str) -> str:
+    """Turn a context name into something a person can read."""
+    if raw in _CATEGORY_LABELS:
+        return _CATEGORY_LABELS[raw]
+    # Fall back to splitting camel case
+    import re as _re
+    return _re.sub(r"(?<!^)(?=[A-Z])", " ", raw).replace("Or", "/")
+
+
 def _extract_institutional(root, local):
     """Sum shareholding percentages into FII and DII buckets.
 
@@ -514,7 +550,7 @@ def _extract_institutional(root, local):
         pct = v * 100.0 if v <= 1.0 else v
         if pct <= 0:
             continue
-        label = cref.split("_")[0]
+        label = _pretty_category(cref.split("_")[0])
         if any(p in cl for p in _DII_PARTS):
             dii += pct
             breakdown[label] = round(pct, 3)
@@ -576,7 +612,7 @@ def fetch_shareholding(limit: int = None, sleep: float = 1.0, quarters: int = 6)
                     try:
                         rows.append((tkr, qdate, float(f_.get("pr_and_prgrp")),
                                      None, None, None,
-                                     float(f_.get("public_val")), None))
+                                     float(f_.get("public_val")), None, None))
                     except (TypeError, ValueError):
                         pass
                     continue
@@ -599,7 +635,8 @@ def fetch_shareholding(limit: int = None, sleep: float = 1.0, quarters: int = 6)
                              parsed.get("pledged_pct"),
                              parsed.get("fii_pct"), parsed.get("dii_pct"),
                              hdr_pub,
-                             bool(parsed.get("encumbrance_declared"))))
+                             bool(parsed.get("encumbrance_declared")),
+                             json.dumps(parsed.get("institutional_breakdown") or {})))
 
             if saw_enc:
                 encumbered_cos += 1
@@ -612,15 +649,16 @@ def fetch_shareholding(limit: int = None, sleep: float = 1.0, quarters: int = 6)
                                 INSERT INTO shareholding
                                     (ticker, quarter_end, promoter_pct, pledged_pct,
                                      fii_pct, dii_pct, public_pct,
-                                     encumbrance_declared)
-                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                                     encumbrance_declared, breakdown)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                                 ON CONFLICT (ticker, quarter_end) DO UPDATE SET
                                     promoter_pct = EXCLUDED.promoter_pct,
                                     pledged_pct  = EXCLUDED.pledged_pct,
                                     fii_pct      = EXCLUDED.fii_pct,
                                     dii_pct      = EXCLUDED.dii_pct,
                                     public_pct   = EXCLUDED.public_pct,
-                                    encumbrance_declared = EXCLUDED.encumbrance_declared
+                                    encumbrance_declared = EXCLUDED.encumbrance_declared,
+                                    breakdown = EXCLUDED.breakdown
                             """, r)
                     conn.commit()
                     stored += len(rows)
