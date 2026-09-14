@@ -4,6 +4,7 @@
 # accounting sanity. This runs before any model computes.
 #
 # Philosophy: refuse loudly rather than output a confident wrong number.
+GATE_BUILD = "2026-07-27 (bank refusal, partial-year tolerance)"
 
 def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
     """Returns (ok: bool, reason: str|None, warnings: list[str])."""
@@ -35,8 +36,40 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
     if not revenue:
         return False, "No revenue data available for this company.", warnings
 
+    # ── Structural: a cash-flow DCF is the WRONG MODEL for banks and
+    # insurers, not merely short of data. They have no working-capital cycle
+    # (deposits are not debt, loans are not inventory) and no meaningful capex
+    # cycle. Professionals use dividend-discount or residual-income models
+    # here. Refusing outright is more useful than a number produced by an
+    # inapplicable framework.
+    sector_raw = (info.get("sector") or "")
+    if sector_raw in ("Financial Services", "Financials", "Banking", "Insurance"):
+        return False, (
+            "A cash-flow DCF is not an appropriate framework for banks and "
+            "insurers — they have no working-capital or capex cycle for the "
+            "model to work with, which is why professional analysts use "
+            "dividend-discount or residual-income methods instead. Use the "
+            "Convergence tab (earnings-based models) or the Quality tab for "
+            "this company."), warnings
+
     years = sorted(revenue.keys(), reverse=True)
+
+    # The newest fiscal year is often partial — merged from a secondary source
+    # before the primary filing exists, so it may carry revenue but no expense
+    # line. Refusing the whole company for that would discard three or four
+    # perfectly good years. Instead, fall back to the newest year that has
+    # BOTH revenue and expenses, and note the substitution.
     latest = years[0]
+    if expenses.get(latest) is None:
+        complete = [y for y in years
+                    if revenue.get(y) and expenses.get(y) is not None]
+        if complete:
+            skipped = latest
+            latest = complete[0]
+            warnings.append(
+                f"FY{skipped} has revenue but no expense figure yet (the "
+                f"filing is likely not published). Validation used FY{latest} "
+                f"as the most recent complete year.")
     rev_l = revenue.get(latest)
 
     # ── 1. Revenue must exist and be positive in the latest year ─────────────
