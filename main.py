@@ -19,6 +19,8 @@ from fmp_data_layer import _cache_get, _cache_set, _with_retry   # for convergen
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import pathlib
+# Requires (already imported in main.py): get_company_data, math, Query
+VALUATION_BUILD = "2026-07-27c (ownership incl. FII/DII)"
 
 
 # Set yfinance to use a persistent session with headers to reduce rate limiting
@@ -188,7 +190,105 @@ def serve_frontend():
 # ── STORE-FIRST /valuation and /financials (drop-in) ──────────────────────────
 # Replace main.py lines for BOTH old blocks (get_valuation + get_financials)
 # with this file's contents. Response shapes preserved for the frontend.
-# Requires (already imported in main.py): get_company_data, math, Query
+
+ 
+def _ownership_block(ticker: str, market: str) -> dict:
+    """Ownership from the shareholding table, which is populated from NSE's
+    quarterly shareholding-pattern filings.
+ 
+    What that source actually publishes: promoter %, public %, employee-trust
+    %, and — from the filing's XBRL — promoter encumbrance. It does NOT break
+    the public figure into FII and DII. Rather than leave two placeholders
+    that can never fill, those are reported as unavailable with the reason,
+    so the screen stops implying data that does not exist.
+    """
+    out = {
+        "promoters_holding": None,
+        "public_holding":    None,
+        "pledged_pct":       None,
+        "pledge_as_of":      None,
+        "promoter_trend":    None,
+        "fii_holding":       None,
+        "dii_holding":       None,
+        "retail_holding":    None,
+        "institutional_trend": None,
+        "ownership_note":    None,
+    }
+    if market.lower() != "india":
+        out["ownership_note"] = ("Ownership breakdown is available for NSE "
+                                 "listings only.")
+        return out
+    try:
+        from data_store import _conn
+        t = ticker.upper()
+        if not t.endswith(".NS"):
+            t += ".NS"
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT quarter_end, promoter_pct, public_pct,
+                                      pledged_pct, encumbrance_declared,
+                                      fii_pct, dii_pct
+                               FROM shareholding WHERE ticker = %s
+                               ORDER BY quarter_end DESC LIMIT 5""", (t,))
+                rows = cur.fetchall()
+        if not rows:
+            out["ownership_note"] = ("Shareholding not fetched for this company "
+                                     "yet — run: python news_engine.py shareholding")
+            return out
+ 
+        q_end, prom, pub, pledged, declared, fii, dii = rows[0]
+        out["promoters_holding"] = round(prom, 2) if prom is not None else None
+        out["public_holding"]    = round(pub, 2) if pub is not None else None
+        out["pledge_as_of"]      = str(q_end)
+ 
+        if pledged is not None:
+            out["pledged_pct"] = round(pledged, 2)
+        elif declared:
+            # The filing declares encumbrance but reports no usable figure.
+            # Saying 0% here would contradict the company's own disclosure.
+            out["pledged_pct"] = "declared, not quantified in the filing"
+ 
+        # Direction of promoter holding over the quarters we hold
+        proms = [(r[0], r[1]) for r in rows if r[1] is not None]
+        if len(proms) >= 2:
+            chg = proms[0][1] - proms[-1][1]
+            out["promoter_trend"] = {
+                "change_pp": round(chg, 2),
+                "quarters":  len(proms),
+                "from":      round(proms[-1][1], 2),
+                "to":        round(proms[0][1], 2),
+            }
+ 
+        out["fii_holding"] = round(fii, 2) if fii is not None else None
+        out["dii_holding"] = round(dii, 2) if dii is not None else None
+ 
+        # Retail is the residual: whatever is left of the public float once
+        # institutions are accounted for. Reported only when every input is
+        # present, so it is never a misleading subtraction from partial data.
+        if pub is not None and fii is not None and dii is not None:
+            retail = pub - fii - dii
+            if retail >= 0:
+                out["retail_holding"] = round(retail, 2)
+ 
+        # FII/DII trend — institutions accumulating or exiting is worth seeing
+        insts = [(r[0], r[5], r[6]) for r in rows
+                 if r[5] is not None and r[6] is not None]
+        if len(insts) >= 2:
+            out["institutional_trend"] = {
+                "fii_change_pp": round(insts[0][1] - insts[-1][1], 2),
+                "dii_change_pp": round(insts[0][2] - insts[-1][2], 2),
+                "quarters": len(insts),
+            }
+ 
+        out["ownership_note"] = ("From NSE quarterly shareholding-pattern "
+                                 "filings. FII and DII are summed from the "
+                                 "filing's own category breakdown; retail is "
+                                 "the residual of public holding.")
+    except Exception as e:
+        out["ownership_note"] = f"Ownership lookup failed: {str(e)[:90]}"
+    return out
+
+
 
 @app.get("/valuation")
 def get_valuation(
@@ -204,7 +304,7 @@ def get_valuation(
         info, income_df, balance_df, cashflow_df, data_source = get_company_data(
             ticker=ticker, market=market, source=source
         )
-
+ 
         def _row(df, *keys):
             if df is None or df.empty:
                 return None
@@ -216,7 +316,7 @@ def get_valuation(
                     except Exception:
                         return None
             return None
-
+ 
         current_price = info.get("currentPrice")
         eps           = info.get("trailingEps") or 0.0
         beta          = info.get("beta") or 1.0
@@ -229,7 +329,7 @@ def get_valuation(
             current_price / eps if current_price and eps > 0 else None)
         pb_ratio      = info.get("priceToBook") or (
             current_price / book_value if current_price and book_value else None)
-
+ 
         # ROE and D/E from the store's own statements
         net_income = info.get("netIncome") or _row(income_df, "net income")
         equity     = _row(balance_df, "stockholders equity") or _row(balance_df, "total equity")
@@ -237,7 +337,7 @@ def get_valuation(
         roe        = info.get("returnOnEquity") or (
             net_income / equity if net_income and equity else None)
         de_ratio   = (total_debt / equity * 100) if equity else None
-
+ 
         # WACC — real debt when available, 80/20 otherwise
         cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
         cost_of_debt   = 0.06
@@ -249,7 +349,7 @@ def get_valuation(
             equity_value = debt_value * 4.0
         wacc = ((equity_value / (equity_value + debt_value)) * cost_of_equity +
                 (debt_value / (equity_value + debt_value)) * cost_of_debt)
-
+ 
         # Gordon Growth with a denominator floor — growth is capped so the
         # spread (wacc - g) never drops below 4%, preventing absurd values
         # (e.g. the old ₹4,472 base case from a 1.3% denominator)
@@ -270,7 +370,7 @@ def get_valuation(
                         except Exception:
                             pass
                     break
-
+ 
         eps_used, eps_basis = eps, "latest year"
         if len(eps_history) >= 3 and eps:
             avg_eps = sum(eps_history) / len(eps_history)
@@ -280,18 +380,18 @@ def get_valuation(
                 eps_used = avg_eps
                 eps_basis = (f"{len(eps_history)}-year average — the latest "
                              f"year was {eps/avg_eps:.1f}x that average")
-
+ 
         # Terminal growth cannot exceed the risk-free rate; no company
         # outgrows the economy in perpetuity. This replaces the arbitrary
         # "wacc - g >= 4%" floor with the reason it existed.
         g_eff = min(growth_rate, risk_free_rate)
         if wacc - g_eff < 0.02:
             g_eff = wacc - 0.02
-
+ 
         intrinsic_value = None
         if eps_used and eps_used > 0 and wacc > g_eff:
             intrinsic_value = (eps_used * (1 + g_eff)) / (wacc - g_eff)
-
+ 
         valuation_low = valuation_high = None
         if eps_used and eps_used > 0:
             g_low,  d_low  = g_eff - 0.02, wacc + 0.02
@@ -300,7 +400,7 @@ def get_valuation(
                 valuation_low = (eps_used * (1 + g_low)) / (d_low - g_low)
             if d_high > g_high:
                 valuation_high = (eps_used * (1 + g_high)) / (d_high - g_high)
-
+ 
         return {
             "ticker":          ticker.upper(),
             "market":          market,
@@ -324,15 +424,14 @@ def get_valuation(
             "growth_rate_used":   round(g_eff, 4),
             "discount_rate_used": round(wacc, 4),
             "wacc":               round(wacc, 4),
-            "promoters_holding":  None,
-            "fii_holding":        None,
-            "dii_holding":        None,
-            "retail_holding":     None,
+            **_ownership_block(ticker, market),
         }
     except Exception as e:
         return {"error": str(e)}
 
 
+
+ 
 @app.get("/financials")
 def get_financials(
     ticker: str = Query(...),
@@ -345,7 +444,7 @@ def get_financials(
             ticker=ticker, market=market, source=source
         )
         shares = info.get("sharesOutstanding")
-
+ 
         def df_to_serializable(df, n=6):
             if df is None or df.empty:
                 return {}
@@ -364,18 +463,18 @@ def get_financials(
                         row[idx] = None
                 out[yr] = row
             return out
-
+ 
         income        = df_to_serializable(income_df)
         cashflow      = df_to_serializable(cashflow_df)
         balance_sheet = df_to_serializable(balance_df)
-
+ 
         # Per-year Basic EPS derived from NI / shares (store has no EPS rows)
         if shares:
             for yr, row in income.items():
                 ni = row.get("Net Income")
                 if ni and "Basic EPS" not in row:
                     row["Basic EPS"] = round(ni / shares, 2)
-
+ 
         # ROE per year: DuPont when total assets exist, plain NI/equity otherwise
         roe_dupont = {}
         for year, row in income.items():
@@ -395,81 +494,7 @@ def get_financials(
                 roe_dupont[year] = 0.0 if (math.isnan(roe_val) or math.isinf(roe_val)) else roe_val
             except (ZeroDivisionError, TypeError):
                 roe_dupont[year] = 0.0
-
-        return {
-            "data_source":      data_source,
-            "income_statement": income,
-            "cash_flow":        cashflow,
-            "balance_sheet":    balance_sheet,
-            "dupont_roe":       roe_dupont,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/financials")
-def get_financials(
-    ticker: str = Query(...),
-    market: str = Query("us"),
-    advanced: bool = Query(False),          # kept for URL compatibility
-    source: str = Query("auto"),
-):
-    try:
-        info, income_df, balance_df, cashflow_df, data_source = get_company_data(
-            ticker=ticker, market=market, source=source
-        )
-        shares = info.get("sharesOutstanding")
-
-        def df_to_serializable(df, n=6):
-            if df is None or df.empty:
-                return {}
-            out = {}
-            for col in df.columns[:n]:
-                try:
-                    yr = str(col.year)
-                except Exception:
-                    yr = str(col)
-                row = {}
-                for idx in df.index:
-                    try:
-                        v = float(df.loc[idx, col])
-                        row[idx] = None if (math.isnan(v) or math.isinf(v)) else v
-                    except Exception:
-                        row[idx] = None
-                out[yr] = row
-            return out
-
-        income        = df_to_serializable(income_df)
-        cashflow      = df_to_serializable(cashflow_df)
-        balance_sheet = df_to_serializable(balance_df)
-
-        # Per-year Basic EPS derived from NI / shares (store has no EPS rows)
-        if shares:
-            for yr, row in income.items():
-                ni = row.get("Net Income")
-                if ni and "Basic EPS" not in row:
-                    row["Basic EPS"] = round(ni / shares, 2)
-
-        # ROE per year: DuPont when total assets exist, plain NI/equity otherwise
-        roe_dupont = {}
-        for year, row in income.items():
-            ni  = row.get("Net Income") or 0
-            bal = balance_sheet.get(year, {})
-            equity = (bal.get("Total Stockholders Equity")
-                      or bal.get("Stockholders Equity") or 0)
-            assets = bal.get("Total Assets")
-            try:
-                if assets and equity and row.get("Total Revenue"):
-                    rev = row["Total Revenue"]
-                    roe_val = (ni / rev) * (rev / assets) * (assets / equity)
-                elif equity:
-                    roe_val = ni / equity
-                else:
-                    roe_val = 0.0
-                roe_dupont[year] = 0.0 if (math.isnan(roe_val) or math.isinf(roe_val)) else roe_val
-            except (ZeroDivisionError, TypeError):
-                roe_dupont[year] = 0.0
-
+ 
         return {
             "data_source":      data_source,
             "income_statement": income,
@@ -2850,48 +2875,366 @@ def get_screener(
 #  /ipos  — unchanged (Indian IPOs via yfinance)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── IPO TRACKER (paste into main.py, replacing /ipos) ────────────────────────
+IPO_BUILD = "2026-07-27 (live NSE issues + measured listing base rates)"
+
+# The old /ipos returned a hardcoded list of two 2021 IPOs (Zomato, Paytm)
+# forever. This replaces it with live NSE data, plus the one thing this app
+# can add that an IPO listing site cannot: the MEASURED base rate of what
+# happened to recent IPOs after listing, computed from our own price history.
+#
+# The honest framing matters here more than anywhere else in the app. An IPO
+# has no financial history in our store, so DCF, Quality and base rates by
+# signature CANNOT be run on it. The app says so plainly rather than
+# implying analysis it cannot do.
+
 @app.get("/ipos")
-def get_ipos():
-    results = []
-    IPOS = [
-        {"name": "ZOMATO",  "ticker": "ZOMATO.NS",  "ipo_price": 76,   "ipo_date": "2021-07-23"},
-        {"name": "PAYTM",   "ticker": "PAYTM.NS",   "ipo_price": 2150, "ipo_date": "2021-11-18"},
-    ]
-    for ipo in IPOS:
-        stock = yf.Ticker(ipo["ticker"])
-        info  = stock.info
-        current_price = info.get("currentPrice")
-        gain_pct = None
-        if current_price:
-            gain_pct = ((current_price - ipo["ipo_price"]) / ipo["ipo_price"]) * 100
-        results.append({
-            "name": ipo["name"], "ipo_date": ipo["ipo_date"],
-            "ipo_price": ipo["ipo_price"], "current_price": current_price,
-            "gain_pct": gain_pct,
-        })
-    return results
+def get_ipos(market: str = Query("india")):
+    try:
+        if market != "india":
+            return {"market": market, "current": [], "upcoming": [],
+                    "note": "IPO tracking currently covers NSE listings only."}
+
+        from india_data_pipeline import _nse_get_json
+
+        def safe(url):
+            try:
+                d = _nse_get_json(url)
+                return d if isinstance(d, list) else (d.get("data") or [])
+            except Exception:
+                return []
+
+        current  = safe("https://www.nseindia.com/api/ipo-current-issue")
+        upcoming = safe("https://www.nseindia.com/api/all-upcoming-issues?category=ipo")
+
+        def clean_current(r):
+            return {
+                "symbol":        r.get("symbol"),
+                "company":       r.get("companyName") or r.get("issueName"),
+                "price_band":    (f"{r.get('issuePrice')}" if r.get("issuePrice")
+                                  else f"{r.get('minPrice','?')}–{r.get('maxPrice','?')}"),
+                "lot_size":      r.get("lotSize") or r.get("bidLot"),
+                "issue_start":   r.get("issueStartDate") or r.get("bidStartDate"),
+                "issue_end":     r.get("issueEndDate") or r.get("bidEndDate"),
+                "issue_size":    r.get("issueSize"),
+                "status":        r.get("status") or "open",
+                "subscription":  r.get("noOfTimesSubscribed") or r.get("subscriptionTimes"),
+                "series":        r.get("series"),
+            }
+
+        def clean_upcoming(r):
+            return {
+                "symbol":      r.get("symbol"),
+                "company":     r.get("companyName") or r.get("issueName"),
+                "issue_start": r.get("issueStartDate") or r.get("bidStartDate"),
+                "issue_end":   r.get("issueEndDate") or r.get("bidEndDate"),
+                "price_band":  (f"{r.get('minPrice','?')}–{r.get('maxPrice','?')}"
+                                if r.get("minPrice") else None),
+                "issue_size":  r.get("issueSize"),
+                "series":      r.get("series"),
+            }
+
+        cur_list = [clean_current(r) for r in current][:20]
+        up_list  = [clean_upcoming(r) for r in upcoming][:20]
+
+        return {
+            "market": "india",
+            "current": cur_list,
+            "upcoming": up_list,
+            "source": "NSE",
+            "what_this_app_cannot_do": [
+                "A company listing for the first time has no filing history in "
+                "this app's store, so DCF, Quality grading and signature-based "
+                "base rates cannot be run on it — there is nothing to compute "
+                "them from.",
+                "Subscription numbers show demand, not value. A heavily "
+                "subscribed issue can still list below its offer price.",
+                "Once a company has been listed for a few quarters and files "
+                "results, it enters the normal universe and every tool applies.",
+            ],
+        }
+    except Exception as e:
+        return {"error": f"IPO fetch failed: {e}"}
+
+
+@app.get("/ipos/base-rates")
+def get_ipo_base_rates(market: str = Query("india"), months_back: int = Query(36)):
+    """What actually happened to recent listings — measured from our own price
+    history, not asserted.
+
+    This is the part an IPO listing site cannot give you: whether recent IPOs
+    as a group beat the market after listing, with the sample size attached.
+    """
+    try:
+        from data_store import _conn
+        import numpy as np
+
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET statement_timeout = '90s'")
+                # Companies whose price history STARTS recently are, in this
+                # universe, effectively recent listings.
+                cur.execute("""
+                    SELECT ticker, MIN(date) AS first_seen, MAX(date) AS last_seen
+                    FROM stock_signatures WHERE market = %s
+                    GROUP BY ticker
+                    HAVING MIN(date) > CURRENT_DATE - (%s || ' months')::interval
+                       AND MIN(date) < CURRENT_DATE - INTERVAL '3 months'
+                """, (market, months_back))
+                recents = cur.fetchall()
+                if not recents:
+                    return {"market": market, "n_listings": 0,
+                            "message": "No recent listings with enough history "
+                                       "to measure yet."}
+
+                tickers = [r[0] for r in recents]
+                cur.execute("""SELECT ticker, date, price FROM stock_signatures
+                               WHERE ticker = ANY(%s) ORDER BY ticker, date""",
+                            (tickers,))
+                prices = cur.fetchall()
+
+                cur.execute("""SELECT ticker, date, price FROM stock_signatures
+                               WHERE market = %s AND price IS NOT NULL""", (market,))
+                allp = cur.fetchall()
+
+        import pandas as pd
+        pdf = pd.DataFrame(prices, columns=["ticker", "date", "price"])
+        pdf["date"] = pd.to_datetime(pdf["date"])
+
+        # Equal-weight benchmark from per-stock RETURNS (not average price —
+        # averaging prices makes a new listing look like a market move)
+        adf = pd.DataFrame(allp, columns=["ticker", "date", "price"])
+        adf["date"] = pd.to_datetime(adf["date"])
+        adf = adf.sort_values(["ticker", "date"])
+        adf["ret"] = adf.groupby("ticker")["price"].pct_change()
+        bench = (1 + adf.groupby("date")["ret"].mean().fillna(0)).cumprod()
+
+        HORIZONS = {"1m": 4, "3m": 13, "6m": 26, "12m": 52}   # weeks
+        out = {h: [] for h in HORIZONS}
+        for tkr, g in pdf.groupby("ticker"):
+            g = g.sort_values("date").reset_index(drop=True)
+            if g.empty:
+                continue
+            p0, d0 = g["price"].iloc[0], g["date"].iloc[0]
+            b0 = bench.get(d0)
+            for h, wk in HORIZONS.items():
+                if wk >= len(g) or not p0 or p0 <= 0:
+                    continue
+                p1, d1 = g["price"].iloc[wk], g["date"].iloc[wk]
+                b1 = bench.get(d1)
+                if b0 and b1 and b0 > 0:
+                    out[h].append((p1 / p0 - 1) - (b1 / b0 - 1))
+
+        horizons = {}
+        for h, vals in out.items():
+            n = len(vals)
+            if n < 10:
+                horizons[h] = {"n": n, "conclusion": "too few listings to measure"}
+                continue
+            a = np.array(vals)
+            horizons[h] = {
+                "n_listings": n,
+                "median_excess_pct": round(float(np.median(a)) * 100, 1),
+                "beat_market_pct": round(float((a > 0).mean()) * 100, 1),
+                "p25_pct": round(float(np.percentile(a, 25)) * 100, 1),
+                "p75_pct": round(float(np.percentile(a, 75)) * 100, 1),
+            }
+
+        return {
+            "market": market,
+            "n_listings": len(tickers),
+            "window": f"listings in the last {months_back} months",
+            "horizons": horizons,
+            "caveats": [
+                "Measured from the first price we hold, which is the listing "
+                "week — not the IPO allotment price. It therefore measures the "
+                "return of BUYING AT LISTING, not of receiving an allotment.",
+                "Returns are excess versus an equal-weight market average.",
+                "Only companies in this app's universe are included, so small "
+                "listings that never entered an index are absent.",
+                "A few dozen listings over three years is a small sample from "
+                "one market regime. Treat it as context, not a rule.",
+            ],
+        }
+    except Exception as e:
+        return {"error": f"IPO base rates failed: {e}"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  /commodities  — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── COMMODITY EXPOSURE (paste into main.py, replacing /commodities) ──────────
+COMMODITY_BUILD = "2026-07-27 (measured exposure, not a price ticker)"
+
+# The old /commodities tab showed four spot prices. A gold price on a screen
+# does not help you value anything. The question that actually matters for a
+# stock app is: WHICH COMPANIES MOVE WITH WHICH COMMODITY — and that is
+# measurable from price history rather than assumed from a sector label.
+#
+# Sector labels are a poor guide here. "Materials" contains both an aluminium
+# smelter (highly exposed to LME) and a speciality chemicals firm (barely
+# exposed). Regressing actual returns separates them.
+#
+# Every number is reported with its R² so weak relationships are visible as
+# weak rather than presented with false confidence.
+
 @app.get("/commodities")
-def get_commodities():
-    commodities = {
-        "Gold": "GC=F", "Silver": "SI=F",
-        "Crude Oil": "CL=F", "Natural Gas": "NG=F",
-    }
-    data = []
-    for name, ticker in commodities.items():
-        stock = yf.Ticker(ticker)
-        info  = stock.info
-        data.append({
-            "name": name,
-            "price": info.get("regularMarketPrice"),
-            "change": info.get("regularMarketChangePercent"),
-        })
-    return data
+def get_commodity_exposure(
+    commodity: str = Query("crude", description="crude | gold | silver | natgas | copper"),
+    market: str = Query("india"),
+    min_r2: float = Query(0.10, description="Hide relationships weaker than this"),
+    limit: int = Query(25),
+):
+    try:
+        from data_store import _conn
+        import pandas as pd
+        import numpy as np
+        import yfinance as yf
+
+        SYMBOLS = {
+            "crude":  ("CL=F", "Crude Oil (WTI)"),
+            "gold":   ("GC=F", "Gold"),
+            "silver": ("SI=F", "Silver"),
+            "natgas": ("NG=F", "Natural Gas"),
+            "copper": ("HG=F", "Copper"),
+        }
+        if commodity not in SYMBOLS:
+            return {"error": f"Choose one of: {list(SYMBOLS)}"}
+        sym, label = SYMBOLS[commodity]
+
+        # ── Commodity weekly returns (signatures are weekly) ─────────────────
+        try:
+            hist = yf.Ticker(sym).history(period="5y", interval="1wk")
+            if hist is None or hist.empty:
+                return {"error": f"No price history available for {label} right now. "
+                                 f"The commodity feed is upstream of this app and is "
+                                 f"currently unavailable."}
+            cmd = hist[["Close"]].rename(columns={"Close": "cmd"})
+            cmd.index = pd.to_datetime(cmd.index).tz_localize(None).normalize()
+            cmd["cmd_ret"] = cmd["cmd"].pct_change()
+            latest_price = float(hist["Close"].iloc[-1])
+            wk_change = float(hist["Close"].pct_change().iloc[-1] * 100)
+        except Exception as e:
+            return {"error": f"Could not load {label} prices: {str(e)[:120]}"}
+
+        # ── Stock weekly returns from our own store ──────────────────────────
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET statement_timeout = '90s'")
+                cur.execute("""
+                    SELECT s.ticker, s.date, s.price, c.name, c.sector
+                    FROM stock_signatures s
+                    JOIN companies c ON c.ticker = s.ticker
+                    WHERE s.market = %s AND s.price IS NOT NULL
+                """, (market,))
+                rows = cur.fetchall()
+        if not rows:
+            return {"error": "No price signatures available. Run signature_engine.py backfill."}
+
+        df = pd.DataFrame(rows, columns=["ticker", "date", "price", "name", "sector"])
+        df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+        df = df.sort_values(["ticker", "date"])
+        df["ret"] = df.groupby("ticker")["price"].pct_change()
+
+        merged = df.merge(cmd[["cmd_ret"]], left_on="date", right_index=True, how="inner")
+        merged = merged.dropna(subset=["ret", "cmd_ret"])
+
+        results = []
+        for tkr, g in merged.groupby("ticker"):
+            if len(g) < 60:            # need ~15 months of overlap
+                continue
+            x, y = g["cmd_ret"].values, g["ret"].values
+            vx = np.var(x)
+            if vx == 0:
+                continue
+            beta = np.cov(x, y)[0][1] / vx
+            corr = np.corrcoef(x, y)[0][1]
+            r2 = corr ** 2
+            if r2 < min_r2:
+                continue
+            results.append({
+                "ticker": tkr.replace(".NS", ""),
+                "name": g["name"].iloc[0],
+                "sector": g["sector"].iloc[0],
+                "beta_to_commodity": round(float(beta), 2),
+                "r_squared": round(float(r2), 3),
+                "direction": "moves with" if beta > 0 else "moves against",
+                "weeks_measured": int(len(g)),
+            })
+
+        results.sort(key=lambda r: abs(r["beta_to_commodity"]), reverse=True)
+        positive = [r for r in results if r["beta_to_commodity"] > 0][:limit]
+        negative = [r for r in results if r["beta_to_commodity"] < 0][:limit]
+
+        return {
+            "commodity": label,
+            "symbol": sym,
+            "latest_price": round(latest_price, 2),
+            "weekly_change_pct": round(wk_change, 2),
+            "market": market,
+            "measured_over": "up to 5 years of weekly returns",
+            "min_r2_applied": min_r2,
+            "moves_with": positive,
+            "moves_against": negative,
+            "how_to_read": [
+                f"Beta is how much a stock moves for a 1% move in {label}. "
+                f"A beta of 0.6 means roughly 0.6% for every 1%.",
+                "R² is how much of the stock's movement this commodity explains. "
+                "Low R² means the relationship is weak even if beta looks large — "
+                "which is why anything below the threshold is hidden rather than "
+                "shown with false confidence.",
+                "This is measured from actual returns, not inferred from the "
+                "sector label. Two companies in the same sector can have very "
+                "different exposure.",
+                "Correlation is not causation, and these relationships change "
+                "with a company's hedging policy, contract structure and mix.",
+            ],
+        }
+    except Exception as e:
+        return {"error": f"Commodity exposure failed: {e}"}
+
+
+# ── PORTFOLIO COMMODITY EXPOSURE ─────────────────────────────────────────────
+@app.get("/commodities/portfolio")
+def get_portfolio_commodity_exposure(market: str = Query("india")):
+    """The same measurement, aimed at what you actually own — so a crude spike
+    tells you which of YOUR holdings is affected, not which of 500 stocks."""
+    try:
+        from data_store import _conn
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT ticker FROM holdings WHERE market = %s", (market,))
+                held = [r[0] for r in cur.fetchall()]
+        if not held:
+            return {"holdings": [], "message":
+                    "No holdings recorded. Add them with: "
+                    "python portfolio.py add TICKER india QTY COST"}
+
+        out = {}
+        for c in ("crude", "gold", "copper", "natgas"):
+            res = get_commodity_exposure(commodity=c, market=market,
+                                         min_r2=0.10, limit=500)
+            if "error" in res:
+                continue
+            for bucket in ("moves_with", "moves_against"):
+                for row in res[bucket]:
+                    full = row["ticker"] + (".NS" if market == "india" else "")
+                    if full in held:
+                        out.setdefault(row["ticker"], []).append({
+                            "commodity": res["commodity"],
+                            "beta": row["beta_to_commodity"],
+                            "r_squared": row["r_squared"],
+                        })
+        return {
+            "market": market,
+            "holdings_with_exposure": out,
+            "note": ("Only relationships explaining at least 10% of a stock's "
+                     "movement are shown. Holdings absent from this list have no "
+                     "measurable commodity exposure over the period."),
+        }
+    except Exception as e:
+        return {"error": f"Portfolio exposure failed: {e}"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
