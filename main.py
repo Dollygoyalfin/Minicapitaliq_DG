@@ -3065,7 +3065,7 @@ def get_ipo_base_rates(market: str = Query("india"), months_back: int = Query(36
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── COMMODITY EXPOSURE (paste into main.py, replacing /commodities) ──────────
-COMMODITY_BUILD = "2026-07-27 (measured exposure, not a price ticker)"
+COMMODITY_BUILD = "2026-07-27b (week-period alignment)"
 
 # The old /commodities tab showed four spot prices. A gold price on a screen
 # does not help you value anything. The question that actually matters for a
@@ -3113,6 +3113,13 @@ def get_commodity_exposure(
             cmd = hist[["Close"]].rename(columns={"Close": "cmd"})
             cmd.index = pd.to_datetime(cmd.index).tz_localize(None).normalize()
             cmd["cmd_ret"] = cmd["cmd"].pct_change()
+            # yfinance dates a weekly bar to the START of the week (Monday),
+            # while our signatures are sampled on Fridays. Merging on the exact
+            # date therefore matched ZERO rows and every stock was silently
+            # skipped for insufficient overlap — which is why this returned an
+            # empty list rather than an error. Align on the week itself.
+            cmd["wk"] = cmd.index.to_period("W")
+            cmd = cmd.reset_index(drop=True)[["wk", "cmd_ret"]].dropna()
             latest_price = float(hist["Close"].iloc[-1])
             wk_change = float(hist["Close"].pct_change().iloc[-1] * 100)
         except Exception as e:
@@ -3137,8 +3144,13 @@ def get_commodity_exposure(
         df = df.sort_values(["ticker", "date"])
         df["ret"] = df.groupby("ticker")["price"].pct_change()
 
-        merged = df.merge(cmd[["cmd_ret"]], left_on="date", right_index=True, how="inner")
+        df["wk"] = df["date"].dt.to_period("W")
+        merged = df.merge(cmd, on="wk", how="inner")
         merged = merged.dropna(subset=["ret", "cmd_ret"])
+        if merged.empty:
+            return {"error": "No overlapping weeks between the commodity series "
+                             "and stored price history. The commodity feed may "
+                             "have returned a different date range than expected."}
 
         results = []
         for tkr, g in merged.groupby("ticker"):
@@ -3168,6 +3180,12 @@ def get_commodity_exposure(
         negative = [r for r in results if r["beta_to_commodity"] < 0][:limit]
 
         return {
+            "diagnostics": {
+                "weeks_of_commodity_data": int(len(cmd)),
+                "stocks_with_enough_overlap": int(
+                    merged.groupby("ticker").size().ge(60).sum()),
+                "stocks_passing_r2": len(results),
+            },
             "commodity": label,
             "symbol": sym,
             "latest_price": round(latest_price, 2),
