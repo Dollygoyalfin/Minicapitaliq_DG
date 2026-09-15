@@ -1438,8 +1438,8 @@
     document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
     document.getElementById("tab-" + name).classList.add("active");
     el.classList.add("active");
-    if (name === "ipos") loadIPOs();
-    if (name === "commodities") loadCommodities();
+    if (name === "ipos") runIpos();
+    if (name === "commodities") runCommodities();
     if (name === "verdict") updateVerdictStatus();
     if (name === "convergence" && getTicker()) runConvergence();
   }
@@ -2341,55 +2341,7 @@
         </div>`;
     } catch (e) { setError("screener-results", e.message); }
   }
-
-  // ── IPOs ───────────────────────────────────────────────────────────────────
-  async function loadIPOs() {
-    setLoading("ipo-results", "Fetching IPO data...");
-    try {
-      const __RES = await safeFetch(`${BASE}/ipos`);
-      const data = __RES;
-      let rows = "";
-      for (const ipo of data) {
-        const g = ipo.gain_pct;
-        rows += `<tr>
-          <td class="lc">${ipo.name}</td>
-          <td>${ipo.ipo_date}</td>
-          <td>${fmt(ipo.ipo_price)}</td>
-          <td>${fmt(ipo.current_price)}</td>
-          <td class="${g >= 0 ? 'nu' : 'nd'}">${g !== null ? pctFmt(g) : "—"}</td>
-        </tr>`;
-      }
-      document.getElementById("ipo-results").innerHTML = `
-        <table class="data-table">
-          <thead><tr><th>Name</th><th>IPO Date</th><th>Issue Price</th><th>Current</th><th>Return</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table>`;
-    } catch (e) { setError("ipo-results", e.message); }
-  }
-
-  // ── COMMODITIES ────────────────────────────────────────────────────────────
-  async function loadCommodities() {
-    setLoading("commodity-results", "Fetching spot prices...");
-    try {
-      const __RES = await safeFetch(`${BASE}/commodities`);
-      const data = __RES;
-      let rows = "";
-      for (const c of data) {
-        const chg = c.change;
-        rows += `<tr>
-          <td class="lc">${c.name}</td>
-          <td>${fmt(c.price)}</td>
-          <td class="${chg >= 0 ? 'nu' : 'nd'}">${chg !== null ? pctFmt(chg) : "—"}</td>
-        </tr>`;
-      }
-      document.getElementById("commodity-results").innerHTML = `
-        <table class="data-table">
-          <thead><tr><th>Commodity</th><th>Price</th><th>Change</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table>`;
-    } catch (e) { setError("commodity-results", e.message); }
-  }
-</script>
+ </script>
   <script>
     // Register service worker for PWA
     if ("serviceWorker" in navigator) {
