@@ -876,7 +876,175 @@
     </div>
   </div>
 </div>
+// ═══════════════════════════════════════════════════════════════════════════
+//  PASTE THIS BLOCK INTO index.html
+//
+//  Where: immediately BEFORE the first  </script>  tag
+//         (the one that closes the main app script, not the service worker one)
+//
+//  These three functions are called by switchTab() and by the tab buttons.
+//  They replace the old loadIPOs() / loadCommodities(), which expected the
+//  endpoints to return arrays — the endpoints now return objects, which is
+//  what produced "data is not iterable".
+// ═══════════════════════════════════════════════════════════════════════════
 
+  async function runIpos() {
+    setLoading("ipos-results", "Loading NSE issues...");
+    try {
+      const d = await safeFetch(`${BASE}/ipos?market=india`);
+      if (d.error) { setError("ipos-results", d.error); return; }
+
+      const row = (x, open) => `
+        <div style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.07)">
+          <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
+            <div><span class="mono" style="font-weight:700">${x.symbol || "-"}</span>
+              <span style="opacity:0.7;font-size:0.8rem"> ${x.company || ""}</span></div>
+            <div class="mono" style="font-size:0.82rem">${x.price_band || "-"}</div>
+          </div>
+          <div style="font-size:0.72rem;opacity:0.6;margin-top:3px">
+            ${x.issue_start || "?"} to ${x.issue_end || "?"}
+            ${x.lot_size ? " &middot; lot " + x.lot_size : ""}
+            ${x.issue_size ? " &middot; " + x.issue_size + " shares" : ""}
+            ${open && x.subscription ? " &middot; subscribed " + x.subscription + "x" : ""}
+            ${x.series ? " &middot; " + x.series : ""}
+          </div>
+        </div>`;
+
+      const cur = (d.current || []).map(x => row(x, true)).join("");
+      const up  = (d.upcoming || []).map(x => row(x, false)).join("");
+
+      document.getElementById("ipos-results").innerHTML = `
+        <div class="result-card">
+          <div style="font-weight:600;font-size:0.9rem;margin-bottom:6px">Open now</div>
+          ${cur || '<div style="opacity:0.6;font-size:0.8rem">No issues currently open.</div>'}
+          <div style="font-weight:600;font-size:0.9rem;margin:16px 0 6px">Upcoming</div>
+          ${up || '<div style="opacity:0.6;font-size:0.8rem">Nothing announced yet.</div>'}
+          <div style="margin-top:14px;padding:10px;background:rgba(255,255,255,0.04);border-radius:4px">
+            <div style="font-size:0.75rem;font-weight:600;margin-bottom:4px">What this app cannot tell you here</div>
+            <ul style="margin:0;padding-left:16px;font-size:0.71rem;opacity:0.7">
+              ${(d.what_this_app_cannot_do || []).map(x => `<li style="margin:3px 0">${x}</li>`).join("")}
+            </ul>
+          </div>
+        </div>`;
+    } catch (e) { setError("ipos-results", e.message); }
+  }
+
+  async function runIpoBaseRates() {
+    setLoading("ipos-results", "Measuring post-listing performance...");
+    try {
+      const d = await safeFetch(`${BASE}/ipos/base-rates?market=india&months_back=36`);
+      if (d.error) { setError("ipos-results", d.error); return; }
+
+      let rows = "";
+      for (const h of ["1m", "3m", "6m", "12m"]) {
+        const x = (d.horizons || {})[h];
+        if (!x) continue;
+        if (x.conclusion) {
+          rows += `<tr><td class="mono">${h}</td><td colspan="4" style="opacity:0.6;font-size:0.8rem">${x.conclusion} (n=${x.n})</td></tr>`;
+          continue;
+        }
+        const col = x.median_excess_pct > 0 ? "#22c55e" : "#ef4444";
+        rows += `<tr>
+          <td class="mono">${h}</td>
+          <td class="mono" style="color:${col};font-weight:600">${x.median_excess_pct > 0 ? "+" : ""}${x.median_excess_pct}%</td>
+          <td class="mono">${x.beat_market_pct}%</td>
+          <td class="mono" style="opacity:0.7;font-size:0.8rem">${x.p25_pct}% to ${x.p75_pct}%</td>
+          <td style="font-size:0.72rem;opacity:0.6">n=${x.n_listings}</td></tr>`;
+      }
+
+      document.getElementById("ipos-results").innerHTML = `
+        <div class="result-card">
+          <div style="font-weight:600;font-size:0.9rem">Buying at listing - what happened</div>
+          <div style="font-size:0.75rem;opacity:0.6;margin:4px 0 10px">
+            ${d.n_listings} listings, ${d.window}
+          </div>
+          <table style="width:100%;border-collapse:collapse;font-size:0.85rem">
+            <thead><tr style="opacity:0.6;font-size:0.75rem;text-align:left">
+              <th>Horizon</th><th>Median vs market</th><th>Beat market</th><th>Typical range</th><th></th>
+            </tr></thead><tbody>${rows}</tbody></table>
+          <div style="margin-top:14px;padding:10px;background:rgba(255,255,255,0.04);border-radius:4px">
+            <ul style="margin:0;padding-left:16px;font-size:0.71rem;opacity:0.7">
+              ${(d.caveats || []).map(x => `<li style="margin:3px 0">${x}</li>`).join("")}
+            </ul>
+          </div>
+        </div>`;
+    } catch (e) { setError("ipos-results", e.message); }
+  }
+
+  async function runCommodities() {
+    const pickEl = document.getElementById("cmd-pick");
+    const r2El   = document.getElementById("cmd-r2");
+    const pick   = pickEl ? pickEl.value : "crude";
+    const r2     = r2El ? r2El.value : 0.10;
+    const market = getMarket();
+
+    setLoading("commodities-results", "Measuring exposure across the universe...");
+    try {
+      const d = await safeFetch(`${BASE}/commodities?commodity=${pick}&market=${market}&min_r2=${r2}&limit=20`);
+      if (d.error) { setError("commodities-results", d.error); return; }
+
+      const tbl = (list, title, colour) => {
+        if (!list || !list.length) return "";
+        return `<div style="font-weight:600;font-size:0.88rem;margin:14px 0 4px;color:${colour}">${title}</div>` +
+          list.map(x => `
+            <div style="display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06)">
+              <div style="flex:1;min-width:0">
+                <span class="mono" style="font-weight:600">${x.ticker}</span>
+                <span style="font-size:0.74rem;opacity:0.6"> ${(x.name || "").slice(0, 34)}</span>
+              </div>
+              <div class="mono" style="font-size:0.8rem">beta ${x.beta_to_commodity}</div>
+              <div class="mono" style="font-size:0.74rem;opacity:0.6;width:64px;text-align:right">R2 ${x.r_squared}</div>
+            </div>`).join("");
+      };
+
+      const none = (!d.moves_with || !d.moves_with.length) &&
+                   (!d.moves_against || !d.moves_against.length);
+      const diag = d.diagnostics
+        ? `<div style="font-size:0.68rem;opacity:0.5;margin-top:8px">
+             ${d.diagnostics.weeks_of_commodity_data} weeks of commodity data &middot;
+             ${d.diagnostics.stocks_with_enough_overlap} stocks with enough overlap &middot;
+             ${d.diagnostics.stocks_passing_r2} passed the R2 filter
+           </div>` : "";
+
+      document.getElementById("commodities-results").innerHTML = `
+        <div class="result-card">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
+            <div style="font-weight:700;font-size:1.05rem">${d.commodity}</div>
+            <div class="mono">${d.latest_price}
+              <span style="font-size:0.78rem;color:${d.weekly_change_pct >= 0 ? '#22c55e' : '#ef4444'}">
+                ${d.weekly_change_pct >= 0 ? "+" : ""}${d.weekly_change_pct}%</span></div>
+          </div>
+          <div style="font-size:0.72rem;opacity:0.55">${d.measured_over} &middot; showing only R2 at or above ${d.min_r2_applied}</div>
+          ${tbl(d.moves_with, "Moves WITH " + d.commodity, "#22c55e")}
+          ${tbl(d.moves_against, "Moves AGAINST " + d.commodity, "#ef4444")}
+          ${none ? '<div style="opacity:0.6;font-size:0.8rem;padding:10px 0">No stock shows a relationship this strong. Lower the R2 threshold to see weaker ones.</div>' : ""}
+          ${diag}
+          <div style="margin-top:14px;padding:10px;background:rgba(255,255,255,0.04);border-radius:4px">
+            <div style="font-size:0.75rem;font-weight:600;margin-bottom:4px">How to read this</div>
+            <ul style="margin:0;padding-left:16px;font-size:0.71rem;opacity:0.7">
+              ${(d.how_to_read || []).map(x => `<li style="margin:3px 0">${x}</li>`).join("")}
+            </ul>
+          </div>
+        </div>`;
+    } catch (e) { setError("commodities-results", e.message); }
+  }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  AFTER PASTING, CHECK THE TAB CONTAINERS EXIST.
+//
+//  These functions write into  ipos-results  and  commodities-results.
+//  Your old markup may use  ipo-results  and  commodity-results  (singular).
+//  Run:
+//      findstr /N /C:"ipos-results" index.html
+//      findstr /N /C:"commodities-results" index.html
+//
+//  If either returns nothing, find the old id and either rename it in the
+//  markup, or change the id in these functions to match. They must agree or
+//  the result will silently go nowhere.
+//
+//  The commodity tab also needs two inputs:  cmd-pick  and  cmd-r2.
+//  If they are absent the function still runs, defaulting to crude at R2 0.10.
+// ═══════════════════════════════════════════════════════════════════════════
 <script>
   const BASE = "https://minicapitaliq-dg.onrender.com";
   let dcfCache = null;   // stores full DCF result for AI Verdict
