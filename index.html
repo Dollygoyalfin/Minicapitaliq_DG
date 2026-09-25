@@ -860,21 +860,40 @@
 <!-- IPO TAB -->
 <div id="tab-ipos" class="tab-content">
   <div class="container">
-    <div class="card">
-      <div class="card-head">IPO Performance — Since Listing</div>
-      <div id="ipo-results"><div class="loading-state"><div class="spinner"></div> Loading IPO data...</div></div>
+    <div style="font-size:0.78rem;opacity:0.75;margin-bottom:12px;line-height:1.55">
+      Live NSE issues, plus what actually happened to recent IPOs after listing,
+      measured from this app's own price history.
     </div>
+    <div style="margin-bottom:14px">
+      <button class="btn-primary" onclick="runIpos()">Load IPOs</button>
+      <button class="btn-ghost" onclick="runIpoBaseRates()">Post-listing base rates</button>
+    </div>
+    <div id="ipo-results"></div>
   </div>
 </div>
 
-<!-- COMMODITIES TAB -->
 <div id="tab-commodities" class="tab-content">
   <div class="container">
-    <div class="card">
-      <div class="card-head">Commodity Spot Prices</div>
-      <div id="commodity-results"><div class="loading-state"><div class="spinner"></div> Loading commodity data...</div></div>
+    <div style="font-size:0.78rem;opacity:0.75;margin-bottom:12px;line-height:1.55">
+      Not a price ticker. This measures which companies actually move with a
+      commodity, regressed from real returns rather than assumed from a sector label.
     </div>
+    <div class="params-grid" style="margin-bottom:10px">
+      <div class="param-group"><label>Commodity</label>
+        <select id="cmd-pick" style="width:100%">
+          <option value="crude">Crude Oil</option>
+          <option value="gold">Gold</option>
+          <option value="silver">Silver</option>
+          <option value="copper">Copper</option>
+          <option value="natgas">Natural Gas</option>
+        </select></div>
+      <div class="param-group"><label>Min R2 (evidence strength)</label>
+        <input type="number" id="cmd-r2" value="0.10" step="0.05" min="0" max="1"/></div>
+    </div>
+    <button class="btn-primary" onclick="runCommodities()">Measure Exposure</button>
+    <div id="commodity-results"></div>
   </div>
+</div>
 </div>
 <script>
   async function runIpos() {
