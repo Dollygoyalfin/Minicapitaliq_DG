@@ -878,10 +878,10 @@
 </div>
 <script>
   async function runIpos() {
-    setLoading("ipos-results", "Loading NSE issues...");
+    setLoading("ipo-results", "Loading NSE issues...");
     try {
       const d = await safeFetch(`${BASE}/ipos?market=india`);
-      if (d.error) { setError("ipos-results", d.error); return; }
+      if (d.error) { setError("ipo-results", d.error); return; }
 
       const row = (x, open) => `
         <div style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.07)">
@@ -902,7 +902,7 @@
       const cur = (d.current || []).map(x => row(x, true)).join("");
       const up  = (d.upcoming || []).map(x => row(x, false)).join("");
 
-      document.getElementById("ipos-results").innerHTML = `
+      document.getElementById("ipo-results").innerHTML = `
         <div class="result-card">
           <div style="font-weight:600;font-size:0.9rem;margin-bottom:6px">Open now</div>
           ${cur || '<div style="opacity:0.6;font-size:0.8rem">No issues currently open.</div>'}
@@ -915,13 +915,13 @@
             </ul>
           </div>
         </div>`;
-    } catch (e) { setError("ipos-results", e.message); }
+    } catch (e) { setError("ipo-results", e.message); }
   }
   async function runIpoBaseRates() {
-    setLoading("ipos-results", "Measuring post-listing performance...");
+    setLoading("ipo-results", "Measuring post-listing performance...");
     try {
       const d = await safeFetch(`${BASE}/ipos/base-rates?market=india&months_back=36`);
-      if (d.error) { setError("ipos-results", d.error); return; }
+      if (d.error) { setError("ipo-results", d.error); return; }
 
       let rows = "";
       for (const h of ["1m", "3m", "6m", "12m"]) {
@@ -940,7 +940,7 @@
           <td style="font-size:0.72rem;opacity:0.6">n=${x.n_listings}</td></tr>`;
       }
 
-      document.getElementById("ipos-results").innerHTML = `
+      document.getElementById("ipo-results").innerHTML = `
         <div class="result-card">
           <div style="font-weight:600;font-size:0.9rem">Buying at listing - what happened</div>
           <div style="font-size:0.75rem;opacity:0.6;margin:4px 0 10px">
@@ -956,7 +956,7 @@
             </ul>
           </div>
         </div>`;
-    } catch (e) { setError("ipos-results", e.message); }
+    } catch (e) { setError("ipo-results", e.message); }
   }
   async function runCommodities() {
     const pickEl = document.getElementById("cmd-pick");
@@ -965,10 +965,10 @@
     const r2     = r2El ? r2El.value : 0.10;
     const market = getMarket();
 
-    setLoading("commodities-results", "Measuring exposure across the universe...");
+    setLoading("commodity-results", "Measuring exposure across the universe...");
     try {
       const d = await safeFetch(`${BASE}/commodities?commodity=${pick}&market=${market}&min_r2=${r2}&limit=20`);
-      if (d.error) { setError("commodities-results", d.error); return; }
+      if (d.error) { setError("commodity-results", d.error); return; }
 
       const tbl = (list, title, colour) => {
         if (!list || !list.length) return "";
@@ -993,7 +993,7 @@
              ${d.diagnostics.stocks_passing_r2} passed the R2 filter
            </div>` : "";
 
-      document.getElementById("commodities-results").innerHTML = `
+      document.getElementById("commodity-results").innerHTML = `
         <div class="result-card">
           <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
             <div style="font-weight:700;font-size:1.05rem">${d.commodity}</div>
@@ -1013,7 +1013,7 @@
             </ul>
           </div>
         </div>`;
-    } catch (e) { setError("commodities-results", e.message); }
+    } catch (e) { setError("commodity-results", e.message); }
   }
 
 </script>
