@@ -876,18 +876,7 @@
     </div>
   </div>
 </div>
-// ═══════════════════════════════════════════════════════════════════════════
-//  PASTE THIS BLOCK INTO index.html
-//
-//  Where: immediately BEFORE the first  </script>  tag
-//         (the one that closes the main app script, not the service worker one)
-//
-//  These three functions are called by switchTab() and by the tab buttons.
-//  They replace the old loadIPOs() / loadCommodities(), which expected the
-//  endpoints to return arrays — the endpoints now return objects, which is
-//  what produced "data is not iterable".
-// ═══════════════════════════════════════════════════════════════════════════
-
+<script>
   async function runIpos() {
     setLoading("ipos-results", "Loading NSE issues...");
     try {
@@ -928,7 +917,6 @@
         </div>`;
     } catch (e) { setError("ipos-results", e.message); }
   }
-
   async function runIpoBaseRates() {
     setLoading("ipos-results", "Measuring post-listing performance...");
     try {
@@ -970,7 +958,7 @@
         </div>`;
     } catch (e) { setError("ipos-results", e.message); }
   }
-
+<script>
   async function runCommodities() {
     const pickEl = document.getElementById("cmd-pick");
     const r2El   = document.getElementById("cmd-r2");
@@ -1029,22 +1017,6 @@
     } catch (e) { setError("commodities-results", e.message); }
   }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  AFTER PASTING, CHECK THE TAB CONTAINERS EXIST.
-//
-//  These functions write into  ipos-results  and  commodities-results.
-//  Your old markup may use  ipo-results  and  commodity-results  (singular).
-//  Run:
-//      findstr /N /C:"ipos-results" index.html
-//      findstr /N /C:"commodities-results" index.html
-//
-//  If either returns nothing, find the old id and either rename it in the
-//  markup, or change the id in these functions to match. They must agree or
-//  the result will silently go nowhere.
-//
-//  The commodity tab also needs two inputs:  cmd-pick  and  cmd-r2.
-//  If they are absent the function still runs, defaulting to crude at R2 0.10.
-// ═══════════════════════════════════════════════════════════════════════════
 <script>
   const BASE = "https://minicapitaliq-dg.onrender.com";
   let dcfCache = null;   // stores full DCF result for AI Verdict
