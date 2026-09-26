@@ -714,7 +714,7 @@ def score_sentiment(limit: int = 50):
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}",
                              "Content-Type": "application/json"},
-                    json={"model": "llama-3.3-70b-versatile",
+                    json={"model": "openai/gpt-oss-20b",
                           "max_tokens": 80, "temperature": 0.0,
                           "response_format": {"type": "json_object"},
                           "messages": [
@@ -729,7 +729,7 @@ def score_sentiment(limit: int = 50):
             try:
                 with conn.cursor() as cur:
                     cur.execute("""UPDATE news_events SET sentiment=%s,
-                                   sentiment_by='groq-llama-3.3-70b' WHERE id=%s""",
+                                   sentiment_by='groq-gpt-oss-20b' WHERE id=%s""",
                                 (s, rid))
                 conn.commit()
             finally:
