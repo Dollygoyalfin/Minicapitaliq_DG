@@ -3274,7 +3274,7 @@ class AIVerdictRequest(BaseModel):
 _GROQ_MODELS = [
     "llama-3.3-70b-versatile",   # primary
     "llama-3.1-8b-instant",      # fast fallback
-    "gemma2-9b-it",              # last resort
+    "llama-3.3-70b-versatile",              # last resort
 ]
 
 
