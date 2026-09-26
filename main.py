@@ -1057,6 +1057,7 @@ def get_convergence(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Requires: from fmp_data_layer import get_company_data   (add this import to main.py)
+DCF_BUILD = "2026-09-26 (depreciation add-back, WACC transparency)"
 
 @app.get("/dcf")
 def get_dcf(
@@ -1116,7 +1117,8 @@ def get_dcf(
       ΔNWC  = WC(year) - WC(year-1)
       CapEx = Net PPE(year) - Net PPE(year-1) + Depreciation(year)
 
-    FCFF  = NOP*(1-t) - ΔNWC - CapEx
+    NOP   = Revenue - Total Expenses          (= EBIT; expenses include D&A)
+    FCFF  = NOP*(1-t) + Depreciation - ΔNWC - CapEx
     TV    = FCFF_terminal / (WACC - terminal_growth_rate)
     EV    = Σ PV(FCFF) + PV(TV)
     Equity = EV + Cash + Investments - Debt - Minority Interest
@@ -1578,9 +1580,25 @@ def get_dcf(
             t      = tax_rates[i]
             d_nwc  = delta_nwc_series[i]
 
+            depr   = depr_series[i] if i < len(depr_series) else 0.0
+
+            # Total Expenses INCLUDES depreciation — in Ind-AS the tag
+            # "Expenses" sums employee benefit + D&A + other expenses, and the
+            # SEC "Total Expenses" line behaves the same way. So NOP here is
+            # EBIT (post-depreciation), not a cash figure.
+            #
+            # Depreciation is a NON-CASH charge, so the standard formula adds
+            # it back after tax:
+            #     FCFF = EBIT x (1 - t) + D&A - dNWC - CapEx
+            #
+            # Without the add-back, depreciation was charged against the
+            # company TWICE: once inside operating expenses, and again inside
+            # CapEx (which is computed as dPP&E + depreciation). That
+            # understated free cash flow by roughly the full D&A figure every
+            # year, in every valuation this app has ever produced.
             nop    = rev - opex
             nop_at = nop * (1 - t)
-            fcff   = nop_at - d_nwc - capex
+            fcff   = nop_at + depr - d_nwc - capex
 
             historical_table.append({
                 "year":               year_labels[i],
@@ -1589,6 +1607,7 @@ def get_dcf(
                 "nop":                round(nop,   2),
                 "tax_rate":           round(t,     4),
                 "nop_after_tax":      round(nop_at,2),
+                "depreciation_addback": round(depr, 2),
                 "delta_nwc":          round(-d_nwc, 2),
                 "capex":              round(-capex, 2),
                 "fcff":               round(fcff,  2),
@@ -1626,10 +1645,22 @@ def get_dcf(
             # is ~0, but a plausible market rate is used rather than nothing.
             cost_of_debt = risk_free_rate + 0.02
 
+        # Equity value for the WACC weights. Prefer price x shares over the
+        # stored marketCap: the store writes marketCap as None and the data
+        # layer only fills it when a live quote succeeded, so it can be stale
+        # or absent while current_price is fresh. Using price x shares also
+        # keeps the weights consistent with the equity bridge below, which
+        # divides equity value by the same share count.
+        _mcap_basis = "stored marketCap"
+        if current_price and shares_outstanding:
+            market_cap  = current_price * shares_outstanding
+            _mcap_basis = "current price x shares outstanding"
+
         if market_cap:
             equity_val = market_cap
             debt_val   = total_debt if total_debt else market_cap * 0.2
         else:
+            _mcap_basis = "unavailable - assumed 80/20 capital structure"
             # Price/market cap unavailable — assume a standard 80/20
             # capital structure instead of collapsing to all-debt WACC
             debt_val   = total_debt if total_debt else 1.0
@@ -1886,7 +1917,8 @@ def get_dcf(
 
             proj_nop    = proj_rev - proj_opex
             proj_nop_at = proj_nop * (1 - avg_tax_rate)
-            proj_fcff   = proj_nop_at - proj_delta_nwc - proj_capex
+            # Non-cash depreciation added back — see the historical block above
+            proj_fcff   = proj_nop_at + proj_depr - proj_delta_nwc - proj_capex
 
             pv = proj_fcff / ((1 + wacc) ** (year + 1))
 
@@ -1897,6 +1929,7 @@ def get_dcf(
                 "nop":                round(proj_nop,         2),
                 "tax_rate":           round(avg_tax_rate,     4),
                 "nop_after_tax":      round(proj_nop_at,      2),
+                "depreciation_addback": round(proj_depr,       2),
                 "delta_nwc":          round(-proj_delta_nwc,   2),
                 "capex":              round(-proj_capex,        2),
                 "fcff":               round(proj_fcff,         2),
@@ -1958,7 +1991,8 @@ def get_dcf(
 
         term_nop    = term_rev - term_opex
         term_nop_at = term_nop * (1 - avg_tax_rate)
-        term_fcff   = term_nop_at - term_delta_nwc - term_capex
+        # Non-cash depreciation added back — see the historical block above
+        term_fcff   = term_nop_at + term_depr - term_delta_nwc - term_capex
 
         terminal_year = {
             "year":               f"Year {projection_years + 1} (Terminal)",
@@ -1967,6 +2001,7 @@ def get_dcf(
             "nop":                round(term_nop,         2),
             "tax_rate":           round(avg_tax_rate,     4),
             "nop_after_tax":      round(term_nop_at,      2),
+            "depreciation_addback": round(term_depr,       2),
             "delta_nwc":          round(-term_delta_nwc,   2),
             "capex":              round(-term_capex,        2),
             "fcff":               round(term_fcff,         2),
@@ -2055,6 +2090,8 @@ def get_dcf(
 
         # ── Response ──────────────────────────────────────────────────────────
         return {
+            "dcf_build":     DCF_BUILD,
+            "computed_at":   __import__("datetime").datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "ticker":        raw_ticker,
             "market":        market,
             "data_source":   data_source,
@@ -2108,6 +2145,22 @@ def get_dcf(
             "intrinsic_value_per_share":             round(intrinsic_value_per_share, 2),
             "intrinsic_value_with_margin_of_safety": round(intrinsic_value_with_mos,  2),
             "margin_of_safety_used":                 margin_of_safety,
+            "wacc_components": {
+                "cost_of_equity":    round(cost_of_equity, 4),
+                "cost_of_debt":      round(cost_of_debt, 4),
+                "after_tax_cost_of_debt": round(cost_of_debt * (1 - avg_tax_rate), 4),
+                "equity_value_used": round(equity_val, 2),
+                "debt_value_used":   round(debt_val, 2),
+                "equity_weight":     round(equity_val / total_capital, 4),
+                "debt_weight":       round(debt_val / total_capital, 4),
+                "equity_basis":      _mcap_basis,
+                "risk_free_rate":    risk_free_rate,
+                "market_return":     market_return,
+                "note": ("WACC = equity weight x cost of equity + debt weight x "
+                         "after-tax cost of debt. Every input is listed here so "
+                         "an implausible WACC can be traced to the input that "
+                         "caused it rather than guessed at."),
+            },
             "assumptions_applied": {
                 "revenue_growth": {
                     "raw_from_data":  round(raw_revenue_growth, 4),
@@ -3260,10 +3313,22 @@ def get_portfolio_commodity_exposure(market: str = Query("india")):
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── AI VERDICT (hardened drop-in) ─────────────────────────────────────────────
-# Replace the existing @app.post("/ai-verdict") block in main.py with this.
-# Guarantees: ALWAYS returns JSON (never an empty body), survives Groq model
-# deprecations via a fallback chain, bounded prompt size, 45s timeout.
-# Requires (already in main.py): os, json, httpx, BaseModel
+# ── AI VERDICT (paste into main.py, replacing the existing /ai-verdict) ──────
+AI_VERDICT_BUILD = "2026-09-26 (reads news_events; gpt-oss models)"
+#
+# Two changes from the previous version:
+#
+# 1. It now reads the app's OWN news_events table. Previously news_fed was
+#    always [], the prompt said "never invent headlines - leave
+#    recent_headlines empty", and management_guidance was hardcoded to
+#    {"capex": "N/A", "revenue": "N/A", "expansion": "N/A"} in the template.
+#    So the N/A values were not a data failure — the prompt was asking for
+#    them. With ~5,000 NSE announcements and ~400 US 8-K events already
+#    stored, there is real material to work from.
+#
+# 2. The Groq model chain is updated. llama-3.3-70b-versatile and
+#    llama-3.1-8b-instant moved to Enterprise-only tiers and now return 404
+#    for standard accounts; gemma2-9b-it was decommissioned outright.
 
 class AIVerdictRequest(BaseModel):
     ticker: str
@@ -3272,10 +3337,68 @@ class AIVerdictRequest(BaseModel):
 
 
 _GROQ_MODELS = [
-    "openai/gpt-oss-120b",   # primary — best synthesis quality
-    "openai/gpt-oss-20b",    # fast fallback
+    "openai/gpt-oss-120b",   # primary - best synthesis quality
+    "openai/gpt-oss-20b",    # faster fallback
     "qwen/qwen3.8-27b",      # last resort, different family
 ]
+
+
+def _recent_events(ticker: str, market: str, days: int = 180, limit: int = 14):
+    """Corporate filings for this company from our own store.
+
+    Red flags first, then everything else by recency, so a limited prompt
+    budget is spent on what matters rather than on routine disclosures.
+    """
+    try:
+        from data_store import _conn
+        t = ticker.upper()
+        if market.lower() == "india" and not t.endswith(".NS"):
+            t += ".NS"
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET statement_timeout = '20s'")
+                cur.execute("""
+                    SELECT event_date, category, severity, headline
+                    FROM news_events
+                    WHERE ticker = %s
+                      AND event_date >= CURRENT_DATE - (%s || ' days')::interval
+                    ORDER BY
+                      CASE severity WHEN 'red_flag' THEN 0 WHEN 'watch' THEN 1
+                                    WHEN 'positive' THEN 2 ELSE 3 END,
+                      event_date DESC
+                    LIMIT %s
+                """, (t, days, limit))
+                return cur.fetchall()
+    except Exception:
+        return []
+
+
+def _governance_snapshot(ticker: str, market: str):
+    """Promoter holding and encumbrance — facts the model should not have to
+    infer from headlines."""
+    if market.lower() != "india":
+        return None
+    try:
+        from data_store import _conn
+        t = ticker.upper()
+        if not t.endswith(".NS"):
+            t += ".NS"
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT quarter_end, promoter_pct, pledged_pct
+                               FROM shareholding WHERE ticker = %s
+                               ORDER BY quarter_end DESC LIMIT 2""", (t,))
+                rows = cur.fetchall()
+        if not rows:
+            return None
+        out = {"as_of": str(rows[0][0]), "promoter_pct": rows[0][1],
+               "encumbered_pct": rows[0][2]}
+        if len(rows) > 1 and rows[0][1] is not None and rows[1][1] is not None:
+            out["promoter_change_pp"] = round(rows[0][1] - rows[1][1], 2)
+        return out
+    except Exception:
+        return None
+
 
 @app.post("/ai-verdict")
 def ai_verdict(req: AIVerdictRequest):
@@ -3285,21 +3408,65 @@ def ai_verdict(req: AIVerdictRequest):
             return {"error": "AI Verdict unavailable: GROQ_API_KEY not configured."}
 
         d = req.dcf_result or {}
+        assumptions = d.get("assumptions_applied") or {}
+
+        # A stale DCF is worse than none: the frontend caches the last DCF run
+        # and posts it here, so after a redeploy this endpoint can silently
+        # analyse numbers the current model would no longer produce. That is
+        # what made a WACC of 5.60% appear for RELIANCE when the live model
+        # cannot go below about 6.5% for it. The DCF now stamps its build, so
+        # an unstamped or mismatched result is flagged rather than trusted.
+        dcf_build = d.get("dcf_build")
+        stale_note = None
+        if d and not dcf_build:
+            stale_note = ("This DCF result predates the current model version "
+                          "(no build stamp). Re-run the DCF tab before relying "
+                          "on the figures below.")
+        elif dcf_build and "DCF_BUILD" in globals() and dcf_build != DCF_BUILD:
+            stale_note = (f"This DCF result came from build {dcf_build}; the "
+                          f"server is now on {DCF_BUILD}. Re-run the DCF tab.")
+
         summary = {
             "ticker":          req.ticker,
             "market":          req.market,
             "current_price":   d.get("current_price"),
             "intrinsic_value": d.get("intrinsic_value_per_share"),
-            "upside_pct":      d.get("upside_pct"),
+            "upside_pct":      d.get("upside_downside_pct") or d.get("upside_pct"),
             "verdict":         d.get("verdict"),
-            "wacc":            (d.get("assumptions") or {}).get("wacc") or d.get("wacc"),
+            "wacc":            d.get("wacc"),
             "growth_rates":    d.get("derived_growth_rates"),
+            "operating_margin": (assumptions.get("operating_margin") or {}).get("used"),
+            "margin_history":   (assumptions.get("operating_margin") or {}).get("historical_range"),
+            "beta":             (assumptions.get("beta") or {}).get("used"),
+            "beta_r2":          (assumptions.get("beta") or {}).get("regression_r2"),
             "data_source":     d.get("data_source"),
             "warning":         d.get("reliability_warning"),
+            "wacc_components": d.get("wacc_components"),
         }
 
-        prompt = f"""You are an equity analyst. Based on this DCF output, give a
-balanced verdict. Respond with ONLY a JSON object, no markdown:
+        events = _recent_events(req.ticker, req.market)
+        if events:
+            ev_lines, red_flags = [], []
+            for ev_date, cat, sev, headline in events:
+                mark = {"red_flag": "[RED FLAG]", "watch": "[WATCH]",
+                        "positive": "[POSITIVE]"}.get(sev, "")
+                line = f"{ev_date} {mark} ({cat}) {headline[:180]}"
+                ev_lines.append(line)
+                if sev == "red_flag":
+                    red_flags.append(f"{cat} on {ev_date}")
+            news_block = "\n".join(ev_lines)
+            news_fed = ev_lines[:6]
+        else:
+            news_block = ("No corporate filings recorded for this company in the "
+                          "last 180 days.")
+            news_fed, red_flags = [], []
+
+        gov = _governance_snapshot(req.ticker, req.market)
+        gov_block = json.dumps(gov) if gov else "Not available."
+
+        prompt = f"""You are an equity analyst. Give a balanced verdict on this
+company using the DCF output and the corporate filings below. Respond with ONLY
+a JSON object, no markdown.
 
 {{
   "verdict": "<one line: overall stance>",
@@ -3307,17 +3474,36 @@ balanced verdict. Respond with ONLY a JSON object, no markdown:
   "summary": "<3-4 sentence balanced analysis of the valuation>",
   "bull_case": "<2-3 sentences: the strongest case for upside>",
   "bear_case": "<2-3 sentences: the strongest case for downside>",
-  "news_sentiment": "<one line on likely current sentiment for this stock>",
-  "management_guidance": {{"capex": "N/A", "revenue": "N/A", "expansion": "N/A"}},
+  "news_sentiment": "<Positive|Neutral|Negative> - <one line, based ONLY on the filings listed>",
+  "management_guidance": {{
+     "capex":     "<capex guidance IF a filing below states it, else N/A>",
+     "revenue":   "<revenue guidance IF a filing below states it, else N/A>",
+     "expansion": "<expansion or strategic plans IF a filing below states it, else N/A>"
+  }},
+  "governance_note": "<one line on promoter holding / encumbrance, or N/A>",
   "key_risks": ["<risk 1>", "<risk 2>", "<risk 3>"],
-  "recent_headlines": []
+  "recent_headlines": ["<up to 4 of the most material filings below, verbatim>"]
 }}
 
-Rules: be specific to the numbers given; if a reliability warning is present,
-lead with caution; never invent headlines - leave recent_headlines empty.
+Rules:
+- Be specific to the numbers given.
+- recent_headlines must be copied from the CORPORATE FILINGS section. Never
+  invent one. If that section says none were recorded, return an empty list.
+- management_guidance must come from those filings only. Write "N/A" for
+  anything not stated there - do not infer it from the sector or the DCF.
+- If a reliability warning is present, lead with caution.
+- If any filing is marked [RED FLAG], it must appear in key_risks.
+- A low beta R-squared means beta is a weak descriptor for this company;
+  mention it if it is below 0.3.
 
 DCF DATA:
-{json.dumps(summary)}"""
+{json.dumps(summary)}
+
+GOVERNANCE (from quarterly shareholding filings):
+{gov_block}
+
+CORPORATE FILINGS (last 180 days, most serious first):
+{news_block}"""
 
         last_err = None
         for model in _GROQ_MODELS:
@@ -3328,7 +3514,7 @@ DCF DATA:
                         headers={"Content-Type": "application/json",
                                  "Authorization": f"Bearer {api_key}"},
                         json={"model": model,
-                              "max_tokens": 700,
+                              "max_completion_tokens": 1100,
                               "temperature": 0.3,
                               "response_format": {"type": "json_object"},
                               "messages": [
@@ -3344,33 +3530,54 @@ DCF DATA:
                     except Exception:
                         last_err = f"{model}: non-JSON reply"
                         continue
+
                     parsed.setdefault("verdict", "No verdict generated.")
                     parsed.setdefault("confidence", "Low")
                     parsed.setdefault("summary", "Analysis not available.")
                     parsed.setdefault("bull_case", "")
                     parsed.setdefault("bear_case", "")
                     parsed.setdefault("news_sentiment", "-")
+                    parsed.setdefault("governance_note", "N/A")
                     if not isinstance(parsed.get("management_guidance"), dict):
                         parsed["management_guidance"] = {}
                     parsed.setdefault("key_risks", [])
                     parsed.setdefault("recent_headlines", [])
-                    # Top-level fields the frontend header renders
+
+                    # The model can still hallucinate a headline. Anything not
+                    # traceable to a stored filing is dropped rather than shown.
+                    if events:
+                        stored = [h for (_, _, _, h) in events]
+                        parsed["recent_headlines"] = [
+                            h for h in parsed["recent_headlines"]
+                            if any(h[:40].lower() in s.lower() or
+                                   s[:40].lower() in h.lower() for s in stored)
+                        ][:4]
+                    else:
+                        parsed["recent_headlines"] = []
+
                     company_name, sector = req.ticker.upper(), "-"
                     try:
                         from data_store import get_from_store
-                        stored = get_from_store(req.ticker, req.market)
-                        if stored:
-                            company_name = stored[0].get("longName") or company_name
-                            sector       = stored[0].get("sector") or sector
+                        stored_co = get_from_store(req.ticker, req.market)
+                        if stored_co:
+                            company_name = stored_co[0].get("longName") or company_name
+                            sector       = stored_co[0].get("sector") or sector
                     except Exception:
                         pass
-                    return {"ai_verdict": parsed,
-                            "model_used": model,
-                            "ticker": req.ticker.upper(),
-                            "company_name": company_name,
-                            "sector": sector,
-                            "current_price": (req.dcf_result or {}).get("current_price"),
-                            "news_fed": []}
+
+                    if stale_note:
+                        parsed["stale_warning"] = stale_note
+
+                    return {"ai_verdict":    parsed,
+                            "stale_warning": stale_note,
+                            "model_used":    model,
+                            "ticker":        req.ticker.upper(),
+                            "company_name":  company_name,
+                            "sector":        sector,
+                            "current_price": d.get("current_price"),
+                            "news_fed":      news_fed,
+                            "red_flags_found": red_flags,
+                            "events_available": len(events)}
                 last_err = f"{model}: HTTP {resp.status_code} {resp.text[:120]}"
             except Exception as e:
                 last_err = f"{model}: {e}"
