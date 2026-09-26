@@ -729,7 +729,7 @@ def score_sentiment(limit: int = 50):
             try:
                 with conn.cursor() as cur:
                     cur.execute("""UPDATE news_events SET sentiment=%s,
-                                   sentiment_by='groq-llama-3.1-8b' WHERE id=%s""",
+                                   sentiment_by='groq-llama-3.3-70b' WHERE id=%s""",
                                 (s, rid))
                 conn.commit()
             finally:
