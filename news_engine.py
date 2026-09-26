@@ -714,7 +714,7 @@ def score_sentiment(limit: int = 50):
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}",
                              "Content-Type": "application/json"},
-                    json={"model": "llama-3.1-8b-instant",
+                    json={"model": "llama-3.3-70b-versatile",
                           "max_tokens": 80, "temperature": 0.0,
                           "response_format": {"type": "json_object"},
                           "messages": [
