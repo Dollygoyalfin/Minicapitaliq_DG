@@ -3272,11 +3272,10 @@ class AIVerdictRequest(BaseModel):
 
 
 _GROQ_MODELS = [
-    "llama-3.3-70b-versatile",   # primary
-    "llama-3.1-8b-instant",      # fast fallback
-    "llama-3.3-70b-versatile",              # last resort
+    "openai/gpt-oss-120b",   # primary — best synthesis quality
+    "openai/gpt-oss-20b",    # fast fallback
+    "qwen/qwen3.8-27b",      # last resort, different family
 ]
-
 
 @app.post("/ai-verdict")
 def ai_verdict(req: AIVerdictRequest):
