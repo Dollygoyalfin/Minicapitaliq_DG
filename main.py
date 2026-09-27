@@ -429,7 +429,79 @@ def get_valuation(
     except Exception as e:
         return {"error": str(e)}
 
+# ── CALENDAR + PAPER BOOK (paste into main.py) ───────────────────────────────
+CALENDAR_ENDPOINTS_BUILD = "2026-09-27"
+#
+# Two read-only endpoints. All the work happens in the nightly job
+# (events_calendar.py all, paper_portfolio.py run); these only read what it
+# stored, so they are fast and cannot hit NSE rate limits from the app.
 
+@app.get("/calendar")
+def get_calendar(
+    market: str = Query("india"),
+    days: int = Query(30, ge=1, le=120),
+    ticker: str = Query(None, description="Only this company"),
+    kinds: str = Query(None, description="Comma-separated kinds to include"),
+    holdings_only: bool = Query(False),
+):
+    try:
+        from events_calendar import upcoming, KIND_LABELS
+        if market.lower() != "india":
+            return {"market": market, "events": [],
+                    "note": "The known-events calendar covers NSE-listed "
+                            "companies. US earnings dates are not collected yet."}
+
+        tickers = None
+        if ticker:
+            t = ticker.upper()
+            tickers = [t if t.endswith(".NS") else t + ".NS"]
+        elif holdings_only:
+            from data_store import _conn
+            with _conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT ticker FROM holdings WHERE market='india'")
+                    tickers = [r[0] for r in cur.fetchall()] or ["__none__"]
+
+        kind_list = [k.strip() for k in kinds.split(",")] if kinds else None
+        rows = upcoming(days=days, tickers=tickers, kinds=kind_list)
+
+        events = []
+        for t, d, kind, title, detail, cert in rows:
+            if isinstance(detail, str):
+                try:
+                    detail = json.loads(detail)
+                except Exception:
+                    detail = {}
+            events.append({
+                "ticker": t, "symbol": t.replace(".NS", ""),
+                "company": (detail or {}).get("company"),
+                "date": str(d), "kind": kind,
+                "label": KIND_LABELS.get(kind, kind),
+                "title": title, "certainty": cert, "detail": detail or {},
+            })
+
+        return {
+            "market": "india", "days": days, "count": len(events),
+            "events": events,
+            "certainty_key": {
+                "scheduled":  "Set by the company in a filing — a fact.",
+                "rule_based": "Follows from SEBI rules applied to a known date "
+                              "— the date is a fact; whether anyone sells is not.",
+                "estimate":   "Our reading of NSE's index rules on our own data "
+                              "— a watchlist, not an announcement.",
+            },
+        }
+    except Exception as e:
+        return {"error": f"Calendar unavailable: {e}"}
+
+
+@app.get("/paper-portfolio")
+def get_paper_portfolio(book: str = Query("shortlist-v1")):
+    try:
+        from paper_portfolio import report_data
+        return report_data(book)
+    except Exception as e:
+        return {"error": f"Paper portfolio unavailable: {e}"}
 
  
 @app.get("/financials")
