@@ -4148,6 +4148,7 @@ def get_base_rates(
 # accounting sanity. This runs before any model computes.
 #
 # Philosophy: refuse loudly rather than output a confident wrong number.
+GATE_BUILD = "2026-09-26 (refuse lenders/insurers only, not fee-based financials)"
 
 def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
     """Returns (ok: bool, reason: str|None, warnings: list[str])."""
@@ -4185,15 +4186,56 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
     # cycle. Professionals use dividend-discount or residual-income models
     # here. Refusing outright is more useful than a number produced by an
     # inapplicable framework.
-    sector_raw = (info.get("sector") or "")
-    if sector_raw in ("Financial Services", "Financials", "Banking", "Insurance"):
+    sector_raw   = (info.get("sector") or "")
+    industry_raw = (info.get("industry") or "").lower()
+
+    # "Financial Services" is far broader than banking. NSE's macro-sector and
+    # the SEC's equivalent both lump together two very different kinds of
+    # business:
+    #
+    #   Balance-sheet lenders and insurers (banks, NBFCs, housing finance,
+    #   life/general insurers). Deposits are not debt, loans are not
+    #   inventory, and there is no capex cycle — a cash-flow DCF genuinely
+    #   cannot be built for them.
+    #
+    #   Fee and commission businesses (asset managers, exchanges, depositories,
+    #   brokers, rating agencies, payment networks, registrars). These have
+    #   ordinary revenue, ordinary costs and no lending book. A DCF works
+    #   perfectly well, and refusing them was simply wrong — it blocked
+    #   HDFC AMC, BSE, CDSL, CAMS, CRISIL, Visa, Mastercard and others for a
+    #   reason that does not apply to them.
+    _FEE_BASED = (
+        "asset management", "capital market", "exchange", "depositor",
+        "broker", "broking", "rating", "wealth", "registrar", "fintech",
+        "payment", "financial technology", "investment banking", "advisory",
+        "credit services", "transaction & payment",
+    )
+    _LENDER_OR_INSURER = (
+        "bank", "insurance", "insurer", "nbfc", "non banking financial",
+        "housing finance", "finance company", "financial institution",
+        "lending", "microfinance", "asset reconstruction",
+    )
+
+    _is_fin_sector = sector_raw in ("Financial Services", "Financials",
+                                    "Banking", "Insurance")
+    _fee_based  = any(k in industry_raw for k in _FEE_BASED)
+    _lender     = any(k in industry_raw for k in _LENDER_OR_INSURER)
+
+    # Refuse a lender/insurer whatever its sector label says, and refuse an
+    # unclassified financial (most are lenders) — but never a fee-based one.
+    if (_lender or (_is_fin_sector and not _fee_based)) and not (_fee_based and not _lender):
         return False, (
             "A cash-flow DCF is not an appropriate framework for banks and "
             "insurers — they have no working-capital or capex cycle for the "
             "model to work with, which is why professional analysts use "
             "dividend-discount or residual-income methods instead. Use the "
-            "Convergence tab (earnings-based models) or the Quality tab for "
-            "this company."), warnings
+            "Residual Income tab — the model built for lenders, which values "
+            "the company from its book value and the returns it earns on that "
+            "capital — or the Convergence and Quality tabs."
+            + (f" (Classified from industry: {info.get('industry')}.)"
+               if info.get("industry") else
+               f" (Classified from sector: {sector_raw}; no industry recorded.)")
+        ), warnings
 
     years = sorted(revenue.keys(), reverse=True)
 
@@ -4284,6 +4326,7 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
             "the earnings-based models in Convergence as primary.")
 
     return True, None, warnings
+    
 # ── NEWS & CORPORATE EVENTS ENDPOINT (paste into main.py) ────────────────────
 # Serves the events collected by news_engine.py. Red flags first, because a
 # pledge creation or auditor resignation matters more than a routine filing.
@@ -4761,3 +4804,273 @@ def get_technicals(
     except Exception as e:
         return {"error": f"Technicals failed: {e}"}
         
+# ── RESIDUAL INCOME MODEL (paste into main.py) ───────────────────────────────
+RIM_BUILD = "2026-09-26 (lenders and insurers)"
+#
+# The valuation path for the companies a cash-flow DCF cannot touch: banks,
+# NBFCs, housing finance companies and insurers. That is roughly a third of
+# the Nifty by weight, and until now the app could only refuse them.
+#
+# Why residual income rather than DCF, in one line: for a lender, debt is raw
+# material rather than financing, so "free cash flow to the firm" has no
+# meaning — but book value is the regulatory capital base and is meaningful,
+# and a lender creates value only when it earns more on that capital than
+# shareholders require.
+#
+#     Value = BV0 + SUM_t [ (ROE_t - r) x BV_(t-1) ] / (1+r)^t  +  PV(terminal)
+#     BV_t  = BV_(t-1) x (1 + ROE_t x (1 - payout))
+#
+# where r is the cost of equity. The bracket is residual income: profit above
+# and beyond what the equity capital had to earn. If ROE equals the cost of
+# equity, the company is worth exactly its book value and not a rupee more.
+
+@app.get("/residual-income")
+def get_residual_income(
+    ticker: str = Query(...),
+    market: str = Query("india"),
+    risk_free_rate: float = Query(0.04),
+    market_return: float = Query(0.10),
+    projection_years: int = Query(10, description="Years before terminal"),
+    roe_basis: str = Query("median", description="median | average | latest"),
+    fade_to_coe: bool = Query(True,
+        description="Fade ROE toward cost of equity over the horizon"),
+    terminal_persistence: float = Query(0.5,
+        description="Share of final-year residual income assumed to persist (0-1)"),
+    margin_of_safety: float = Query(0.25),
+):
+    try:
+        from fmp_data_layer import get_company_data
+        import math
+
+        raw = ticker.upper()
+        if market.lower() == "india" and not raw.endswith(".NS"):
+            raw += ".NS"
+
+        info, income_df, balance_df, cashflow_df, data_source = get_company_data(
+            ticker=ticker, market=market, source="auto")
+
+        shares = info.get("sharesOutstanding")
+        if not shares or shares <= 0:
+            return {"error": "Shares outstanding unavailable — cannot compute a "
+                             "per-share value."}
+
+        def series(df, *kw):
+            """Newest-first list for the first row matching all keywords."""
+            if df is None or df.empty:
+                return []
+            for idx in df.index:
+                if all(k.lower() in idx.lower() for k in kw):
+                    out = []
+                    for col in df.columns:
+                        try:
+                            v = float(df.loc[idx, col])
+                            out.append(None if v != v else v)
+                        except Exception:
+                            out.append(None)
+                    return out
+            return []
+
+        equity_series = (series(balance_df, "stockholders equity")
+                         or series(balance_df, "total equity"))
+        ni_series     = series(income_df, "net income")
+
+        if not equity_series or not ni_series:
+            return {"error": "Book value or net income is missing for this "
+                             "company, so a residual income model cannot be built."}
+
+        bv0 = equity_series[0]
+        if not bv0 or bv0 <= 0:
+            return {"error": "Book value is zero or negative. A residual income "
+                             "model cannot value a company with no equity base."}
+
+        # ── ROE history ──────────────────────────────────────────────────────
+        # Measured against OPENING equity — the capital that was actually put
+        # to work during the year. Closing equity already contains the profit
+        # being measured, which flatters the ratio.
+        roes = []
+        for i in range(len(ni_series) - 1):
+            ni, bv_open = ni_series[i], equity_series[i + 1]
+            if ni is not None and bv_open and bv_open > 0:
+                roes.append(ni / bv_open)
+        if not roes:
+            # Only one year available — fall back to closing equity
+            if ni_series[0] is not None and bv0 > 0:
+                roes = [ni_series[0] / bv0]
+            else:
+                return {"error": "Not enough history to estimate return on equity."}
+
+        _sorted = sorted(roes)
+        roe_median  = _sorted[len(_sorted) // 2]
+        roe_average = sum(roes) / len(roes)
+        roe_latest  = roes[0]
+
+        # Median by default, for the same reason the DCF uses it for growth:
+        # one distorted year (a provision write-back, a one-off gain) drags an
+        # average but is simply not the middle observation.
+        roe_start = {"median": roe_median, "average": roe_average,
+                     "latest": roe_latest}.get(roe_basis, roe_median)
+
+        # ── Cost of equity ───────────────────────────────────────────────────
+        beta = info.get("beta")
+        beta_source = "external"
+        try:
+            from data_store import _conn
+            with _conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""SELECT beta_2y, beta_r2 FROM stock_signatures
+                                   WHERE ticker = %s AND beta_2y IS NOT NULL
+                                   ORDER BY date DESC LIMIT 1""", (raw,))
+                    row = cur.fetchone()
+            if row and row[0] is not None and row[1] and row[1] >= 0.10:
+                beta, beta_source = float(row[0]), "computed from own price history"
+        except Exception:
+            pass
+        beta = max(0.5, min(float(beta or 1.0), 2.5))
+        coe  = risk_free_rate + beta * (market_return - risk_free_rate)
+
+        # ── Payout ratio, to grow book value by retained earnings ────────────
+        payout = None
+        div_series = series(cashflow_df, "dividend")
+        if div_series and ni_series[0]:
+            d0 = abs(div_series[0] or 0)
+            if d0 and ni_series[0] > 0:
+                payout = min(max(d0 / ni_series[0], 0.0), 0.9)
+        if payout is None:
+            payout = 0.25   # typical for an Indian lender retaining to grow
+
+        # ── Project residual income ──────────────────────────────────────────
+        # ROE fades toward the cost of equity. This matters more here than
+        # anywhere else in the app: an unfaded 20% ROE compounds book value
+        # AND residual income together, and produces valuations that assume a
+        # permanent competitive advantage no lender has ever sustained.
+        rows, pv_total, bv = [], 0.0, bv0
+        for yr in range(1, projection_years + 1):
+            if fade_to_coe and projection_years > 1:
+                roe_t = roe_start + (coe - roe_start) * ((yr - 1) / projection_years)
+            else:
+                roe_t = roe_start
+
+            ri     = (roe_t - coe) * bv          # residual income on opening BV
+            pv_ri  = ri / ((1 + coe) ** yr)
+            pv_total += pv_ri
+
+            rows.append({
+                "year":              f"Year {yr}",
+                "opening_book_value": round(bv, 2),
+                "roe":               round(roe_t, 4),
+                "cost_of_equity":    round(coe, 4),
+                "excess_return_pp":  round((roe_t - coe) * 100, 2),
+                "residual_income":   round(ri, 2),
+                "pv_residual_income": round(pv_ri, 2),
+            })
+            bv = bv * (1 + roe_t * (1 - payout))   # retained earnings compound
+
+        # ── Terminal ─────────────────────────────────────────────────────────
+        # Residual income does not continue at full strength for ever —
+        # competition erodes it. The persistence factor is the share assumed
+        # to continue as a perpetuity; 0 means the advantage disappears
+        # entirely at the horizon, 1 means it lasts for ever.
+        last_ri = rows[-1]["residual_income"] if rows else 0.0
+        terminal_ri = last_ri * max(0.0, min(terminal_persistence, 1.0))
+        terminal_value = terminal_ri / coe if coe > 0 else 0.0
+        pv_terminal = terminal_value / ((1 + coe) ** projection_years)
+
+        equity_value = bv0 + pv_total + pv_terminal
+        value_ps     = equity_value / shares
+        value_mos    = value_ps * (1 - margin_of_safety)
+        bvps         = bv0 / shares
+
+        price = info.get("currentPrice")
+        upside = ((value_ps - price) / price * 100) if price and price > 0 else None
+        verdict = (None if upside is None else
+                   "Potentially Undervalued" if upside > 20 else
+                   "Potentially Overvalued"  if upside < -20 else "Fairly Valued")
+
+        # Sanity: a model output far below book value for a profitable lender
+        # usually means ROE was measured on a bad year rather than that the
+        # company is worth less than its net assets.
+        warning = None
+        if value_ps < bvps * 0.5 and roe_start > 0:
+            warning = ("The model values the company at less than half its book "
+                       "value while ROE is positive. Check the ROE basis — one "
+                       "weak year can drive this.")
+        if roe_start <= 0:
+            warning = ("Return on equity is negative over the measured history, "
+                       "so residual income is negative throughout: the model is "
+                       "saying this company destroys shareholder capital at its "
+                       "current returns. Verify against the actual filings "
+                       "before acting on it.")
+
+        return {
+            "rim_build":  RIM_BUILD,
+            "ticker":     raw,
+            "market":     market,
+            "data_source": data_source,
+            "method":     "Residual Income (appropriate for lenders and insurers)",
+            "current_price": price,
+
+            "book_value_per_share":       round(bvps, 2),
+            "intrinsic_value_per_share":  round(value_ps, 2),
+            "value_with_margin_of_safety": round(value_mos, 2),
+            "upside_downside_pct":        round(upside, 2) if upside is not None else None,
+            "verdict":                    verdict,
+            "reliability_warning":        warning,
+
+            "inputs": {
+                "roe_basis_used":   roe_basis,
+                "roe_start":        round(roe_start, 4),
+                "roe_median":       round(roe_median, 4),
+                "roe_average":      round(roe_average, 4),
+                "roe_latest":       round(roe_latest, 4),
+                "roe_years_measured": len(roes),
+                "cost_of_equity":   round(coe, 4),
+                "beta_used":        round(beta, 3),
+                "beta_source":      beta_source,
+                "payout_ratio":     round(payout, 3),
+                "fade_to_coe":      fade_to_coe,
+                "terminal_persistence": terminal_persistence,
+                "projection_years": projection_years,
+            },
+
+            "bridge": {
+                "opening_book_value":     round(bv0, 2),
+                "pv_residual_income":     round(pv_total, 2),
+                "pv_terminal":            round(pv_terminal, 2),
+                "equity_value":           round(equity_value, 2),
+                "shares_outstanding":     shares,
+            },
+
+            "projection_table": rows,
+
+            "how_to_read": [
+                "Value = book value today + the present value of profits ABOVE "
+                "what shareholders require on that capital. If return on equity "
+                "equals the cost of equity, the company is worth its book value "
+                "and nothing more.",
+                f"This company earned {roe_start*100:.1f}% on equity against a "
+                f"{coe*100:.1f}% cost of equity — an excess of "
+                f"{(roe_start-coe)*100:+.1f} percentage points.",
+                "ROE is faded toward the cost of equity across the horizon "
+                "because no lender sustains an advantage indefinitely. Turn the "
+                "fade off to see what a permanent advantage would be worth.",
+            ],
+
+            "caveats": [
+                "This model is only as good as the book value, and for a lender "
+                "that is exactly where the risk hides. Book value depends on "
+                "loan-loss provisioning: a lender under-provisioning against bad "
+                "loans has an overstated book value, and this model will inherit "
+                "that overstatement in full.",
+                "Asset quality — non-performing assets, restructured loans, "
+                "sector concentration — is not modelled here at all. It is the "
+                "single most important thing to check separately.",
+                "Regulatory capital requirements can force a rights issue or "
+                "dilution that this model does not anticipate.",
+                "For an insurer, embedded value is the more standard measure; "
+                "residual income is a reasonable cross-check, not a replacement.",
+            ],
+        }
+
+    except Exception as e:
+        return {"error": f"Residual income model failed: {e}"}
+
