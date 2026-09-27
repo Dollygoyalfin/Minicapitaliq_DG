@@ -527,6 +527,7 @@
 <div class="tab-row">
   <div class="tab active" onclick="switchTab('valuation',this)">Overview</div>
   <div class="tab" onclick="switchTab('dcf',this)">DCF Valuation</div>
+  <div class="tab" onclick="switchTab('rim',this)">Residual Income</div>
   <div class="tab" onclick="switchTab('financials',this)">Financials</div>
   <div class="tab" onclick="switchTab('screener',this)">Screener</div>
   <div class="tab" onclick="switchTab('convergence',this)">🎯 Convergence</div>
@@ -550,7 +551,39 @@
 </div>
 
 <!-- DCF TAB -->
-<div id="tab-dcf" class="tab-content">
+<div id="tab-rim" class="tab-content">
+  <div class="container">
+    <div style="font-size:0.78rem;opacity:0.75;margin-bottom:12px;line-height:1.55">
+      The model for <strong>banks, NBFCs, housing finance and insurers</strong> —
+      the companies a cash-flow DCF cannot value, because for a lender debt is
+      raw material rather than financing. Value starts at book value and adds
+      only the profit earned <em>above</em> what shareholders require on that
+      capital.
+    </div>
+    <div class="params-grid" style="margin-bottom:10px">
+      <div class="param-group"><label>ROE basis</label>
+        <select id="rim-basis" style="width:100%">
+          <option value="median">Median of history</option>
+          <option value="average">Average of history</option>
+          <option value="latest">Latest year</option>
+        </select></div>
+      <div class="param-group"><label>Fade ROE to cost of equity</label>
+        <select id="rim-fade" style="width:100%">
+          <option value="true" selected>Yes - advantage erodes</option>
+          <option value="false">No - advantage is permanent</option>
+        </select></div>
+      <div class="param-group"><label>Terminal persistence (0-1)</label>
+        <input type="number" id="rim-persist" value="0.5" step="0.1" min="0" max="1"/></div>
+    </div>
+    <button class="btn-primary" onclick="runRIM()">Value This Lender</button>
+    <div id="rim-results" style="margin-top:14px">
+      <div class="state-empty"><span class="icon">B</span>
+        Enter a bank, NBFC or insurer above and run the model.
+      </div>
+    </div>
+  </div>
+</div>
+
   <div class="container">
     <div class="card">
       <div class="card-head">Model Parameters</div>
@@ -1691,6 +1724,130 @@
   }
 
   // ── DCF ────────────────────────────────────────────────────────────────────
+  
+// ── PIECE 3 of 3 ────────────────────────────────────────────────────────
+// Add this function INSIDE a <script> block, alongside runDCF():
+ 
+  async function runRIM() {
+    const ticker = getTicker(), market = getMarket();
+    if (!ticker) { setError("rim-results", "Enter a ticker first."); return; }
+    const basis   = (document.getElementById("rim-basis")   || {}).value || "median";
+    const fade    = (document.getElementById("rim-fade")    || {}).value || "true";
+    const persist = (document.getElementById("rim-persist") || {}).value || 0.5;
+ 
+    setLoading("rim-results", `Valuing ${ticker.toUpperCase()} on residual income...`);
+    try {
+      const d = await safeFetch(`${BASE}/residual-income?ticker=${ticker}&market=${market}` +
+        `&roe_basis=${basis}&fade_to_coe=${fade}&terminal_persistence=${persist}`);
+      if (d.error) { setError("rim-results", d.error); return; }
+ 
+      const cur = market === "india" ? "₹" : "$";
+      const I   = d.inputs || {};
+      const B   = d.bridge || {};
+      const up  = d.upside_downside_pct;
+      const cls = d.verdict === "Potentially Undervalued" ? "buy"
+                : d.verdict === "Potentially Overvalued"  ? "sell" : "hold";
+      const upCol = up == null ? "inherit" : up > 0 ? "#22c55e" : "#ef4444";
+ 
+      const excess = (I.roe_start - I.cost_of_equity) * 100;
+      const exCol  = excess > 0 ? "#22c55e" : "#ef4444";
+ 
+      const rows = (d.projection_table || []).map(r => `
+        <tr>
+          <td class="mono">${r.year}</td>
+          <td class="mono">${cur}${(r.opening_book_value/1e9).toFixed(1)}B</td>
+          <td class="mono">${(r.roe*100).toFixed(1)}%</td>
+          <td class="mono" style="color:${r.excess_return_pp>0?'#22c55e':'#ef4444'}">
+            ${r.excess_return_pp>0?'+':''}${r.excess_return_pp}pp</td>
+          <td class="mono">${cur}${(r.residual_income/1e9).toFixed(2)}B</td>
+          <td class="mono" style="opacity:0.75">${cur}${(r.pv_residual_income/1e9).toFixed(2)}B</td>
+        </tr>`).join("");
+ 
+      document.getElementById("rim-results").innerHTML = `
+        <div class="verdict-strip ${cls}">
+          <div>
+            <div class="verdict-main">${d.verdict || "-"}</div>
+            <div class="verdict-sub">${d.ticker} &middot; Residual Income &middot;
+              cost of equity ${(I.cost_of_equity*100).toFixed(2)}%</div>
+          </div>
+          <div class="mono" style="font-size:1.6rem;font-weight:800;color:${upCol}">
+            ${up == null ? "-" : (up>0?"+":"") + up + "%"}</div>
+        </div>
+ 
+        <div class="result-card">
+          <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:14px">
+            <div style="flex:1;min-width:120px">
+              <div style="font-size:0.7rem;opacity:0.6">Book value / share</div>
+              <div class="mono" style="font-size:1.3rem;font-weight:700">${cur}${d.book_value_per_share}</div>
+            </div>
+            <div style="flex:1;min-width:120px">
+              <div style="font-size:0.7rem;opacity:0.6">Intrinsic value</div>
+              <div class="mono" style="font-size:1.3rem;font-weight:700">${cur}${d.intrinsic_value_per_share}</div>
+            </div>
+            <div style="flex:1;min-width:120px">
+              <div style="font-size:0.7rem;opacity:0.6">With margin of safety</div>
+              <div class="mono" style="font-size:1.3rem;font-weight:700">${cur}${d.value_with_margin_of_safety}</div>
+            </div>
+            <div style="flex:1;min-width:120px">
+              <div style="font-size:0.7rem;opacity:0.6">Current price</div>
+              <div class="mono" style="font-size:1.3rem;font-weight:700">${d.current_price ? cur+d.current_price : "-"}</div>
+            </div>
+          </div>
+ 
+          <div style="padding:10px 12px;background:rgba(255,255,255,0.05);border-radius:4px;font-size:0.82rem">
+            Earns <strong>${(I.roe_start*100).toFixed(1)}%</strong> on equity against a
+            <strong>${(I.cost_of_equity*100).toFixed(1)}%</strong> cost of equity —
+            an excess of <strong style="color:${exCol}">${excess>0?'+':''}${excess.toFixed(1)} percentage points</strong>.
+            <div style="font-size:0.72rem;opacity:0.65;margin-top:4px">
+              ROE basis: ${I.roe_basis_used} of ${I.roe_years_measured} years
+              (median ${(I.roe_median*100).toFixed(1)}%, latest ${(I.roe_latest*100).toFixed(1)}%)
+              &middot; beta ${I.beta_used} ${I.beta_source}
+              &middot; payout ${(I.payout_ratio*100).toFixed(0)}%
+              &middot; ${I.fade_to_coe ? "ROE fades to cost of equity" : "no fade - permanent advantage assumed"}
+            </div>
+          </div>
+ 
+          ${d.reliability_warning ? `
+            <div style="margin-top:10px;padding:10px 12px;background:rgba(234,179,8,0.10);
+                        border-left:3px solid #eab308;border-radius:2px;font-size:0.78rem">
+              ${d.reliability_warning}
+            </div>` : ""}
+ 
+          <div style="margin-top:16px;font-weight:600;font-size:0.9rem">Value bridge</div>
+          <div style="font-size:0.84rem;margin-top:4px">
+            <div style="display:flex;justify-content:space-between;padding:4px 0">
+              <span>Opening book value</span><span class="mono">${cur}${(B.opening_book_value/1e9).toFixed(2)}B</span></div>
+            <div style="display:flex;justify-content:space-between;padding:4px 0">
+              <span>+ PV of residual income</span><span class="mono">${cur}${(B.pv_residual_income/1e9).toFixed(2)}B</span></div>
+            <div style="display:flex;justify-content:space-between;padding:4px 0">
+              <span>+ PV of terminal</span><span class="mono">${cur}${(B.pv_terminal/1e9).toFixed(2)}B</span></div>
+            <div style="display:flex;justify-content:space-between;padding:6px 0;
+                        border-top:1px solid rgba(255,255,255,0.12);font-weight:700">
+              <span>= Equity value</span><span class="mono">${cur}${(B.equity_value/1e9).toFixed(2)}B</span></div>
+          </div>
+ 
+          <div style="margin-top:16px;font-weight:600;font-size:0.9rem">Projection</div>
+          <table style="width:100%;border-collapse:collapse;font-size:0.82rem;margin-top:4px">
+            <thead><tr style="opacity:0.6;font-size:0.72rem;text-align:left">
+              <th>Year</th><th>Opening BV</th><th>ROE</th><th>vs CoE</th>
+              <th>Residual income</th><th>PV</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+ 
+          <div style="margin-top:14px;padding:10px;background:rgba(255,255,255,0.04);border-radius:4px">
+            <div style="font-size:0.75rem;font-weight:600;margin-bottom:4px">How to read this</div>
+            <ul style="margin:0 0 8px;padding-left:16px;font-size:0.72rem;opacity:0.8">
+              ${(d.how_to_read||[]).map(x=>`<li style="margin:3px 0">${x}</li>`).join("")}
+            </ul>
+            <div style="font-size:0.75rem;font-weight:600;margin-bottom:4px">Where this model can mislead you</div>
+            <ul style="margin:0;padding-left:16px;font-size:0.72rem;opacity:0.7">
+              ${(d.caveats||[]).map(x=>`<li style="margin:3px 0">${x}</li>`).join("")}
+            </ul>
+          </div>
+        </div>`;
+    } catch (e) { setError("rim-results", e.message); }
+  }
+
   async function runDCF() {
     const ticker = getTicker(), market = getMarket();
     if (!ticker) { setError("dcf-results", "Please enter a ticker symbol first."); return; }
