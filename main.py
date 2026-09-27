@@ -4220,7 +4220,90 @@ def get_base_rates(
 # accounting sanity. This runs before any model computes.
 #
 # Philosophy: refuse loudly rather than output a confident wrong number.
-GATE_BUILD = "2026-09-26 (refuse lenders/insurers only, not fee-based financials)"
+GATE_BUILD = "2026-09-27 (label + balance-sheet economics; detailed NSE industry)"
+
+# ── Financial-company classifier ─────────────────────────────────────────────
+# A cash-flow DCF cannot value a balance-sheet business (bank, NBFC, housing
+# finance, insurer) but values a fee business (exchange, depository, AMC,
+# registrar, broker, ratings, payments) perfectly well. Two kinds of evidence:
+#
+#  1. ECONOMICS — a lender funds itself with other people's money, and that
+#     shows in two numbers no label can hide. Measured on this app's own
+#     store (FY2026): lenders pay 40-97% of revenue as interest, fee
+#     businesses 0.0-0.5%; debt/equity 0.2-4.6 vs 0.00-0.05. The gap is so
+#     wide the thresholds below are not sensitive. Economics OVERRIDES the
+#     label: Capital One is labelled "Credit Services" but is a lender.
+#
+#  2. LABEL — needed because insurers look exactly like fee businesses on
+#     those two numbers (HDFC Life: 0.2% interest, 0.17 debt/equity). Only
+#     the detailed industry ("Life Insurance") gives them away. A coarse
+#     label like "Financial Services" cannot, so it is treated as unknown.
+#
+# Fee phrases are checked BEFORE lender words so that "Insurance Brokers"
+# and "Insurance Distributors" (AON, PolicyBazaar) are not mistaken for
+# insurers.
+LENDER_INTEREST_PCT = 20.0     # interest expense as % of revenue
+LENDER_DEBT_EQUITY  = 2.0
+
+_FEE_PHRASES = (
+    "insurance broker", "insurance distributor", "distributor",
+    "asset management", "stockbroking", "broking", "broker",
+    "exchange", "depositor", "clearing", "rating", "registrar", "wealth",
+    "payment", "fintech", "financial technology", "financial data",
+    "capital market", "advisory", "investment banking", "credit services",
+    "transaction",
+)
+_LENDER_WORDS = (
+    "bank", "nbfc", "non banking", "housing finance", "microfinance",
+    "financial institution", "finance company", "lending", "mortgage",
+    "insurance", "insurer", "reinsurance", "asset reconstruction",
+)
+_GENERIC = ("financial services", "financials", "other financial services",
+            "investment company", "holding company", "diversified financial",
+            "unknown", "")
+
+
+def classify_financial(sector, industry, interest_pct=None, debt_equity=None):
+    """Pure function. Returns (verdict, why) where verdict is one of
+    'not_financial' | 'fee' | 'lender' | 'unclear'."""
+    sec = (sector or "").strip().lower()
+    ind = (industry or "").strip().lower()
+    fin_sector = sec in ("financial services", "financials", "banking",
+                         "insurance")
+    fee_label = any(p in ind for p in _FEE_PHRASES)
+    lender_label = (not fee_label) and any(w in ind for w in _LENDER_WORDS)
+    if not (fin_sector or fee_label or lender_label):
+        return "not_financial", None
+
+    nums = []
+    if interest_pct is not None:
+        nums.append(f"interest is {interest_pct:.1f}% of revenue")
+    if debt_equity is not None:
+        nums.append(f"debt is {debt_equity:.2f}x equity")
+    numtxt = ", ".join(nums)
+
+    # Interest is the primary signal: a lender's cost of funds IS its
+    # interest line. Debt/equity alone misfires on fee businesses that buy
+    # back shares (buybacks shrink equity - Mastercard, AON), so debt only
+    # counts when the interest line is missing or ~zero. Debt with no
+    # interest cost is not a real business state; it means the interest
+    # figure was not extracted (Bajaj Housing Finance: 0.0% on 4.6x debt).
+    interest_missing = interest_pct is None or interest_pct < 0.5
+    high_interest = interest_pct is not None and interest_pct >= LENDER_INTEREST_PCT
+    debt_no_interest = (interest_missing and debt_equity is not None
+                        and debt_equity >= LENDER_DEBT_EQUITY)
+    if high_interest or debt_no_interest:
+        return "lender", (f"its balance sheet is a lender's ({numtxt}), "
+                          f"whatever its label says")
+    if lender_label:
+        return "lender", f"classified as '{industry}'"
+    if fee_label:
+        return "fee", (f"classified as '{industry}'"
+                       + (f" and {numtxt}" if numtxt else ""))
+    return "unclear", (f"its industry is recorded only as '{industry or sector}', "
+                       f"which cannot tell an insurer from a fee business"
+                       + (f" ({numtxt})" if numtxt else ""))
+
 
 def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
     """Returns (ok: bool, reason: str|None, warnings: list[str])."""
@@ -4258,56 +4341,40 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
     # cycle. Professionals use dividend-discount or residual-income models
     # here. Refusing outright is more useful than a number produced by an
     # inapplicable framework.
-    sector_raw   = (info.get("sector") or "")
-    industry_raw = (info.get("industry") or "").lower()
+    # Which kind of financial company this is — see classify_financial()
+    # at the top of this block for the evidence and thresholds.
+    sector_raw = (info.get("sector") or "")
 
-    # "Financial Services" is far broader than banking. NSE's macro-sector and
-    # the SEC's equivalent both lump together two very different kinds of
-    # business:
-    #
-    #   Balance-sheet lenders and insurers (banks, NBFCs, housing finance,
-    #   life/general insurers). Deposits are not debt, loans are not
-    #   inventory, and there is no capex cycle — a cash-flow DCF genuinely
-    #   cannot be built for them.
-    #
-    #   Fee and commission businesses (asset managers, exchanges, depositories,
-    #   brokers, rating agencies, payment networks, registrars). These have
-    #   ordinary revenue, ordinary costs and no lending book. A DCF works
-    #   perfectly well, and refusing them was simply wrong — it blocked
-    #   HDFC AMC, BSE, CDSL, CAMS, CRISIL, Visa, Mastercard and others for a
-    #   reason that does not apply to them.
-    _FEE_BASED = (
-        "asset management", "capital market", "exchange", "depositor",
-        "broker", "broking", "rating", "wealth", "registrar", "fintech",
-        "payment", "financial technology", "investment banking", "advisory",
-        "credit services", "transaction & payment",
-    )
-    _LENDER_OR_INSURER = (
-        "bank", "insurance", "insurer", "nbfc", "non banking financial",
-        "housing finance", "finance company", "financial institution",
-        "lending", "microfinance", "asset reconstruction",
-    )
+    # Latest year's economics, for the classifier
+    _debt = row(balance_df, "total debt")
+    _eq   = row(balance_df, "stockholders equity") or row(balance_df, "total equity")
+    _yrs  = sorted(revenue.keys(), reverse=True)
+    _y0   = _yrs[0] if _yrs else None
+    _rev0 = revenue.get(_y0)
+    _int0 = interest.get(_y0)
+    interest_pct = (abs(_int0) / _rev0 * 100) if (_int0 is not None and _rev0) else None
+    debt_equity = (_debt.get(_y0) / _eq.get(_y0)
+                   if (_debt.get(_y0) is not None and _eq.get(_y0) and _eq.get(_y0) > 0)
+                   else None)
 
-    _is_fin_sector = sector_raw in ("Financial Services", "Financials",
-                                    "Banking", "Insurance")
-    _fee_based  = any(k in industry_raw for k in _FEE_BASED)
-    _lender     = any(k in industry_raw for k in _LENDER_OR_INSURER)
+    fin_verdict, fin_why = classify_financial(sector_raw, info.get("industry"),
+                                              interest_pct, debt_equity)
 
-    # Refuse a lender/insurer whatever its sector label says, and refuse an
-    # unclassified financial (most are lenders) — but never a fee-based one.
-    if (_lender or (_is_fin_sector and not _fee_based)) and not (_fee_based and not _lender):
-        return False, (
-            "A cash-flow DCF is not an appropriate framework for banks and "
-            "insurers — they have no working-capital or capex cycle for the "
-            "model to work with, which is why professional analysts use "
-            "dividend-discount or residual-income methods instead. Use the "
-            "Residual Income tab — the model built for lenders, which values "
-            "the company from its book value and the returns it earns on that "
-            "capital — or the Convergence and Quality tabs."
-            + (f" (Classified from industry: {info.get('industry')}.)"
-               if info.get("industry") else
-               f" (Classified from sector: {sector_raw}; no industry recorded.)")
-        ), warnings
+    if fin_verdict in ("lender", "unclear"):
+        head = ("A cash-flow DCF is not an appropriate framework for banks, "
+                "NBFCs and insurers — they have no working-capital or capex "
+                "cycle for the model to work with, which is why professional "
+                "analysts use residual-income methods instead. Use the Residual "
+                "Income tab, or the Convergence and Quality tabs.")
+        if fin_verdict == "lender":
+            return False, f"{head} Refused because {fin_why}.", warnings
+        return False, (f"{head} Refused because {fin_why}. If this is a fee "
+                       f"business (exchange, depository, AMC, broker), run "
+                       f"`python fix_industry.py` to record NSE's detailed "
+                       f"industry, and it will be valued."), warnings
+    if fin_verdict == "fee":
+        warnings.append(f"Financial-sector company valued by DCF because it is "
+                        f"a fee business: {fin_why}.")
 
     years = sorted(revenue.keys(), reverse=True)
 
@@ -4390,12 +4457,8 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
                         f"derived from it are unreliable.")
                     break
 
-    # ── 7. Structural: cash-flow DCF is inappropriate for banks/insurers ─────
-    if is_fin:
-        warnings.append(
-            "Financial-sector company — cash-flow DCF is not the appropriate "
-            "framework (no meaningful working capital or capex cycle). Treat "
-            "the earnings-based models in Convergence as primary.")
+    # (Banks and insurers never reach this point — they are refused above.
+    # Fee businesses that do reach it carry an explanatory warning instead.)
 
     return True, None, warnings
     
