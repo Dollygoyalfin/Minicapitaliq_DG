@@ -528,6 +528,7 @@
   <div class="tab active" onclick="switchTab('valuation',this)">Overview</div>
   <div class="tab" onclick="switchTab('dcf',this)">DCF Valuation</div>
   <div class="tab" onclick="switchTab('rim',this)">Residual Income</div>
+  <div class="tab" onclick="switchTab('ahead',this); loadAhead()">🗓 Ahead</div>
   <div class="tab" onclick="switchTab('financials',this)">Financials</div>
   <div class="tab" onclick="switchTab('screener',this)">Screener</div>
   <div class="tab" onclick="switchTab('convergence',this)">🎯 Convergence</div>
@@ -550,7 +551,7 @@
   </div>
 </div>
 
-<!-- DCF TAB -->
+<!-- RESIDUAL INCOME TAB -->
 <div id="tab-rim" class="tab-content">
   <div class="container">
     <div style="font-size:0.78rem;opacity:0.75;margin-bottom:12px;line-height:1.55">
@@ -584,6 +585,8 @@
   </div>
 </div>
 
+<!-- DCF TAB -->
+<div id="tab-dcf" class="tab-content">
   <div class="container">
     <div class="card">
       <div class="card-head">Model Parameters</div>
@@ -633,6 +636,39 @@
     <div id="dcf-results">
       <div class="state-empty"><span class="icon">∫</span>Configure parameters and run the model.</div>
     </div>
+  </div>
+</div>
+
+<!-- AHEAD TAB: known-events calendar + paper book -->
+<div id="tab-ahead" class="tab-content">
+  <div class="container">
+    <div style="font-size:0.78rem;opacity:0.75;margin-bottom:12px;line-height:1.55">
+      The part of the future that is already written down — results dates,
+      ex-dates, IPO lock-in expiries, and likely Nifty 50 changes — and a
+      paper book that trades the shortlist with virtual money, so you can see
+      whether it earns anything before your own money goes in.
+    </div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <select id="ahead-days" onchange="loadCalendar()">
+        <option value="14">Next 14 days</option>
+        <option value="30" selected>Next 30 days</option>
+        <option value="60">Next 60 days</option>
+        <option value="120">Next 120 days</option>
+      </select>
+      <select id="ahead-filter" onchange="loadCalendar()">
+        <option value="">Everything</option>
+        <option value="holdings">My holdings only</option>
+        <option value="results">Results dates</option>
+        <option value="ex_dividend,bonus,split,buyback,rights">Ex-dates &amp; record dates</option>
+        <option value="lockin_anchor_50,lockin_anchor_all,lockin_pre_ipo">IPO lock-in expiries</option>
+        <option value="index_add_candidate,index_drop_risk">Nifty 50 watch</option>
+      </select>
+    </div>
+    <div id="calendar-results"></div>
+
+    <div style="margin-top:22px;font-weight:700;font-size:1rem">Paper book</div>
+    <div id="paper-results" style="margin-top:8px"></div>
   </div>
 </div>
 
@@ -926,7 +962,6 @@
     <button class="btn-primary" onclick="runCommodities()">Measure Exposure</button>
     <div id="commodity-results"></div>
   </div>
-</div>
 </div>
 <script>
   async function runIpos() {
@@ -1846,6 +1881,135 @@
           </div>
         </div>`;
     } catch (e) { setError("rim-results", e.message); }
+  }
+
+  function loadAhead() { loadCalendar(); loadPaper(); }
+
+  async function loadCalendar() {
+    const days = (document.getElementById("ahead-days") || {}).value || 30;
+    const f    = (document.getElementById("ahead-filter") || {}).value || "";
+    let url = `${BASE}/calendar?market=india&days=${days}`;
+    if (f === "holdings") url += "&holdings_only=true";
+    else if (f) url += `&kinds=${encodeURIComponent(f)}`;
+
+    setLoading("calendar-results", "Reading the calendar...");
+    try {
+      const d = await safeFetch(url);
+      if (d.error) { setError("calendar-results", d.error); return; }
+      const ev = d.events || [];
+      if (!ev.length) {
+        document.getElementById("calendar-results").innerHTML =
+          `<div class="state-empty">Nothing scheduled in this window.
+           ${d.note ? "<br>" + d.note : ""}</div>`;
+        return;
+      }
+      const certTag = c => c === "estimate"
+        ? `<span style="font-size:0.65rem;padding:1px 6px;border-radius:8px;
+             background:rgba(234,179,8,0.15);color:#eab308">estimate</span>`
+        : c === "rule_based"
+        ? `<span style="font-size:0.65rem;padding:1px 6px;border-radius:8px;
+             background:rgba(59,130,246,0.15);color:#60a5fa">rule-based</span>`
+        : "";
+
+      let html = "", last = null;
+      for (const e of ev) {
+        if (e.date !== last) {
+          const dt = new Date(e.date + "T00:00:00");
+          html += `<div style="margin:14px 0 6px;font-size:0.75rem;font-weight:700;
+                     opacity:0.6;text-transform:uppercase;letter-spacing:0.04em">
+                     ${dt.toLocaleDateString(undefined,
+                       {weekday:"short", day:"numeric", month:"short"})}</div>`;
+          last = e.date;
+        }
+        const extra = e.kind.startsWith("index_") && e.detail && e.detail.ratio_to_smallest
+          ? ` · ${e.detail.ratio_to_smallest}x smallest member` : "";
+        const est = e.detail && e.detail.dates_estimated ? " · date estimated" : "";
+        html += `
+          <div class="result-card" style="padding:10px 12px;margin-bottom:6px">
+            <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+              <div><strong>${e.symbol}</strong>
+                <span style="opacity:0.6;font-size:0.78rem">
+                  ${e.company ? e.company.slice(0, 32) : ""}</span></div>
+              ${certTag(e.certainty)}
+            </div>
+            <div style="font-size:0.82rem;margin-top:3px">${e.label}</div>
+            <div style="font-size:0.72rem;opacity:0.65;margin-top:2px">
+              ${(e.title || "").slice(0, 110)}${extra}${est}</div>
+          </div>`;
+      }
+      html += `<div style="font-size:0.7rem;opacity:0.6;margin-top:10px;line-height:1.5">
+        <strong>rule-based</strong>: the date is fixed by SEBI rules; whether
+        holders actually sell is not known in advance.
+        <strong>estimate</strong>: our reading of NSE's index rules on our own
+        data — a watchlist, not an announcement.</div>`;
+      document.getElementById("calendar-results").innerHTML = html;
+    } catch (e) { setError("calendar-results", e.message); }
+  }
+
+  async function loadPaper() {
+    setLoading("paper-results", "Loading paper book...");
+    try {
+      const d = await safeFetch(`${BASE}/paper-portfolio`);
+      if (d.error) { setError("paper-results", d.error); return; }
+
+      const pc = v => v == null ? "–" : (v > 0 ? "+" : "") + v + "%";
+      const col = v => v == null ? "inherit" : v >= 0 ? "#22c55e" : "#ef4444";
+
+      // NAV sparkline
+      const h = d.nav_history || [];
+      let spark = "";
+      if (h.length > 1) {
+        const vals = h.map(x => x.nav), lo = Math.min(...vals), hi = Math.max(...vals);
+        const W = 300, H = 50, span = (hi - lo) || 1;
+        const pts = vals.map((v, i) =>
+          `${(i / (vals.length - 1) * W).toFixed(1)},${(H - (v - lo) / span * H).toFixed(1)}`).join(" ");
+        spark = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"
+                   style="width:100%;height:50px;margin-top:10px">
+                   <polyline points="${pts}" fill="none" stroke="${col(d.return_pct)}"
+                     stroke-width="2" vector-effect="non-scaling-stroke"/></svg>`;
+      }
+
+      const rows = (d.positions || []).map(p => p.status === "pending_buy"
+        ? `<tr><td>${p.ticker.replace(".NS","")}</td>
+             <td colspan="3" style="opacity:0.65">buy order ₹${p.reserved.toLocaleString()}
+             — fills at next price</td></tr>`
+        : `<tr><td>${p.ticker.replace(".NS","")}${p.status==="pending_sell" ? " ↘" : ""}</td>
+             <td class="mono">${p.qty}</td>
+             <td class="mono">₹${Number(p.price).toLocaleString(undefined,{maximumFractionDigits:0})}</td>
+             <td class="mono" style="color:${col(p.pnl_pct)}">${pc(p.pnl_pct)}</td></tr>`).join("");
+
+      document.getElementById("paper-results").innerHTML = `
+        <div class="result-card">
+          <div style="display:flex;gap:16px;flex-wrap:wrap">
+            <div style="flex:1;min-width:100px">
+              <div style="font-size:0.7rem;opacity:0.6">Value</div>
+              <div class="mono" style="font-size:1.25rem;font-weight:700">
+                ₹${d.nav.toLocaleString()}</div></div>
+            <div style="flex:1;min-width:90px">
+              <div style="font-size:0.7rem;opacity:0.6">Return (after costs)</div>
+              <div class="mono" style="font-size:1.25rem;font-weight:700;color:${col(d.return_pct)}">
+                ${pc(d.return_pct)}</div></div>
+            <div style="flex:1;min-width:90px">
+              <div style="font-size:0.7rem;opacity:0.6">Market, same dates</div>
+              <div class="mono" style="font-size:1.25rem;font-weight:700">
+                ${pc(d.benchmark_return_pct)}</div></div>
+          </div>
+          ${spark}
+          <div style="margin-top:10px;padding:8px 10px;background:rgba(255,255,255,0.05);
+                      border-radius:4px;font-size:0.8rem">${d.verdict}</div>
+          <div style="font-size:0.72rem;opacity:0.6;margin-top:6px">
+            Day ${d.days_running} · max drawdown ${d.max_drawdown_pct}%
+            ${d.closed_trades ? ` · ${d.closed_trades} closed trades, ${d.win_rate_pct}% winners` : ""}
+          </div>
+          ${rows ? `<table style="width:100%;border-collapse:collapse;font-size:0.82rem;margin-top:12px">
+            <thead><tr style="opacity:0.6;font-size:0.72rem;text-align:left">
+              <th>Stock</th><th>Qty</th><th>Price</th><th>P&amp;L</th></tr></thead>
+            <tbody>${rows}</tbody></table>` : ""}
+          <ul style="margin:12px 0 0;padding-left:16px;font-size:0.7rem;opacity:0.65">
+            ${(d.how_it_stays_honest || []).map(x => `<li>${x}</li>`).join("")}
+          </ul>
+        </div>`;
+    } catch (e) { setError("paper-results", e.message); }
   }
 
   async function runDCF() {
