@@ -18,11 +18,14 @@ Design principles:
 
 Usage:
     python signal_journal.py init            # create table
-    python signal_journal.py snapshot        # record today's signals (nightly)
+    python signal_journal.py snapshot        # record today's quality grades
+    python signal_journal.py dcf-snapshot    # record today's DCF verdicts
     python signal_journal.py score           # how have past signals done?
     python signal_journal.py score --days 90 # only signals older than 90d
+    python signal_journal.py score --source dcf
 """
 
+import os
 import sys
 import time
 from datetime import date, timedelta
@@ -30,7 +33,7 @@ import pandas as pd
 import numpy as np
 from data_store import _conn
 
-JOURNAL_BUILD = "2026-07-26b (store-only, no live price calls)"
+JOURNAL_BUILD = "2026-09-27 (DCF snapshot; equal-weight benchmark fixed)"
 
 
 def _connect_with_retry(attempts: int = 3):
@@ -157,6 +160,132 @@ def snapshot_quality_signals(limit: int = None):
     print(f"✅ Quality snapshot: {recorded} recorded, {failed} skipped.")
 
 
+# ── DCF snapshot ─────────────────────────────────────────────────────────────
+# Records what the DCF said, on the day it said it. Two reasons this exists:
+#
+# 1. Until now the journal only tracked Quality, so the scorecard could never
+#    answer the question that actually matters — does the valuation model
+#    work? A DCF that is never recorded can never be wrong, which is a
+#    comfortable place to be and a useless one.
+#
+# 2. The shortlist needs a valuation filter, and a filter needs stored values.
+#
+# It calls the DEPLOYED endpoint rather than recomputing. A second copy of the
+# DCF in this file would drift from the real one within a month, and then the
+# track record would be scoring a model the app does not actually run.
+
+API_BASE = os.environ.get("MINITRADEIQ_API",
+                          "https://minicapitaliq-dg.onrender.com").rstrip("/")
+
+
+def _dcf_signal(upside):
+    if upside is None:
+        return None
+    if upside >= 40:  return "Strong Buy"
+    if upside >= 15:  return "Buy"
+    if upside <= -40: return "Strong Sell"
+    if upside <= -15: return "Sell"
+    return "Hold"
+
+
+def snapshot_dcf_signals(limit: int = None, market: str = None,
+                         min_quality: int = 50, pause: float = 1.5):
+    """Run the live DCF across the universe and record each verdict.
+
+    Ordered by quality score so that a truncated run covers the companies
+    most likely to matter. Lenders and insurers are refused by the validation
+    gate and counted as skipped, not as failures — that refusal is correct.
+    """
+    import httpx
+
+    conn = _connect_with_retry()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '120s'")
+            q = """
+                WITH qual AS (
+                  SELECT DISTINCT ON (ticker) ticker,
+                         (detail->>'score')::float AS score
+                  FROM signal_journal WHERE source='quality'
+                  ORDER BY ticker, signal_date DESC
+                )
+                SELECT c.ticker, c.market, COALESCE(q.score, 0) AS score
+                FROM companies c
+                LEFT JOIN qual q ON q.ticker = c.ticker
+                WHERE COALESCE(q.score, 0) >= %s
+            """
+            params = [min_quality]
+            if market:
+                q += " AND c.market = %s"
+                params.append(market)
+            q += " ORDER BY score DESC"
+            cur.execute(q, params)
+            universe = cur.fetchall()
+    finally:
+        conn.close()
+
+    if limit:
+        universe = universe[:limit]
+    if not universe:
+        print(f"No companies with a quality score >= {min_quality}. "
+              "Run `python signal_journal.py snapshot` first.")
+        return
+
+    print(f"Running DCF for {len(universe)} companies against {API_BASE}")
+    print("(this calls the deployed model, so it is the same numbers the app "
+          "shows — expect roughly "
+          f"{len(universe) * (pause + 2) / 60:.0f} minutes)\n")
+
+    recorded = skipped = failed = 0
+    with httpx.Client(timeout=90.0) as client:
+        for i, (tkr, mkt, score) in enumerate(universe, 1):
+            short = tkr.replace(".NS", "")
+            try:
+                r = client.get(f"{API_BASE}/dcf",
+                               params={"ticker": short, "market": mkt})
+                if r.status_code != 200:
+                    failed += 1
+                    continue
+                d = r.json()
+
+                # A refusal is a correct answer, not an error: the validation
+                # gate declines lenders and insurers because a cash-flow DCF
+                # genuinely cannot value them. Those go to the RIM model.
+                if d.get("error"):
+                    skipped += 1
+                    continue
+
+                upside = d.get("upside_downside_pct")
+                sig = _dcf_signal(upside)
+                if sig is None:
+                    skipped += 1
+                    continue
+
+                record_signal(
+                    tkr, mkt, "dcf", sig,
+                    price=d.get("current_price"),
+                    detail={"upside_pct":  round(float(upside), 2),
+                            "intrinsic":   d.get("intrinsic_value_per_share"),
+                            "wacc":        d.get("wacc"),
+                            "dcf_build":   d.get("dcf_build"),
+                            "quality":     score})
+                recorded += 1
+            except Exception:
+                failed += 1
+            time.sleep(pause)
+            if i % 25 == 0:
+                print(f"  {i}/{len(universe)}  "
+                      f"({recorded} recorded, {skipped} not applicable, "
+                      f"{failed} failed)")
+
+    print(f"\n✅ DCF snapshot: {recorded} recorded, "
+          f"{skipped} not applicable (lenders/insurers), {failed} failed.")
+    if recorded:
+        print("   These are now scoreable — in 90 days "
+              "`python signal_journal.py score` will tell you whether the "
+              "DCF's Buy calls actually beat the market.")
+
+
 def _quick_quality(inc, bal, cf, info):
     """Condensed quality score — mirrors /quality's components closely
     enough for trend tracking. Returns (grade, score) or (None, None)."""
@@ -229,23 +358,30 @@ def score_journal(min_age_days: int = 30, source: str = None):
                       "time to play out — check back later.")
                 return
 
-            cur.execute("""SELECT ticker, date, price FROM stock_signatures""")
+            cur.execute("""SELECT ticker, market, date, price
+                           FROM stock_signatures WHERE price > 0""")
             prices = cur.fetchall()
-            cur.execute("""SELECT market, date, AVG(price) FROM stock_signatures
-                           GROUP BY market, date""")
-            bench = cur.fetchall()
     finally:
         conn.close()
 
-    pdf = pd.DataFrame(prices, columns=["ticker", "date", "price"])
+    pdf = pd.DataFrame(prices, columns=["ticker", "market", "date", "price"])
     pdf["date"] = pd.to_datetime(pdf["date"])
-    bdf = pd.DataFrame(bench, columns=["market", "date", "avg_price"])
-    bdf["date"] = pd.to_datetime(bdf["date"])
+
+    # ── Equal-weight benchmark ──────────────────────────────────────────────
+    # Built from the MEAN OF PER-STOCK RETURNS, not from the change in the
+    # average price. The latter looks equivalent and is not: when a new ticker
+    # enters the universe, the average price jumps, and that jump is counted
+    # as a market return. That is what produced a +4974% index in the base
+    # rate engine. A stock must be present on BOTH dates to contribute a
+    # return, which pct_change() on a pivot gives us for free (missing dates
+    # become NaN and are skipped by the row mean).
     bmaps = {}
-    for m, g in bdf.groupby("market"):
-        g = g.sort_values("date").copy()
-        g["idx"] = (1 + g["avg_price"].pct_change().fillna(0)).cumprod()
-        bmaps[m] = dict(zip(g["date"], g["idx"]))
+    for m, g in pdf.groupby("market"):
+        wide = g.pivot_table(index="date", columns="ticker",
+                             values="price", aggfunc="last").sort_index()
+        rets = wide.pct_change()
+        eq = rets.mean(axis=1, skipna=True).fillna(0.0)
+        bmaps[m] = dict(zip(wide.index, (1 + eq).cumprod()))
 
     sdf = pd.DataFrame(sigs, columns=["signal_date", "ticker", "market",
                                       "source", "signal", "price_at_signal"])
@@ -309,5 +445,15 @@ if __name__ == "__main__":
         if "--source" in sys.argv:
             src = sys.argv[sys.argv.index("--source") + 1]
         score_journal(min_age_days=days, source=src)
+    elif cmd in ("dcf-snapshot", "dcf"):
+        init_table()
+        a = sys.argv
+        snapshot_dcf_signals(
+            limit=int(a[a.index("--limit") + 1]) if "--limit" in a else None,
+            market=a[a.index("--market") + 1] if "--market" in a else None,
+            min_quality=int(a[a.index("--min-quality") + 1])
+                        if "--min-quality" in a else 50,
+            pause=float(a[a.index("--pause") + 1]) if "--pause" in a else 1.5)
     else:
-        print("Usage: python signal_journal.py [init|snapshot|score]")
+        print("Usage: python signal_journal.py "
+              "[init|snapshot|dcf-snapshot|score]")
