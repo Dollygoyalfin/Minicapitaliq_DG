@@ -237,6 +237,7 @@ def snapshot_dcf_signals(limit: int = None, market: str = None,
           f"{len(universe) * (pause + 2) / 60:.0f} minutes)\n")
 
     recorded = skipped = failed = 0
+    reasons = {}                      # why each company was not recorded
     with httpx.Client(timeout=90.0) as client:
         for i, (tkr, mkt, score) in enumerate(universe, 1):
             short = tkr.replace(".NS", "")
@@ -245,6 +246,7 @@ def snapshot_dcf_signals(limit: int = None, market: str = None,
                                params={"ticker": short, "market": mkt})
                 if r.status_code != 200:
                     failed += 1
+                    reasons.setdefault(f"HTTP {r.status_code}", []).append(short)
                     continue
                 d = r.json()
 
@@ -253,12 +255,19 @@ def snapshot_dcf_signals(limit: int = None, market: str = None,
                 # genuinely cannot value them. Those go to the RIM model.
                 if d.get("error"):
                     skipped += 1
+                    err = str(d["error"])
+                    low = err.lower()
+                    key = ("lender / insurer (use Residual Income)"
+                           if "bank" in low or "insur" in low or "lender" in low
+                           else err[:90])
+                    reasons.setdefault(key, []).append(short)
                     continue
 
                 upside = d.get("upside_downside_pct")
                 sig = _dcf_signal(upside)
                 if sig is None:
                     skipped += 1
+                    reasons.setdefault("no upside figure returned", []).append(short)
                     continue
 
                 record_signal(
@@ -270,16 +279,20 @@ def snapshot_dcf_signals(limit: int = None, market: str = None,
                             "dcf_build":   d.get("dcf_build"),
                             "quality":     score})
                 recorded += 1
-            except Exception:
+            except Exception as e:
                 failed += 1
+                reasons.setdefault(f"request error: {str(e)[:60]}", []).append(short)
             time.sleep(pause)
             if i % 25 == 0:
                 print(f"  {i}/{len(universe)}  "
                       f"({recorded} recorded, {skipped} not applicable, "
                       f"{failed} failed)")
 
-    print(f"\n✅ DCF snapshot: {recorded} recorded, "
-          f"{skipped} not applicable (lenders/insurers), {failed} failed.")
+    print(f"\n✅ DCF snapshot: {recorded} recorded, {skipped} not recorded, "
+          f"{failed} failed.")
+    for why, names in sorted(reasons.items(), key=lambda kv: -len(kv[1])):
+        print(f"   {len(names):>3} × {why}")
+        print(f"         {', '.join(names[:12])}{' …' if len(names) > 12 else ''}")
     if recorded:
         print("   These are now scoreable — in 90 days "
               "`python signal_journal.py score` will tell you whether the "
@@ -343,7 +356,8 @@ def score_journal(min_age_days: int = 30, source: str = None):
         with conn.cursor() as cur:
             cur.execute("SET statement_timeout = '120s'")
             q = """SELECT signal_date, ticker, market, source, signal,
-                          price_at_signal
+                          price_at_signal,
+                          (detail->>'upside_pct')::float AS upside
                    FROM signal_journal WHERE signal_date <= %s"""
             params = [cutoff]
             if source:
@@ -384,7 +398,13 @@ def score_journal(min_age_days: int = 30, source: str = None):
         bmaps[m] = dict(zip(wide.index, (1 + eq).cumprod()))
 
     sdf = pd.DataFrame(sigs, columns=["signal_date", "ticker", "market",
-                                      "source", "signal", "price_at_signal"])
+                                      "source", "signal", "price_at_signal",
+                                      "upside"])
+    # Extreme DCF upsides get their own row. Averaged in with ordinary Strong
+    # Buys, the question "are +150% DCFs right or broken?" could never be
+    # answered — which is the whole reason they are being kept.
+    extreme = (sdf["source"] == "dcf") & (sdf["upside"] > 100)
+    sdf.loc[extreme, "signal"] = "Strong Buy >100%"
     sdf["signal_date"] = pd.to_datetime(sdf["signal_date"])
 
     results = {}
