@@ -272,11 +272,10 @@ def refresh_all():
             print(f"  ❌ {clean_ticker}: {e}")
         time.sleep(1.5 if market == "us" else 3.0)
     print(f"✅ Refresh complete: {ok}/{len(companies)}.")
-    # Daily price top-up for the whole universe (cheap, batched)
-    try:
-        refresh_prices()
-    except Exception as e:
-        print(f"⚠ price refresh failed: {e}")
+    # Prices are no longer refreshed here. Buried at the end of this job they
+    # were skipped whenever it returned early or failed above, and a blocked
+    # yfinance reported "0 rows" as success — prices froze on 3 Sep 2026
+    # unnoticed. They now have their own step: python price_refresh.py
 
 
 def _print_builds():
