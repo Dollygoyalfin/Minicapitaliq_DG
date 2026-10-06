@@ -21,7 +21,7 @@ import pandas as pd
 import numpy as np
 from data_store import _conn
 
-SIGNATURE_BUILD = "2026-07-27d (weekly sampling, ~80% smaller)"
+SIGNATURE_BUILD = "2026-09-27 (update writes recent window only; table stays weekly)"
 
 
 def _init_table():
@@ -264,6 +264,20 @@ def backfill_signatures(full_rebuild: bool = True, recent_days: int = None,
         print(f"  weekly sampling: {before:,} → {len(feats):,} rows "
               f"({100 - len(feats)/before*100:.0f}% smaller)")
 
+    # ── Incremental: write only the recent window ────────────────────────
+    # Everything above needs the FULL history (a 200-day average, 12-month
+    # momentum and 2-year beta cannot be computed from 30 days), but only
+    # the recent rows can have changed. Until 2026-09-27 recent_days was
+    # printed and then ignored, so "update" rewrote all ~245,000 rows every
+    # night — and every rewritten row leaves a dead copy behind in Postgres
+    # until vacuum, which is how a free-tier database creeps toward its cap.
+    cutoff = None
+    if recent_days and not full_rebuild:
+        cutoff = feats["date"].max() - pd.Timedelta(days=recent_days)
+        feats = feats[feats["date"] >= cutoff]
+        print(f"  incremental: writing {len(feats):,} rows dated "
+              f"{cutoff.date()} onward")
+
     print("Writing to store...")
     t0 = time.time()
 
@@ -370,6 +384,32 @@ def backfill_signatures(full_rebuild: bool = True, recent_days: int = None,
         print(f"  ⚠ {failed_batches} batch(es) failed — rerun to fill the gaps "
               f"(upserts are idempotent, so a rerun is safe)")
     print(f"  {written:,} of {len(rows):,} rows written ({time.time()-t0:.0f}s)")
+
+    # ── Keep the table weekly ────────────────────────────────────────────
+    # Sampling keeps Fridays plus the latest date. Tomorrow the latest date
+    # moves on, but yesterday's non-Friday "latest" row was already written
+    # and nothing removed it — so the recent end of the table slowly turned
+    # daily again. That bloats storage and, worse, breaks the base-rate
+    # engine, whose horizons count ROWS as weeks (1m = 4 rows). Remove the
+    # stale mid-week rows in the window, only after a clean write.
+    if cutoff is not None and sample_weekly and not failed_batches:
+        try:
+            conn = _connect_with_retry()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""DELETE FROM stock_signatures
+                                   WHERE date >= %s AND date < %s
+                                     AND EXTRACT(ISODOW FROM date) <> 5""",
+                                (cutoff.date(), latest_date.date()))
+                    removed = cur.rowcount
+                conn.commit()
+            finally:
+                conn.close()
+            if removed:
+                print(f"  removed {removed:,} stale mid-week rows "
+                      f"(table stays one row per stock per week)")
+        except Exception as e:
+            print(f"  ⚠ mid-week cleanup skipped: {str(e)[:100]}")
     print("✅ Signature backfill complete.")
 
 
