@@ -23,10 +23,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Prices FIRST, as their own step. They used to be a top-up buried at
+      # the end of the fundamentals job, and froze on 3 Sep 2026 without
+      # anyone noticing. This step fails (turns red) when prices are stale,
+      # so a silent freeze cannot happen again. Every later step still runs.
+      - name: Refresh daily prices (NSE bhavcopy + yfinance)
+        env:
+          DATABASE_URL:   ${{ secrets.DATABASE_URL }}
+          NSE_CACHE_DAYS: "0"
+        run: python price_refresh.py
+
       # Scheduled runs must always fetch fresh filings — the disk caches are a
       # local development accelerator, not something that should make
       # production data stale.
       - name: Refresh fundamentals (staleness-filtered, 200/night)
+        if: always()
         env:
           DATABASE_URL:   ${{ secrets.DATABASE_URL }}
           GROQ_API_KEY:   ${{ secrets.GROQ_API_KEY }}
@@ -48,15 +59,100 @@ jobs:
           NSE_CACHE_DAYS: "0"
         run: python news_engine.py fetch --days 3
 
+      - name: Fetch US 8-K events
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python us_events_engine.py fetch --days 3
+
       - name: Record signal journal snapshot
         if: always()
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python signal_journal.py snapshot
 
+      # DCF verdicts, recorded on the day they were given. This is what makes
+      # the valuation model scoreable, and what the shortlist filters on.
+      # It calls the deployed endpoint, so it is slow: capped at 150/night,
+      # highest quality first, which refreshes the screenable universe on a
+      # rolling basis over a few nights.
+      - name: Record DCF verdicts
+        if: always()
+        env:
+          DATABASE_URL:    ${{ secrets.DATABASE_URL }}
+          MINITRADEIQ_API: ${{ vars.MINITRADEIQ_API || 'https://minicapitaliq-dg.onrender.com' }}
+        run: python signal_journal.py dcf-snapshot --limit 150 --min-quality 60
+
       # The store re-certifies itself. If extraction quality regresses after a
       # pipeline change, this surfaces it in the run log rather than waiting
       # for someone to notice a wrong valuation.
+      # Shareholding is quarterly data — weekly is ample, and it is one
+      # request per company so it must not run nightly.
+      - name: Fetch promoter shareholding (Mondays only)
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NSE_CACHE_DAYS: "0"
+        run: |
+          if [ "$(date +%u)" = "1" ]; then
+            python news_engine.py shareholding
+          else
+            echo "Skipping — runs on Mondays only"
+          fi
+
+      # IPO post-listing performance. Milestones (3m / 6m / 1y) move slowly and
+      # each IPO is one Yahoo call, so weekly is enough and keeps Yahoo happy.
+      - name: IPO post-listing tracker (Tuesdays only)
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ "$(date +%u)" = "2" ]; then
+            python ipo_tracker.py run
+          else
+            echo "Skipping — runs on Tuesdays only"
+          fi
+
+      # Scheduled and rule-based events: results dates, ex-dates, IPO lock-in
+      # expiries, Nifty 50 watch. Runs after shareholding because the index
+      # watch uses promoter holding to estimate free float.
+      - name: Refresh known-events calendar
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python events_calendar.py all
+
+      # Fills yesterday's orders at the next price, marks the book to market,
+      # and rebalances once a week. Runs after the DCF snapshot so it trades
+      # the same shortlist the digest shows tonight.
+      - name: Paper portfolio
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python paper_portfolio.py run
+
+      # Portfolio monitor runs LAST, so it sees the fresh events, quality
+      # snapshots and shareholding written by the steps above.
+      - name: Portfolio alerts
+        if: always()
+        env:
+          DATABASE_URL:         ${{ secrets.DATABASE_URL }}
+          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          NTFY_TOPIC:           ${{ secrets.NTFY_TOPIC }}
+          SMTP_USER:            ${{ secrets.SMTP_USER }}
+          SMTP_PASS:            ${{ secrets.SMTP_PASS }}
+          EMAIL_TO:             ${{ secrets.EMAIL_TO }}
+          TWILIO_SID:           ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN:         ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
+          MY_WHATSAPP_TO:       ${{ secrets.MY_WHATSAPP_TO }}
+          # critical | important | all   (see portfolio.py for what each covers)
+          ALERT_LEVEL:          ${{ vars.ALERT_LEVEL || 'all' }}
+        run: |
+          python portfolio.py check
+          python portfolio.py digest
+
       - name: Data quality audit
         if: always()
         env:
