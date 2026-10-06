@@ -40,6 +40,7 @@ Usage:
     python paper_portfolio.py report
     python paper_portfolio.py trades
     python paper_portfolio.py new-book NAME       # start a book under new rules
+    python paper_portfolio.py reset NAME          # only if nothing has filled yet
 """
 
 import sys
@@ -48,7 +49,7 @@ import math
 from datetime import date, timedelta
 from data_store import _conn
 
-PAPER_BUILD = "2026-09-27 (next-bar fills, frozen rules, costs)"
+PAPER_BUILD = "2026-09-27b (require_dcf rule; reset only before first fill)"
 
 DEFAULT_BOOK = "shortlist-v1"
 
@@ -66,6 +67,10 @@ DEFAULT_RULES = {
     "cost_per_side_pct": 0.25,
     "min_quality":       65,
     "min_dcf_upside":    0.0,
+    "require_dcf":       True,        # buy only names with a current DCF.
+                                      # Without it the valuation gate is
+                                      # decorative: a stock with no DCF
+                                      # passes "upside >= 0" by default.
 }
 
 MAX_FILL_WAIT_DAYS = 21   # an order with no newer price in 3 weeks is void
@@ -283,7 +288,10 @@ def run(book: str = DEFAULT_BOOK, force: bool = False, dry_run: bool = False):
                 keep = candidate_rows(cur, R["market"], exclude=(),
                                       limit=R["keep_if_in_top"],
                                       min_quality=R["min_quality"],
-                                      min_dcf_upside=R["min_dcf_upside"])
+                                      min_dcf_upside=R["min_dcf_upside"],
+                                      # books created before this rule existed
+                                      # keep the behaviour they were frozen with
+                                      require_dcf=R.get("require_dcf", False))
                 keep_set = {c["ticker"] for c in keep}
 
                 # Exits
@@ -529,6 +537,37 @@ def print_report(book: str = DEFAULT_BOOK):
                   f"  {p['pnl_pct']:+.1f}%{flag}")
 
 
+def reset_book(book: str):
+    """Delete a book that has NOT STARTED — no order has filled yet.
+
+    Once anything has filled, the book has a record, and a record is not
+    deleted because it looks bad; that is the whole point of paper trading.
+    To change the rules of a running book, start a new one alongside it."""
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            if not _get_book(cur, book, create=False):
+                print(f"No book called '{book}'.")
+                return False
+            cur.execute("""SELECT COUNT(*) FROM paper_positions
+                           WHERE book=%s AND entry_date IS NOT NULL""", (book,))
+            filled = cur.fetchone()[0]
+            if filled:
+                print(f"Refused: '{book}' already has {filled} filled trade(s). "
+                      f"Its record stays. Start a new book with "
+                      f"`python paper_portfolio.py new-book NAME` instead.")
+                return False
+            cur.execute("DELETE FROM paper_positions WHERE book=%s", (book,))
+            cur.execute("DELETE FROM paper_nav WHERE book=%s", (book,))
+            cur.execute("DELETE FROM paper_books WHERE book=%s", (book,))
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"Book '{book}' reset (it had no fills). The next `run` starts it "
+          f"fresh with the current default rules.")
+    return True
+
+
 def print_trades(book: str = DEFAULT_BOOK):
     conn = _conn()
     try:
@@ -568,6 +607,8 @@ if __name__ == "__main__":
         print_report(book)
     elif cmd == "trades":
         print_trades(book)
+    elif cmd == "reset":
+        reset_book(a[2] if len(a) > 2 and not a[2].startswith("--") else book)
     elif cmd == "new-book":
         if len(a) < 3:
             print("Usage: python paper_portfolio.py new-book NAME")
