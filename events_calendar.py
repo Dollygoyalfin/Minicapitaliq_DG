@@ -37,13 +37,15 @@ Usage:
     python events_calendar.py show --days 30   # print what is coming up
 """
 
+import io
+import csv
 import sys
 import json
 import time
 from datetime import date, datetime, timedelta
 from data_store import _conn
 
-CAL_BUILD = "2026-09-27 (results, corporate actions, lock-ins, index watch)"
+CAL_BUILD = "2026-09-27b (index list from NSE archive CSV; lock-ins on trading days)"
 
 DEFAULT_DAYS_AHEAD = 60
 
@@ -377,8 +379,15 @@ def lockin_events(allotment: date, include_sme: bool = False, series: str = ""):
         return []
     if not include_sme and "SME" in (series or "").upper():
         return []
-    return [(kind, allotment + timedelta(days=days), label)
-            for kind, days, label in LOCKINS]
+    out = []
+    for kind, days, label in LOCKINS:
+        d = allotment + timedelta(days=days)
+        # The lock-in ends on a calendar date, but shares can only be SOLD
+        # on a trading day — so the date that matters is the next weekday.
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        out.append((kind, d, label))
+    return out
 
 
 def build_lockins(days_ahead: int = DEFAULT_DAYS_AHEAD):
@@ -391,6 +400,18 @@ def build_lockins(days_ahead: int = DEFAULT_DAYS_AHEAD):
                                   listing_date, issue_price, dates_estimated
                            FROM ipo_listings""")
             ipos = cur.fetchall()
+    finally:
+        conn.close()
+
+    # Lock-ins are fully recomputed from ipo_listings each run, so clear the
+    # future ones first — otherwise a date that moved (weekend roll, or an
+    # estimated allotment replaced by the real one) would leave a stale twin.
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""DELETE FROM event_calendar WHERE kind LIKE 'lockin_%%'
+                           AND event_date >= CURRENT_DATE""")
+        conn.commit()
     finally:
         conn.close()
 
@@ -459,12 +480,32 @@ def rank_for_index(rows, members, add_ratio: float = 1.5, top_n: int = 50):
     return adds, drops, smallest
 
 
+def nifty50_members():
+    """NSE publishes the constituent list as a plain CSV in its archive
+    (Company Name, Industry, Symbol, Series, ISIN Code). That file is far
+    steadier than the live API, which started returning 404."""
+    from india_data_pipeline import _nse_get
+    try:
+        raw = _nse_get("https://nsearchives.nseindia.com/content/indices/"
+                       "ind_nifty50list.csv", retries=2).content
+        rows = csv.DictReader(io.StringIO(raw.decode("utf-8-sig",
+                                                     errors="replace")))
+        rows.fieldnames = [f.strip() for f in (rows.fieldnames or [])]
+        syms = {(r.get("Symbol") or "").strip().upper() for r in rows}
+        syms.discard("")
+        if len(syms) >= 40:
+            return {_ns(x) for x in syms}
+    except Exception as e:
+        print(f"  Nifty 50 list (archive CSV) unavailable: {str(e)[:90]}")
+    raw = _nse("https://www.nseindia.com/api/equity-stockIndices"
+               "?index=NIFTY%2050")
+    return {_ns(r.get("symbol")) for r in raw
+            if r.get("symbol") and r.get("symbol") != "NIFTY 50"
+            and r.get("priority", 0) != 1}
+
+
 def index_watch():
-    members_raw = _nse("https://www.nseindia.com/api/equity-stockIndices"
-                       "?index=NIFTY%2050")
-    members = {_ns(r.get("symbol")) for r in members_raw
-               if r.get("symbol") and r.get("symbol") != "NIFTY 50"
-               and r.get("priority", 0) != 1}
+    members = nifty50_members()
     if len(members) < 40:
         print(f"  Index watch: could not read Nifty 50 membership "
               f"({len(members)} names) — skipped.")
