@@ -247,6 +247,54 @@ def _load_sector_map() -> dict:
     return m
 
 
+_LAST_INDUSTRY_ERROR = {}
+
+
+def fetch_detailed_industry(symbol: str):
+    """A detailed industry label for one NSE symbol, as (label, source).
+
+    1. NSE's quote API (basicIndustry — "Life Insurance", "Private Sector
+       Bank", "Depositories, Clearing Houses and Other Intermediaries").
+       NSE has been retiring its old /api/ endpoints (equity-stockIndices
+       already returns 404), so this may fail; the reason is kept in
+       _LAST_INDUSTRY_ERROR rather than swallowed.
+    2. Yahoo's industry for SYMBOL.NS ("Capital Markets", "Insurance - Life",
+       "Banks - Regional", "Mortgage Finance", "Credit Services") — the same
+       vocabulary the DCF gate already reads for US stocks.
+    Returns (None, None) if neither answers."""
+    try:
+        data = _nse_get_json(
+            f"https://www.nseindia.com/api/quote-equity?symbol={_q(symbol)}"
+        )
+        info = (data or {}).get("industryInfo", {}) or {}
+        label = (info.get("basicIndustry") or info.get("industry") or "").strip()
+        if label and label.lower() != "financial services":
+            return label, "nse"
+        _LAST_INDUSTRY_ERROR["nse"] = ("responded, but with no detailed industry "
+                                       f"(keys: {sorted((data or {}).keys())[:8]})")
+    except Exception as e:
+        _LAST_INDUSTRY_ERROR["nse"] = str(e)[:160]
+
+    try:
+        import logging
+        import yfinance as yf
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+        tk = yf.Ticker(f"{symbol.upper()}.NS")
+        info = tk.get_info() if hasattr(tk, "get_info") else tk.info
+        label = (info.get("industry") or info.get("industryDisp") or "").strip()
+        if label:
+            return label, "yahoo"
+        _LAST_INDUSTRY_ERROR["yahoo"] = "responded, but with no industry field"
+    except Exception as e:
+        _LAST_INDUSTRY_ERROR["yahoo"] = str(e)[:160]
+    return None, None
+
+
+def fetch_nse_basic_industry(symbol: str):
+    """Kept for callers that only want the label."""
+    return fetch_detailed_industry(symbol)[0]
+
+
 def fetch_nse_sector(symbol: str) -> tuple:
     """Returns (mapped_sector, raw_industry).
     Primary: Nifty-500 CSV Industry column (one cached request for all).
@@ -255,6 +303,17 @@ def fetch_nse_sector(symbol: str) -> tuple:
     ind = _load_sector_map().get(symbol.upper())
     if ind:
         mapped = _NSE_SECTOR_MAP.get(ind.strip().lower(), "Unknown")
+        # The CSV's "Industry" column is NSE's TOP-LEVEL sector, so every
+        # bank, insurer, exchange and depository comes back as "Financial
+        # Services". That single label cannot tell HDFC Bank from CDSL, and
+        # the DCF gate needs exactly that distinction. For financials, ask
+        # the quote API for NSE's most detailed level (basicIndustry, e.g.
+        # "Life Insurance", "Depositories, Clearing Houses and Other
+        # Intermediaries", "Private Sector Bank").
+        if ind.strip().lower() == "financial services":
+            detail = fetch_nse_basic_industry(symbol)
+            if detail:
+                return mapped, detail
         return mapped, ind
 
     # ── Quote-API fallback ──────────────────────────────────────────────────
@@ -263,7 +322,7 @@ def fetch_nse_sector(symbol: str) -> tuple:
             f"https://www.nseindia.com/api/quote-equity?symbol={_q(symbol)}"
         )
         info = data.get("industryInfo", {}) or {}
-        raw_industry = (info.get("industry") or info.get("basicIndustry")
+        raw_industry = (info.get("basicIndustry") or info.get("industry")
                         or "Unknown")
         for key in (info.get("macro"), info.get("sector"), info.get("industry")):
             if key and key.strip().lower() in _NSE_SECTOR_MAP:
