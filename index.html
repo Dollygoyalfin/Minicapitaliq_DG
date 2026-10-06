@@ -513,7 +513,7 @@
 <div class="search-row">
   <div class="ticker-input-wrap">
     <span class="ticker-icon">⌕</span>
-    <input class="ticker-input" type="text" id="ticker" placeholder="Enter ticker — AAPL, RELIANCE, TSLA..."/>
+    <input class="ticker-input" type="text" id="ticker" placeholder="Enter ticker - AAPL, RELIANCE, TSLA..."/>
   </div>
   <select class="market-select" id="market">
     <option value="us">🇺🇸 US Markets</option>
@@ -555,7 +555,7 @@
 <div id="tab-rim" class="tab-content">
   <div class="container">
     <div style="font-size:0.78rem;opacity:0.75;margin-bottom:12px;line-height:1.55">
-      The model for <strong>banks, NBFCs, housing finance and insurers</strong> —
+      The model for <strong>banks, NBFCs, housing finance and insurers</strong> -
       the companies a cash-flow DCF cannot value, because for a lender debt is
       raw material rather than financing. Value starts at book value and adds
       only the profit earned <em>above</em> what shareholders require on that
@@ -601,11 +601,11 @@
       <details style="margin-bottom:14px">
         <summary style="cursor:pointer;font-size:0.8rem;font-weight:600;padding:6px 0">
           ⚙️ Modelling guardrails <span style="font-weight:400;opacity:0.6">
-          — deliberately conservative; these lower intrinsic value</span>
+          - deliberately conservative; these lower intrinsic value</span>
         </summary>
         <div style="padding:10px 0 4px">
           <div style="font-size:0.73rem;opacity:0.65;margin-bottom:10px;line-height:1.5">
-            Revenue growth is no longer capped — it now <strong>fades</strong> from the
+            Revenue growth is no longer capped - it now <strong>fades</strong> from the
             observed rate toward terminal growth, so a fast grower is not penalised and
             a company in a downcycle is not assumed to shrink forever. Operating costs
             are derived from revenue at the margin basis you choose, so margins cannot
@@ -615,7 +615,7 @@
           <div class="params-grid">
             <div class="param-group"><label>Operating Margin Basis</label>
               <select id="dcf-marginbasis" style="width:100%">
-                <option value="current" selected>Current — latest year's margin</option>
+                <option value="current" selected>Current - latest year's margin</option>
                 <option value="average">Average of available years</option>
                 <option value="median">Median of available years</option>
               </select></div>
@@ -643,8 +643,8 @@
 <div id="tab-ahead" class="tab-content">
   <div class="container">
     <div style="font-size:0.78rem;opacity:0.75;margin-bottom:12px;line-height:1.55">
-      The part of the future that is already written down — results dates,
-      ex-dates, IPO lock-in expiries, and likely Nifty 50 changes — and a
+      The part of the future that is already written down - results dates,
+      ex-dates, IPO lock-in expiries, and likely Nifty 50 changes - and a
       paper book that trades the shortlist with virtual money, so you can see
       whether it earns anything before your own money goes in.
     </div>
@@ -707,7 +707,7 @@
         </div>
       </div>
 
-      <div class="section-label">Filters <span style="font-size:0.6rem;color:var(--muted);letter-spacing:0;text-transform:none;font-weight:400">&nbsp;— leave blank to skip</span></div>
+      <div class="section-label">Filters <span style="font-size:0.6rem;color:var(--muted);letter-spacing:0;text-transform:none;font-weight:400">&nbsp;- leave blank to skip</span></div>
 
       <div class="screener-filters">
         <div class="filter-group">
@@ -800,7 +800,7 @@
       <button class="btn-primary" onclick="runQuality()">🏰 Analyze Quality</button>
     </div>
     <div id="quality-results">
-      <div class="state-empty"><span class="icon">🏰</span>Buffett-style quality &amp; moat assessment — enter a ticker and click <strong>Analyze Quality</strong>.</div>
+      <div class="state-empty"><span class="icon">🏰</span>Buffett-style quality &amp; moat assessment - enter a ticker and click <strong>Analyze Quality</strong>.</div>
     </div>
   </div>
 </div>
@@ -834,7 +834,7 @@
     <button class="btn-primary" onclick="runTechnicals()">📈 Load Technicals</button>
     <div id="technicals-results" style="margin-top:14px">
       <div class="state-empty"><span class="icon">📈</span>
-        Price-based indicators — RSI, moving averages, and where price sits
+        Price-based indicators - RSI, moving averages, and where price sits
         versus its own range.
       </div>
     </div>
@@ -846,7 +846,7 @@
   <div class="container">
     <div style="font-size:0.78rem;opacity:0.75;margin-bottom:12px;line-height:1.55">
       A <strong>screen</strong>, not a buy list. Each strategy shows the base rate
-      this app measured on its own five years of data — including when the result
+      this app measured on its own five years of data - including when the result
       was <em>unfavourable</em>. Companies with governance red flags (auditor
       resignations, promoter pledges, regulatory action) are excluded by default.
     </div>
@@ -913,10 +913,10 @@
     <div class="card">
       <div class="card-head">AI Verdict</div>
       <div id="verdict-dcf-status" style="font-size:0.78rem;color:var(--muted);margin-bottom:16px;padding:12px 16px;background:var(--cream);border-radius:2px;border:1px solid var(--line)">
-        ⚠ No DCF results yet — run DCF model first on the <strong>DCF Valuation</strong> tab
+        ⚠ No DCF results yet - run DCF model first on the <strong>DCF Valuation</strong> tab
       </div>
       <div style="font-size:0.72rem;color:var(--muted);margin-bottom:16px;padding:10px 14px;background:var(--cream);border-radius:2px;border:1px solid var(--line)">
-        💡 Uses <strong>your DCF assumptions</strong> — adjust parameters on the DCF tab first, then generate verdict here. Takes 15-30 seconds.
+        💡 Uses <strong>your DCF assumptions</strong> - adjust parameters on the DCF tab first, then generate verdict here. Takes 15-30 seconds.
       </div>
       <button class="btn-primary" onclick="runVerdict()">Generate AI Verdict</button>
     </div>
@@ -1110,7 +1110,7 @@
   let dcfCache = null;   // stores full DCF result for AI Verdict
 
   function fmt(n, d=2) {
-    if (n === null || n === undefined || isNaN(n)) return "—";
+    if (n === null || n === undefined || isNaN(n)) return "-";
     const abs = Math.abs(n);
     if (abs >= 1e12) return (n/1e12).toFixed(d) + "T";
     if (abs >= 1e9)  return (n/1e9).toFixed(d)  + "B";
@@ -1118,11 +1118,11 @@
     return Number(n).toFixed(d);
   }
   function fmtPct(n, d=2) {
-    if (n === null || n === undefined || isNaN(n)) return "—";
+    if (n === null || n === undefined || isNaN(n)) return "-";
     return Number(n).toFixed(d) + "%";
   }
   function pctFmt(n) {
-    if (n === null || n === undefined) return "—";
+    if (n === null || n === undefined) return "-";
     return (n > 0 ? "+" : "") + Number(n).toFixed(2) + "%";
   }
   function getTicker() { return document.getElementById("ticker").value.trim(); }
@@ -1134,7 +1134,7 @@
 
   // Every endpoint call goes through this. Previously a 503 (Render free-tier
   // cold start) or a 500 returned an empty body, and `res.json()` threw
-  // "JSON.parse: unexpected end of data" — technically accurate, useless to
+  // "JSON.parse: unexpected end of data" - technically accurate, useless to
   // the user. Now the failure mode is named.
   async function safeFetch(url, opts) {
     let res;
@@ -1142,11 +1142,11 @@
       res = await fetch(url, opts);
     } catch (netErr) {
       throw new Error("Could not reach the server. Check your connection, or the "
-                    + "service may be starting up — wait ~60 seconds and retry.");
+                    + "service may be starting up - wait ~60 seconds and retry.");
     }
     if (res.status === 503 || res.status === 502) {
       throw new Error("Server is waking up (free tier sleeps when idle). "
-                    + "Wait about a minute and try again — it stays fast afterwards.");
+                    + "Wait about a minute and try again - it stays fast afterwards.");
     }
     const text = await res.text();
     if (!text || !text.trim()) {
@@ -1163,7 +1163,7 @@
 
   // Jhunjhunwala ran two separate books: a long-term investment book and a
   // short-term trading book, with different rules for each. The horizon
-  // toggle applies that idea — same data, different emphasis, so the user is
+  // toggle applies that idea - same data, different emphasis, so the user is
   // never mixing a 12-month thesis with a 2-week one.
   function loadHorizon() {
     try { return window.localStorage.getItem("mtq_horizon") || "investor"; }
@@ -1177,11 +1177,11 @@
   const HORIZON_NOTES = {
     investor: "<strong>Investor view.</strong> Weight the Quality grade, DCF and "
             + "owner earnings, the Munger red-flag checklist, and the 12-month base "
-            + "rate. Technicals below are context only — at this horizon, business "
+            + "rate. Technicals below are context only - at this horizon, business "
             + "quality and price paid dominate returns.",
     trader:   "<strong>Trader view.</strong> Weight RSI, position versus the 50- and "
             + "200-day averages, recent momentum, and the 1-month base rate. Be aware "
-            + "that our own validation found short-horizon signals to be weak — the "
+            + "that our own validation found short-horizon signals to be weak - the "
             + "1-month median excess return for most setups is close to zero."
   };
 
@@ -1218,7 +1218,7 @@
       const metric = (label, val, suffix) => `
         <div style="padding:7px 0;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-between;font-size:0.82rem">
           <span style="opacity:0.7">${label}</span>
-          <span class="mono">${val == null ? "—" : val + (suffix||"")}</span>
+          <span class="mono">${val == null ? "-" : val + (suffix||"")}</span>
         </div>`;
 
       document.getElementById("technicals-results").innerHTML = `
@@ -1227,7 +1227,7 @@
             <div style="flex:1;min-width:170px">
               <div style="font-size:0.72rem;opacity:0.6">RSI (14)</div>
               <div class="mono" style="font-size:2.2rem;font-weight:800;color:${rsiCol}">
-                ${I.rsi_14 ?? "—"}</div>
+                ${I.rsi_14 ?? "-"}</div>
               <div style="font-size:0.76rem;text-transform:capitalize;color:${rsiCol}">${I.rsi_state}</div>
             </div>
             <div style="flex:1;min-width:170px">
@@ -1334,7 +1334,7 @@
               </div>
             </div>
             <div style="text-align:right;min-width:70px">
-              <div class="mono" style="font-size:1.15rem;font-weight:800;color:var(--accent)">${x.composite_score ?? "—"}</div>
+              <div class="mono" style="font-size:1.15rem;font-weight:800;color:var(--accent)">${x.composite_score ?? "-"}</div>
               <div style="font-size:0.62rem;opacity:0.5">composite</div>
             </div>
           </div>
@@ -1349,8 +1349,8 @@
               ${bar("Trend (15%)", b.trend ?? 0, 15, "#a855f7")}
               ${bar("Low vol (10%)", b.low_volatility ?? 0, 10, "#eab308")}
               <div style="font-size:0.65rem;opacity:0.5;margin-top:4px">
-                percentiles — 200DMA ${p.vs_200dma ?? "—"} · from low ${p.from_52wk_low ?? "—"} ·
-                12m mom ${p.momentum_12m ?? "—"} · 3m mom ${p.momentum_3m ?? "—"} · vol ${p.volatility ?? "—"}
+                percentiles - 200DMA ${p.vs_200dma ?? "-"} · from low ${p.from_52wk_low ?? "-"} ·
+                12m mom ${p.momentum_12m ?? "-"} · 3m mom ${p.momentum_3m ?? "-"} · vol ${p.volatility ?? "-"}
               </div>
             </div>
           </details>
@@ -1398,13 +1398,13 @@
       const cur = market === "india" ? "₹" : "$";
       const col = g == null ? "inherit" : g > 25 ? "#ef4444" : g > 15 ? "#eab308" : "#22c55e";
       const read = g == null ? "" :
-        g > 25 ? "Very demanding — sustained growth at this rate is rare and usually short-lived."
-        : g > 15 ? "Ambitious — achievable for a strong franchise, but leaves little room for disappointment."
-        : g > 5  ? "Moderate — the market is assuming steady rather than spectacular growth."
-        : "Low — the market is pricing in little growth, or expects decline.";
+        g > 25 ? "Very demanding - sustained growth at this rate is rare and usually short-lived."
+        : g > 15 ? "Ambitious - achievable for a strong franchise, but leaves little room for disappointment."
+        : g > 5  ? "Moderate - the market is assuming steady rather than spectacular growth."
+        : "Low - the market is pricing in little growth, or expects decline.";
 
       const scen = (d.scenarios || []).map(s => `
-        <tr><td class="mono">${s.growth_rate ?? s.growth ?? "—"}%</td>
+        <tr><td class="mono">${s.growth_rate ?? s.growth ?? "-"}%</td>
             <td class="mono">${cur}${(s.implied_value ?? s.value ?? 0).toLocaleString()}</td>
             <td style="font-size:0.78rem;opacity:0.7">${s.verdict ?? s.label ?? ""}</td></tr>`).join("");
 
@@ -1412,11 +1412,11 @@
         <div class="result-card">
           <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap">
             <div class="mono" style="font-size:2.4rem;font-weight:800;color:${col}">
-              ${g == null ? "—" : g + "%"}</div>
+              ${g == null ? "-" : g + "%"}</div>
             <div style="font-size:0.82rem;opacity:0.75">
               implied annual revenue growth<br>
               <span style="opacity:0.6">needed to justify today's price of
-              ${d.current_price ? cur + d.current_price.toLocaleString() : "—"}</span>
+              ${d.current_price ? cur + d.current_price.toLocaleString() : "-"}</span>
             </div>
           </div>
           <div style="margin-top:10px;font-size:0.82rem">${read}</div>
@@ -1535,7 +1535,7 @@
       '<div class="state-empty"><span class="icon">⏳</span>Scoring quality for ' + ticker + '…</div>';
     try {
       const __RES = await safeFetch(`${BASE}/quality?ticker=${ticker}&market=${market}`);
-      // Corporate events fetched in parallel — red flags belong next to the
+      // Corporate events fetched in parallel - red flags belong next to the
       // quality checklist, not on a separate screen you have to remember to open
       let __EV = null;
       try {
@@ -1573,7 +1573,7 @@
       const cur = market === "india" ? "₹" : "$";
       const oeHtml = oe ? (oe.per_share_value != null
         ? `<div style="margin-top:14px;padding:12px;background:rgba(255,255,255,0.04);border-radius:4px">
-             <div style="font-size:0.8rem;opacity:0.7">Owner Earnings Value (Buffett 1986 — conservative perpetuity)</div>
+             <div style="font-size:0.8rem;opacity:0.7">Owner Earnings Value (Buffett 1986 - conservative perpetuity)</div>
              <div class="mono" style="font-size:1.3rem;margin-top:4px">${cur}${oe.per_share_value.toLocaleString()}<span style="font-size:0.8rem;opacity:0.6"> / share</span></div>
            </div>`
         : `<div style="margin-top:14px;font-size:0.8rem;opacity:0.7">Owner earnings: ${oe.note || "n/a"}</div>`) : "";
@@ -1594,7 +1594,7 @@
              </div>`
           : `<div style="padding:8px 12px;background:rgba(34,197,94,0.08);border-left:3px solid #22c55e;border-radius:2px;margin-bottom:10px;font-size:0.8rem">
                ✓ No red-flag filings in the last 180 days
-               <span style="opacity:0.6">— absence of flags is not a clean bill of health, only that nothing matching was filed.</span>
+               <span style="opacity:0.6">- absence of flags is not a clean bill of health, only that nothing matching was filed.</span>
              </div>`;
 
         const list = (__EV.events||[]).slice(0,12).map(e=>`
@@ -1612,7 +1612,7 @@
         evHtml = `
           <div style="margin-top:18px">
             <div style="font-weight:600;font-size:0.9rem;margin-bottom:8px">
-              Corporate Events <span style="opacity:0.55;font-weight:400">— last 180 days</span>
+              Corporate Events <span style="opacity:0.55;font-weight:400">- last 180 days</span>
             </div>
             ${banner}
             ${list}
@@ -1680,6 +1680,93 @@
   }
 
   // ── VALUATION ──────────────────────────────────────────────────────────────
+  // ── Ownership: five headline figures, trends, and the full pie ──────────
+  // The backend (/valuation, _ownership_block) already returns pledged_pct,
+  // pledge_as_of, promoter_trend, institutional_trend and ownership_slices;
+  // the old markup showed only four of the fields and dropped the rest.
+  function renderOwnership(d) {
+    const num = v => typeof v === "number" && isFinite(v);
+    const pct = v => num(v) ? v.toFixed(2) + "%" : "-";
+    const pp  = v => (v > 0 ? "+" : "") + v.toFixed(2) + " pp";
+
+    // Pledge: share of PROMOTER shares encumbered (the market convention,
+    // e.g. "40.1% of promoter holding pledged"), plus what that is of the
+    // whole company. Colour by how much of the promoter stake is at risk.
+    let pv = "None reported", psub = "", pcol = "var(--green)";
+    if (num(d.pledged_pct)) {
+      pv = d.pledged_pct.toFixed(2) + "%";
+      const ofCo = num(d.promoters_holding) ? d.promoters_holding * d.pledged_pct / 100 : null;
+      psub = "of promoter shares" + (ofCo !== null ? ` · ${ofCo.toFixed(2)}% of company` : "");
+      pcol = d.pledged_pct >= 25 ? "var(--red)" : d.pledged_pct > 0 ? "#b7791f" : "var(--green)";
+    } else if (typeof d.pledged_pct === "string" && d.pledged_pct) {
+      pv = "Declared"; psub = d.pledged_pct; pcol = "#b7791f";
+    } else if (!num(d.promoters_holding)) {
+      pv = "-"; pcol = "inherit";
+    }
+    const box = (label, value, sub, colour) => `
+      <div class="metric"><div class="m-label">${label}</div>
+        <div class="m-value" ${colour ? `style="color:${colour}"` : ""}>${value}</div>
+        ${sub ? `<div style="font-size:0.66rem;opacity:0.65;margin-top:2px;line-height:1.3">${sub}</div>` : ""}
+      </div>`;
+
+    const trends = [];
+    if (d.promoter_trend && num(d.promoter_trend.change_pp))
+      trends.push(`Promoters ${pp(d.promoter_trend.change_pp)} over ${d.promoter_trend.quarters} quarters`);
+    if (d.institutional_trend) {
+      const t = d.institutional_trend;
+      if (num(t.fii_change_pp)) trends.push(`FII ${pp(t.fii_change_pp)}`);
+      if (num(t.dii_change_pp)) trends.push(`DII ${pp(t.dii_change_pp)}`);
+    }
+
+    // Donut chart from ownership_slices (built server-side so it sums to 100)
+    let pie = "";
+    const sl = (d.ownership_slices || []).filter(x => num(x.pct) && x.pct > 0);
+    if (sl.length) {
+      const PALETTE = ["#1a7a4a", "#2f6fb0", "#c8421a", "#b7791f", "#7b4fa8",
+                       "#2a9d8f", "#d1495b", "#5c7c3a", "#8a6d3b", "#4a6fa5", "#9a9590"];
+      const colourFor = (s, i) => {
+        if (s.group === "promoter") return PALETTE[0];
+        if (s.group === "retail") return PALETTE[10];
+        return PALETTE[1 + (i % 9)];
+      };
+      const total = sl.reduce((a, x) => a + x.pct, 0);
+      const R = 54, C = 2 * Math.PI * R;
+      let offset = 0;
+      const arcs = sl.map((s, i) => {
+        const len = s.pct / total * C, col = colourFor(s, i);
+        const a = `<circle r="${R}" cx="70" cy="70" fill="none" stroke="${col}" stroke-width="26"
+                    stroke-dasharray="${len.toFixed(2)} ${(C - len).toFixed(2)}"
+                    stroke-dashoffset="${(-offset).toFixed(2)}"><title>${s.label}: ${s.pct.toFixed(2)}%</title></circle>`;
+        offset += len;
+        return { a, col, s };
+      });
+      pie = `
+        <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-top:12px">
+          <svg viewBox="0 0 140 140" width="140" height="140" style="flex:none;transform:rotate(-90deg)"
+               role="img" aria-label="Shareholding pattern">${arcs.map(x => x.a).join("")}</svg>
+          <div style="flex:0 1 320px;min-width:200px;font-size:0.76rem;line-height:1.7">
+            ${arcs.map(x => `<div style="display:flex;justify-content:space-between;gap:8px">
+                <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;
+                  background:${x.col};margin-right:6px"></span>${x.s.label}</span>
+                <span class="mono">${x.s.pct.toFixed(2)}%</span></div>`).join("")}
+          </div>
+        </div>`;
+    }
+
+    return `
+      <div class="section-label">Ownership Structure${d.pledge_as_of ? ` <span style="font-weight:400;opacity:0.6;font-size:0.72rem">as of ${d.pledge_as_of}</span>` : ""}</div>
+      <div class="metrics-grid">
+        ${box("Promoters", pct(d.promoters_holding))}
+        ${box("FII", pct(d.fii_holding))}
+        ${box("DII", pct(d.dii_holding))}
+        ${box("Retail", pct(d.retail_holding))}
+        ${box("Pledged", pv, psub, pcol)}
+      </div>
+      ${trends.length ? `<div style="font-size:0.74rem;opacity:0.75;margin-top:8px">${trends.join(" · ")}</div>` : ""}
+      ${pie}
+      ${d.ownership_note ? `<div style="font-size:0.68rem;opacity:0.55;margin-top:8px;line-height:1.45">${d.ownership_note}</div>` : ""}`;
+  }
+
   async function runValuation() {
     const ticker = getTicker(), market = getMarket();
     if (!ticker) { setError("valuation-results", "Please enter a ticker symbol."); return; }
@@ -1698,33 +1785,33 @@
       document.getElementById("valuation-results").innerHTML = `
         <div class="verdict-strip ${cls}">
           <div>
-            <div class="verdict-main">${isBuy ? "Undervalued — Consider Buying" : "Overvalued — Exercise Caution"}</div>
+            <div class="verdict-main">${isBuy ? "Undervalued - Consider Buying" : "Overvalued - Exercise Caution"}</div>
             <div class="verdict-sub">${d.ticker} &nbsp;·&nbsp; Gordon Growth Model &nbsp;·&nbsp; ${market === "india" ? "NSE" : "NYSE / NASDAQ"}</div>
           </div>
           <div style="text-align:right">
-            <div class="verdict-pct">${upside !== null ? pctFmt(upside) : "—"}</div>
+            <div class="verdict-pct">${upside !== null ? pctFmt(upside) : "-"}</div>
             <div class="verdict-sub">vs. current price</div>
           </div>
         </div>
         <div class="hero-row">
           <div class="hero-stat main">
             <div class="h-label">Current Market Price</div>
-            <div class="h-value">${d.current_price ?? "—"}</div>
+            <div class="h-value">${d.current_price ?? "-"}</div>
             <div class="h-sub">Live quote via yfinance</div>
           </div>
           <div class="hero-stat">
             <div class="h-label">Intrinsic Value</div>
-            <div class="h-value" style="color:${isBuy ? 'var(--green)' : 'var(--red)'}">${d.intrinsic_value ? Number(d.intrinsic_value).toFixed(2) : "—"}</div>
+            <div class="h-value" style="color:${isBuy ? 'var(--green)' : 'var(--red)'}">${d.intrinsic_value ? Number(d.intrinsic_value).toFixed(2) : "-"}</div>
             <div class="h-sub">Gordon Growth</div>
           </div>
           <div class="hero-stat">
             <div class="h-label">WACC</div>
-            <div class="h-value">${d.wacc ? fmtPct(d.wacc * 100) : "—"}</div>
+            <div class="h-value">${d.wacc ? fmtPct(d.wacc * 100) : "-"}</div>
             <div class="h-sub">Discount Rate</div>
           </div>
           <div class="hero-stat">
             <div class="h-label">Beta</div>
-            <div class="h-value">${d.beta ?? "—"}</div>
+            <div class="h-value">${d.beta ?? "-"}</div>
             <div class="h-sub">Market Sensitivity</div>
           </div>
         </div>
@@ -1736,24 +1823,17 @@
           <div class="metric"><div class="m-label">P/B Ratio</div><div class="m-value">${fmt(d.pb_ratio)}</div></div>
           <div class="metric"><div class="m-label">Market Cap</div><div class="m-value">${fmt(d.market_cap)}</div></div>
           <div class="metric"><div class="m-label">Book Value</div><div class="m-value">${fmt(d.book_value)}</div></div>
-          <div class="metric"><div class="m-label">ROE</div><div class="m-value ${d.roe > 0 ? 'up' : 'down'}">${d.roe ? fmtPct(d.roe * 100) : "—"}</div></div>
+          <div class="metric"><div class="m-label">ROE</div><div class="m-value ${d.roe > 0 ? 'up' : 'down'}">${d.roe ? fmtPct(d.roe * 100) : "-"}</div></div>
           <div class="metric"><div class="m-label">D/E Ratio</div><div class="m-value">${fmt(d.de_ratio)}</div></div>
         </div>
         ${d.valuation_low || d.valuation_high ? `
         <div class="section-label">Sensitivity Range</div>
         <div class="sens-row">
-          <div class="sens-cell bear"><div class="s-label">Bear Case</div><div class="s-value">${d.valuation_low ? Number(d.valuation_low).toFixed(2) : "—"}</div></div>
-          <div class="sens-cell base"><div class="s-label">Base Case</div><div class="s-value">${d.intrinsic_value ? Number(d.intrinsic_value).toFixed(2) : "—"}</div></div>
-          <div class="sens-cell bull"><div class="s-label">Bull Case</div><div class="s-value">${d.valuation_high ? Number(d.valuation_high).toFixed(2) : "—"}</div></div>
+          <div class="sens-cell bear"><div class="s-label">Bear Case</div><div class="s-value">${d.valuation_low ? Number(d.valuation_low).toFixed(2) : "-"}</div></div>
+          <div class="sens-cell base"><div class="s-label">Base Case</div><div class="s-value">${d.intrinsic_value ? Number(d.intrinsic_value).toFixed(2) : "-"}</div></div>
+          <div class="sens-cell bull"><div class="s-label">Bull Case</div><div class="s-value">${d.valuation_high ? Number(d.valuation_high).toFixed(2) : "-"}</div></div>
         </div>` : ""}
-        ${market === "india" ? `
-        <div class="section-label">Ownership Structure</div>
-        <div class="metrics-grid">
-          <div class="metric"><div class="m-label">Promoters</div><div class="m-value">${d.promoters_holding ?? "—"}%</div></div>
-          <div class="metric"><div class="m-label">FII</div><div class="m-value">${d.fii_holding ?? "—"}%</div></div>
-          <div class="metric"><div class="m-label">DII</div><div class="m-value">${d.dii_holding ?? "—"}%</div></div>
-          <div class="metric"><div class="m-label">Retail</div><div class="m-value">${d.retail_holding ?? "—"}%</div></div>
-        </div>` : ""}
+        ${market === "india" ? renderOwnership(d) : ""}
       `;
     } catch (e) { setError("valuation-results", e.message); }
   }
@@ -1831,7 +1911,7 @@
  
           <div style="padding:10px 12px;background:rgba(255,255,255,0.05);border-radius:4px;font-size:0.82rem">
             Earns <strong>${(I.roe_start*100).toFixed(1)}%</strong> on equity against a
-            <strong>${(I.cost_of_equity*100).toFixed(1)}%</strong> cost of equity —
+            <strong>${(I.cost_of_equity*100).toFixed(1)}%</strong> cost of equity -
             an excess of <strong style="color:${exCol}">${excess>0?'+':''}${excess.toFixed(1)} percentage points</strong>.
             <div style="font-size:0.72rem;opacity:0.65;margin-top:4px">
               ROE basis: ${I.roe_basis_used} of ${I.roe_years_measured} years
@@ -1941,7 +2021,7 @@
         <strong>rule-based</strong>: the date is fixed by SEBI rules; whether
         holders actually sell is not known in advance.
         <strong>estimate</strong>: our reading of NSE's index rules on our own
-        data — a watchlist, not an announcement.</div>`;
+        data - a watchlist, not an announcement.</div>`;
       document.getElementById("calendar-results").innerHTML = html;
     } catch (e) { setError("calendar-results", e.message); }
   }
@@ -1972,7 +2052,7 @@
       const rows = (d.positions || []).map(p => p.status === "pending_buy"
         ? `<tr><td>${p.ticker.replace(".NS","")}</td>
              <td colspan="3" style="opacity:0.65">buy order ₹${p.reserved.toLocaleString()}
-             — fills at next price</td></tr>`
+             - fills at next price</td></tr>`
         : `<tr><td>${p.ticker.replace(".NS","")}${p.status==="pending_sell" ? " ↘" : ""}</td>
              <td class="mono">${p.qty}</td>
              <td class="mono">₹${Number(p.price).toLocaleString(undefined,{maximumFractionDigits:0})}</td>
@@ -2044,17 +2124,17 @@
           const m = A.operating_margin;
           const rng = m.historical_range
             ? ` (this company's history: ${(m.historical_range[0]*100).toFixed(1)}% to ${(m.historical_range[1]*100).toFixed(1)}%)` : "";
-          items.push(`Operating margin held at <strong>${(m.used*100).toFixed(1)}%</strong> (${m.basis})${rng} — costs are derived from revenue, so margins do not drift`);
+          items.push(`Operating margin held at <strong>${(m.used*100).toFixed(1)}%</strong> (${m.basis})${rng} - costs are derived from revenue, so margins do not drift`);
         }
         if (A.growth_fade)
           items.push(`Revenue growth fades from <strong>${(A.growth_fade.observed_rate*100).toFixed(1)}%</strong> to <strong>${(A.growth_fade.fades_to*100).toFixed(1)}%</strong> across the projection`);
         if (A.terminal_growth && A.terminal_growth.capped_at_risk_free)
-          items.push(`Terminal growth reduced to the risk-free rate (<strong>${(A.terminal_growth.used*100).toFixed(1)}%</strong>) — no company outgrows the economy in perpetuity`);
+          items.push(`Terminal growth reduced to the risk-free rate (<strong>${(A.terminal_growth.used*100).toFixed(1)}%</strong>) - no company outgrows the economy in perpetuity`);
         if (A.beta) {
           const src = A.beta.source && A.beta.source.startsWith("computed")
             ? `computed from this stock's own 2-year price history` : `from an external source`;
           const r2  = A.beta.regression_r2 != null
-            ? ` (R² ${A.beta.regression_r2} — how much of its movement the market explains)` : "";
+            ? ` (R² ${A.beta.regression_r2} - how much of its movement the market explains)` : "";
           items.push(`Beta <strong>${A.beta.used}</strong> ${src}${r2}`);
           if (A.beta.clamped)
             items.push(`Beta was bounded: raw value <strong>${A.beta.raw_from_data}</strong> fell outside [${A.beta.bounds[0]}, ${A.beta.bounds[1]}]`);
@@ -2081,7 +2161,7 @@
       const isOver  = d.verdict === "Potentially Overvalued";
       const cls = isUnder ? "buy" : isOver ? "sell" : "hold";
 
-      // Build growth rates display — grouped into IS and BS
+      // Build growth rates display - grouped into IS and BS
       const gr = d.derived_growth_rates || {};
       const grLabels = {
         revenue_growth: 'Revenue', opex_growth: 'Op. Expenses',
@@ -2119,7 +2199,7 @@
           <td class="${r.delta_nwc < 0 ? 'nd' : ''}">${fmt(r.delta_nwc)}</td>
           <td class="nd">${fmt(r.capex)}</td>
           <td class="${r.fcff >= 0 ? 'nu' : 'nd'}">${fmt(r.fcff)}</td>
-          <td>${r.pv_fcff !== undefined ? fmt(r.pv_fcff) : (isTerminal ? fmt(d.pv_terminal_value) : '—')}</td>
+          <td>${r.pv_fcff !== undefined ? fmt(r.pv_fcff) : (isTerminal ? fmt(d.pv_terminal_value) : '-')}</td>
         </tr>`;
       }).join('');
 
@@ -2145,11 +2225,11 @@
         ${window._dcfClampHtml || ""}
         <div class="verdict-strip ${cls}">
           <div>
-            <div class="verdict-main">${d.verdict ?? "—"}</div>
-            <div class="verdict-sub">${d.ticker} &nbsp;·&nbsp; Cash-Based FCFF &nbsp;·&nbsp; ${d.historical_years_used}-yr data &nbsp;·&nbsp; WACC ${d.wacc ? fmtPct(d.wacc*100) : "—"}</div>
+            <div class="verdict-main">${d.verdict ?? "-"}</div>
+            <div class="verdict-sub">${d.ticker} &nbsp;·&nbsp; Cash-Based FCFF &nbsp;·&nbsp; ${d.historical_years_used}-yr data &nbsp;·&nbsp; WACC ${d.wacc ? fmtPct(d.wacc*100) : "-"}</div>
           </div>
           <div style="text-align:right">
-            <div class="verdict-pct">${d.upside_downside_pct != null ? pctFmt(d.upside_downside_pct) : "—"}</div>
+            <div class="verdict-pct">${d.upside_downside_pct != null ? pctFmt(d.upside_downside_pct) : "-"}</div>
             <div class="verdict-sub">upside / downside</div>
           </div>
         </div>
@@ -2157,12 +2237,12 @@
         <div class="hero-row">
           <div class="hero-stat main">
             <div class="h-label">Intrinsic Value Per Share</div>
-            <div class="h-value">${d.intrinsic_value_per_share ? Number(d.intrinsic_value_per_share).toFixed(2) : "—"}</div>
+            <div class="h-value">${d.intrinsic_value_per_share ? Number(d.intrinsic_value_per_share).toFixed(2) : "-"}</div>
             <div class="h-sub">Before margin of safety</div>
           </div>
           <div class="hero-stat">
             <div class="h-label">Value w/ ${(parseFloat(mos)*100).toFixed(0)}% MOS</div>
-            <div class="h-value">${d.intrinsic_value_with_margin_of_safety ? Number(d.intrinsic_value_with_margin_of_safety).toFixed(2) : "—"}</div>
+            <div class="h-value">${d.intrinsic_value_with_margin_of_safety ? Number(d.intrinsic_value_with_margin_of_safety).toFixed(2) : "-"}</div>
             <div class="h-sub">Buy below this price</div>
           </div>
           <div class="hero-stat">
@@ -2180,7 +2260,7 @@
         <div class="section-label">Data-Derived Growth Rates</div>
         <div class="metrics-grid">${grHtml}</div>
 
-        <div class="section-label">FCFF Model — Historical · Projected · Terminal</div>
+        <div class="section-label">FCFF Model - Historical · Projected · Terminal</div>
         <div class="card" style="padding:0;overflow:auto;margin-bottom:20px">
           <table class="data-table" style="min-width:900px">
             <thead><tr>
@@ -2232,7 +2312,7 @@
           <div class="metric"><div class="m-label">− Minority Interest</div><div class="m-value nd">${fmt(d.minority_interest)}</div></div>
           <div class="metric"><div class="m-label">= Equity Value</div><div class="m-value">${fmt(d.equity_value_dcf)}</div></div>
           <div class="metric"><div class="m-label">÷ Shares Out.</div><div class="m-value">${fmt(d.shares_outstanding)}</div></div>
-          <div class="metric"><div class="m-label">= Intrinsic Value</div><div class="m-value nu">${d.intrinsic_value_per_share ? Number(d.intrinsic_value_per_share).toFixed(2) : "—"}</div></div>
+          <div class="metric"><div class="m-label">= Intrinsic Value</div><div class="m-value nu">${d.intrinsic_value_per_share ? Number(d.intrinsic_value_per_share).toFixed(2) : "-"}</div></div>
         </div>
       `;
     } catch (e) { setError("dcf-results", e.message); }
@@ -2287,14 +2367,14 @@
         const err = m.error;
         return `<div class="model-row">
           <div class="mr-cell name">${m.method || key}</div>
-          <div class="mr-cell mono">${iv != null ? (getMarket() === "india" ? '₹' : '$') + iv.toLocaleString() : err ? '⚠ Error' : '—'}</div>
-          <div class="mr-cell mono ${up != null ? (up > 0 ? 'nu' : 'nd') : ''}">${up != null ? (up > 0 ? '+' : '') + up.toFixed(1) + '%' : '—'}</div>
+          <div class="mr-cell mono">${iv != null ? (getMarket() === "india" ? '₹' : '$') + iv.toLocaleString() : err ? '⚠ Error' : '-'}</div>
+          <div class="mr-cell mono ${up != null ? (up > 0 ? 'nu' : 'nd') : ''}">${up != null ? (up > 0 ? '+' : '') + up.toFixed(1) + '%' : '-'}</div>
           <div class="mr-cell"><span class="signal-pill ${sigClass(sig)}">${sig}</span></div>
-          <div class="mr-cell" style="font-size:0.72rem;color:var(--muted)">${m.confidence || '—'}</div>
+          <div class="mr-cell" style="font-size:0.72rem;color:var(--muted)">${m.confidence || '-'}</div>
         </div>`;
       }).join('');
 
-      // Value range bars — normalize widths
+      // Value range bars - normalize widths
       const allVals = [vr.bear, vr.base, vr.bull].filter(v => v != null);
       const maxVal  = allVals.length ? Math.max(...allVals) : 1;
       const bearW   = vr.bear ? Math.round(vr.bear / maxVal * 100) : 0;
@@ -2309,19 +2389,19 @@
         <div class="convergence-hero">
           <div class="conv-hero-cell dark">
             <div class="ch-label">Consensus Intrinsic Value</div>
-            <div class="ch-value">${symbol}${c.intrinsic_value ? Number(c.intrinsic_value).toLocaleString() : '—'}</div>
-            <div class="ch-sub">Trimmed mean of ${c.models_used || 0} models &nbsp;·&nbsp; ${c.direction || '—'}</div>
+            <div class="ch-value">${symbol}${c.intrinsic_value ? Number(c.intrinsic_value).toLocaleString() : '-'}</div>
+            <div class="ch-sub">Trimmed mean of ${c.models_used || 0} models &nbsp;·&nbsp; ${c.direction || '-'}</div>
           </div>
           <div class="conv-hero-cell">
             <div class="ch-label">Convergence Signal</div>
-            <div class="ch-value" style="font-size:1.4rem;color:${sigClass(c.convergence_signal).includes('buy') ? 'var(--green)' : sigClass(c.convergence_signal).includes('sell') ? 'var(--red)' : 'var(--blue)'}">${c.convergence_signal || '—'}</div>
-            <div class="ch-sub">Current Price: ${symbol}${curr ? curr.toLocaleString() : '—'} &nbsp;·&nbsp; Upside: ${c.upside_pct != null ? (c.upside_pct > 0 ? '+' : '') + c.upside_pct.toFixed(1) + '%' : '—'}</div>
+            <div class="ch-value" style="font-size:1.4rem;color:${sigClass(c.convergence_signal).includes('buy') ? 'var(--green)' : sigClass(c.convergence_signal).includes('sell') ? 'var(--red)' : 'var(--blue)'}">${c.convergence_signal || '-'}</div>
+            <div class="ch-sub">Current Price: ${symbol}${curr ? curr.toLocaleString() : '-'} &nbsp;·&nbsp; Upside: ${c.upside_pct != null ? (c.upside_pct > 0 ? '+' : '') + c.upside_pct.toFixed(1) + '%' : '-'}</div>
           </div>
         </div>
 
         <!-- Confidence bar -->
         <div class="card" style="padding:22px 26px;margin-bottom:20px">
-          <div class="card-head">Model Agreement — Confidence Score</div>
+          <div class="card-head">Model Agreement - Confidence Score</div>
           <div class="confidence-bar-wrap">
             <div class="confidence-bar-label">
               <span>${c.buy_signals || 0} of ${c.models_used || 0} models signal ${c.direction || 'Neutral'}</span>
@@ -2342,35 +2422,35 @@
         <div class="buy-zone-strip ${bz.at_buy_zone ? 'active' : 'inactive'}">
           <div>
             <div class="bz-label">Buy Zone (${Math.round((1-(bz.mos_used||0.25))*100)}% MOS)</div>
-            <div class="bz-value">${symbol}${bz.price ? Number(bz.price).toLocaleString() : '—'}</div>
+            <div class="bz-value">${symbol}${bz.price ? Number(bz.price).toLocaleString() : '-'}</div>
           </div>
           <div>
             <div class="bz-label">Status</div>
-            <div class="bz-status ${bz.at_buy_zone ? 'active' : 'inactive'}">${bz.status || '—'}</div>
+            <div class="bz-status ${bz.at_buy_zone ? 'active' : 'inactive'}">${bz.status || '-'}</div>
           </div>
           <div>
             <div class="bz-label">Current Price</div>
-            <div class="bz-value">${symbol}${curr ? curr.toLocaleString() : '—'}</div>
+            <div class="bz-value">${symbol}${curr ? curr.toLocaleString() : '-'}</div>
           </div>
         </div>
 
         <!-- Value Range -->
         <div class="card" style="padding:22px 26px;margin-bottom:20px">
-          <div class="card-head">Valuation Range — Bear · Base · Bull</div>
+          <div class="card-head">Valuation Range - Bear · Base · Bull</div>
           <div class="value-band">
             <div class="band-label" style="color:var(--red)">Bear</div>
             <div class="band-bar bear" style="width:${bearW}%"></div>
-            <div class="band-value nd">${symbol}${vr.bear ? Number(vr.bear).toLocaleString() : '—'}</div>
+            <div class="band-value nd">${symbol}${vr.bear ? Number(vr.bear).toLocaleString() : '-'}</div>
           </div>
           <div class="value-band">
             <div class="band-label">Base</div>
             <div class="band-bar base" style="width:${baseW}%"></div>
-            <div class="band-value">${symbol}${vr.base ? Number(vr.base).toLocaleString() : '—'}</div>
+            <div class="band-value">${symbol}${vr.base ? Number(vr.base).toLocaleString() : '-'}</div>
           </div>
           <div class="value-band">
             <div class="band-label" style="color:var(--green)">Bull</div>
             <div class="band-bar bull" style="width:${bullW}%"></div>
-            <div class="band-value nu">${symbol}${vr.bull ? Number(vr.bull).toLocaleString() : '—'}</div>
+            <div class="band-value nu">${symbol}${vr.bull ? Number(vr.bull).toLocaleString() : '-'}</div>
           </div>
           <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line);font-size:0.72rem;color:var(--muted)">
             Bear = lowest model value &nbsp;·&nbsp; Base = consensus (trimmed mean) &nbsp;·&nbsp; Bull = highest model value
@@ -2401,10 +2481,10 @@
             <div class="metric"><div class="m-label">Cost of Equity</div><div class="m-value">${fmtPct((d.assumptions?.cost_of_equity||0)*100)}</div></div>
             <div class="metric"><div class="m-label">Cost of Debt</div><div class="m-value">${fmtPct((d.assumptions?.cost_of_debt||0)*100)}</div></div>
             <div class="metric"><div class="m-label">Avg Tax Rate</div><div class="m-value">${fmtPct((d.assumptions?.avg_tax_rate||0)*100)}</div></div>
-            <div class="metric"><div class="m-label">Beta</div><div class="m-value">${d.assumptions?.beta || '—'}</div></div>
+            <div class="metric"><div class="m-label">Beta</div><div class="m-value">${d.assumptions?.beta || '-'}</div></div>
             <div class="metric"><div class="m-label">Terminal Growth</div><div class="m-value">${fmtPct((d.assumptions?.terminal_growth||0)*100)}</div></div>
-            <div class="metric"><div class="m-label">Data Source</div><div class="m-value" style="font-size:0.72rem">${d.data_source || '—'}</div></div>
-            <div class="metric"><div class="m-label">Sector</div><div class="m-value" style="font-size:0.72rem">${d.sector || '—'}</div></div>
+            <div class="metric"><div class="m-label">Data Source</div><div class="m-value" style="font-size:0.72rem">${d.data_source || '-'}</div></div>
+            <div class="metric"><div class="m-label">Sector</div><div class="m-value" style="font-size:0.72rem">${d.sector || '-'}</div></div>
           </div>
         </div>
       `;
@@ -2425,11 +2505,11 @@
     if (!statusEl) return;
     if (dcfCache && !dcfCache.error) {
       const t = dcfCache.ticker || "";
-      statusEl.innerHTML = `<span style="color:var(--green)">✓ DCF loaded for <strong>${t}</strong> — ready to generate verdict</span>`;
+      statusEl.innerHTML = `<span style="color:var(--green)">✓ DCF loaded for <strong>${t}</strong> - ready to generate verdict</span>`;
       statusEl.style.borderColor = "#a7d9bc";
       statusEl.style.background  = "var(--green-light)";
     } else {
-      statusEl.innerHTML = `<span style="color:var(--muted)">⚠ No DCF results yet — run DCF model first on the <strong>DCF Valuation</strong> tab</span>`;
+      statusEl.innerHTML = `<span style="color:var(--muted)">⚠ No DCF results yet - run DCF model first on the <strong>DCF Valuation</strong> tab</span>`;
       statusEl.style.borderColor = "var(--line)";
       statusEl.style.background  = "var(--cream)";
     }
@@ -2441,7 +2521,7 @@
     if (!ticker) { setError("verdict-results", "Please enter a ticker symbol first."); return; }
     switchTab("verdict", document.querySelector(".tab-row .tab:nth-child(6)"));
     updateVerdictStatus();
-    setLoading("verdict-results", `Analyzing ${ticker.toUpperCase()} — fetching news + calling Claude AI...`);
+    setLoading("verdict-results", `Analyzing ${ticker.toUpperCase()} - fetching news + calling Claude AI...`);
 
     // Guard: require DCF to be run first
     if (!dcfCache || dcfCache.error) {
@@ -2513,10 +2593,10 @@
               </span>
               <span class="sentiment-tag ${sentCls}">${av.news_sentiment || "Neutral"} Sentiment</span>
             </div>
-            <div class="verdict-sub">${d.company_name} &nbsp;·&nbsp; ${d.sector} &nbsp;·&nbsp; WACC ${dcf.wacc ? fmtPct(dcf.wacc*100) : "—"}</div>
+            <div class="verdict-sub">${d.company_name} &nbsp;·&nbsp; ${d.sector} &nbsp;·&nbsp; WACC ${dcf.wacc ? fmtPct(dcf.wacc*100) : "-"}</div>
           </div>
           <div style="text-align:right">
-            <div class="verdict-pct">${(dcf.upside_downside_pct != null && dcf.upside_downside_pct !== undefined) ? pctFmt(dcf.upside_downside_pct) : "—"}</div>
+            <div class="verdict-pct">${(dcf.upside_downside_pct != null && dcf.upside_downside_pct !== undefined) ? pctFmt(dcf.upside_downside_pct) : "-"}</div>
             <div class="verdict-sub">DCF upside / downside</div>
           </div>
         </div>
@@ -2525,17 +2605,17 @@
         <div class="hero-row" style="margin-bottom:24px">
           <div class="hero-stat main">
             <div class="h-label">Current Price</div>
-            <div class="h-value">${d.current_price ?? "—"}</div>
+            <div class="h-value">${d.current_price ?? "-"}</div>
             <div class="h-sub">${d.ticker}</div>
           </div>
           <div class="hero-stat">
             <div class="h-label">Intrinsic Value</div>
-            <div class="h-value">${dcf.intrinsic_value_per_share ? Number(dcf.intrinsic_value_per_share).toFixed(2) : "—"}</div>
+            <div class="h-value">${dcf.intrinsic_value_per_share ? Number(dcf.intrinsic_value_per_share).toFixed(2) : "-"}</div>
             <div class="h-sub">Before MOS</div>
           </div>
           <div class="hero-stat">
             <div class="h-label">Value w/ MOS</div>
-            <div class="h-value">${dcf.intrinsic_value_with_margin_of_safety ? Number(dcf.intrinsic_value_with_margin_of_safety).toFixed(2) : "—"}</div>
+            <div class="h-value">${dcf.intrinsic_value_with_margin_of_safety ? Number(dcf.intrinsic_value_with_margin_of_safety).toFixed(2) : "-"}</div>
             <div class="h-sub">Buy below this</div>
           </div>
           <div class="hero-stat">
@@ -2565,7 +2645,7 @@
         </div>
 
         <!-- Management Guidance -->
-        <div class="section-label">Management Guidance — From Latest News</div>
+        <div class="section-label">Management Guidance - From Latest News</div>
         <div class="guidance-grid">${guidanceHtml}</div>
 
         ${av.model_vs_reality ? `
@@ -2630,7 +2710,7 @@
         <td class="${r.delta_nwc < 0 ? 'nd' : ''}">${fmt(r.delta_nwc)}</td>
         <td class="nd">${fmt(r.capex)}</td>
         <td class="${r.fcff >= 0 ? 'nu' : 'nd'}">${fmt(r.fcff)}</td>
-        <td>${r.pv_fcff !== undefined ? fmt(r.pv_fcff) : (isTerminal ? fmt(dcf.pv_terminal_value) : '—')}</td>
+        <td>${r.pv_fcff !== undefined ? fmt(r.pv_fcff) : (isTerminal ? fmt(dcf.pv_terminal_value) : '-')}</td>
       </tr>`;
     }).join('');
 
@@ -2651,7 +2731,7 @@
       <div class="metric"><div class="m-label">+ Cash</div><div class="m-value nu">${fmt(dcf.total_cash)}</div></div>
       <div class="metric"><div class="m-label">− Total Debt</div><div class="m-value nd">${fmt(dcf.total_debt)}</div></div>
       <div class="metric"><div class="m-label">÷ Shares Out.</div><div class="m-value">${fmt(dcf.shares_outstanding)}</div></div>
-      <div class="metric"><div class="m-label">= Intrinsic Value</div><div class="m-value nu">${dcf.intrinsic_value_per_share ? Number(dcf.intrinsic_value_per_share).toFixed(2) : "—"}</div></div>
+      <div class="metric"><div class="m-label">= Intrinsic Value</div><div class="m-value nu">${dcf.intrinsic_value_per_share ? Number(dcf.intrinsic_value_per_share).toFixed(2) : "-"}</div></div>
     </div>`;
   }
 
@@ -2686,10 +2766,10 @@
       let dupRows = "";
       for (const year in d.dupont_roe) {
         const roe = d.dupont_roe[year];
-        dupRows += `<tr><td class="lc">${year}</td><td class="${roe > 0 ? 'nu' : 'nd'}">${roe ? fmtPct(roe * 100) : "—"}</td></tr>`;
+        dupRows += `<tr><td class="lc">${year}</td><td class="${roe > 0 ? 'nu' : 'nd'}">${roe ? fmtPct(roe * 100) : "-"}</td></tr>`;
       }
       document.getElementById("financials-results").innerHTML = `
-        <div class="section-label">Income Statement — 5 Years</div>
+        <div class="section-label">Income Statement - 5 Years</div>
         <div class="card" style="padding:0;overflow:hidden;margin-bottom:24px">
           <table class="data-table">
             <thead><tr><th>Year</th><th>Revenue</th><th>Net Income</th></tr></thead>
@@ -2726,7 +2806,7 @@
     if (!tickers) { setError("screener-results", "Please enter at least one ticker."); return; }
     setLoading("screener-results", "Scanning tickers...");
 
-    // Build query params — only include filters that have values
+    // Build query params - only include filters that have values
     const params = new URLSearchParams({ tickers, market });
     const filterMap = {
       "f-pe-min":  "min_pe",   "f-pe-max":  "max_pe",
@@ -2782,15 +2862,15 @@
         const wk = r.week_change_pct;
         return `<tr class="${r.passed_filters ? '' : 'failed'}">
           <td class="lc">${r.ticker}</td>
-          <td>${r.current_price ?? "—"}</td>
-          <td>${r.pe_ratio ?? "—"}</td>
-          <td>${r.pb_ratio ?? "—"}</td>
-          <td class="${r.roe > 0 ? 'nu' : 'nd'}">${r.roe !== null && r.roe !== undefined ? fmtPct(r.roe * 100) : "—"}</td>
-          <td>${r.market_cap ? fmt(r.market_cap) : "—"}</td>
-          <td>${r.de_ratio ?? "—"}</td>
-          <td>${r.dividend_yield !== null && r.dividend_yield !== undefined ? fmtPct(r.dividend_yield * 100) : "—"}</td>
-          <td>${r.eps ?? "—"}</td>
-          <td class="${wk > 0 ? 'nu' : wk < 0 ? 'nd' : ''}">${wk !== null && wk !== undefined ? pctFmt(wk) : "—"}</td>
+          <td>${r.current_price ?? "-"}</td>
+          <td>${r.pe_ratio ?? "-"}</td>
+          <td>${r.pb_ratio ?? "-"}</td>
+          <td class="${r.roe > 0 ? 'nu' : 'nd'}">${r.roe !== null && r.roe !== undefined ? fmtPct(r.roe * 100) : "-"}</td>
+          <td>${r.market_cap ? fmt(r.market_cap) : "-"}</td>
+          <td>${r.de_ratio ?? "-"}</td>
+          <td>${r.dividend_yield !== null && r.dividend_yield !== undefined ? fmtPct(r.dividend_yield * 100) : "-"}</td>
+          <td>${r.eps ?? "-"}</td>
+          <td class="${wk > 0 ? 'nu' : wk < 0 ? 'nd' : ''}">${wk !== null && wk !== undefined ? pctFmt(wk) : "-"}</td>
           <td><span class="${r.passed_filters ? 'badge-pass' : 'badge-fail'}">${r.passed_filters ? 'PASS' : 'FAIL'}</span></td>
         </tr>`;
       }).join('');
