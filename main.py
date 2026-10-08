@@ -1129,9 +1129,70 @@ def get_convergence(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Requires: from fmp_data_layer import get_company_data   (add this import to main.py)
-DCF_BUILD = "2026-09-26 (depreciation add-back, WACC transparency)"
+DCF_BUILD = "2026-10-06 (non-finite numbers reported, not crashed on)"
+
+ 
+def _json_safe(fn):
+    """A NaN or infinity anywhere in the result made FastAPI fail while
+    encoding the JSON, so the caller saw a bare HTTP 500 and nobody could
+    tell which number broke (ADBE, KO, MNST, HSY and seven others, every
+    run). Now every non-finite number is found and named:
+ 
+      - if a HEADLINE figure (intrinsic value, upside, WACC) is non-finite,
+        the valuation is refused with the list of broken fields;
+      - otherwise those fields become null and the reliability warning
+        names them.
+ 
+    Either way the cause is visible, so it can be fixed at its source."""
+    import functools, math
+ 
+    def walk(obj, path, bad):
+        if isinstance(obj, dict):
+            return {k: walk(v, f"{path}.{k}" if path else str(k), bad)
+                    for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [walk(v, f"{path}[{i}]", bad) for i, v in enumerate(obj)]
+        try:
+            if isinstance(obj, (int, float)) and not isinstance(obj, bool) \
+                    and not math.isfinite(float(obj)):
+                bad.append(path)
+                return None
+        except (TypeError, ValueError, OverflowError):
+            pass
+        if type(obj).__module__ == "numpy" and hasattr(obj, "item"):
+            return walk(obj.item(), path, bad)          # numpy scalar
+        return obj
+ 
+    HEADLINE = ("intrinsic_value_per_share", "upside_downside_pct", "wacc")
+ 
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        if not isinstance(result, dict):
+            return result
+        bad = []
+        clean = walk(result, "", bad)
+        if not bad:
+            return clean
+        shown = ", ".join(bad[:8]) + (" ..." if len(bad) > 8 else "")
+        if any(b.split(".")[0].split("[")[0] in HEADLINE for b in bad):
+            return {"error": (f"Valuation could not be computed: these figures "
+                              f"came out as division-by-zero or infinite "
+                              f"values: {shown}. The inputs behind them are "
+                              f"missing or zero for this company."),
+                    "ticker": clean.get("ticker"), "market": clean.get("market"),
+                    "dcf_build": DCF_BUILD, "non_finite_fields": bad}
+        note = (f"Some figures could not be computed and are left blank: "
+                f"{shown}.")
+        prev = clean.get("reliability_warning")
+        clean["reliability_warning"] = f"{prev} {note}" if prev else note
+        clean["non_finite_fields"] = bad
+        return clean
+    return wrapper
+ 
 
 @app.get("/dcf")
+@_json_safe
 def get_dcf(
     ticker: str = Query(...),
     market: str = Query("us"),
@@ -3184,7 +3245,20 @@ def get_ipo_base_rates(market: str = Query("india"), months_back: int = Query(36
     except Exception as e:
         return {"error": f"IPO base rates failed: {e}"}
 
+# ── IPO POST-LISTING PERFORMANCE (paste into main.py, below /ipos/base-rates) ─
+# Reads what ipo_tracker.py stored — fast, and makes no Yahoo or NSE calls.
+#   /ipos/performance                 every tracked mainboard IPO + cohort stats
+#   /ipos/performance?min_days=252    only IPOs listed at least a year
 
+@app.get("/ipos/performance")
+def get_ipo_performance(min_days: int = Query(0, ge=0),
+                        include_sme: bool = Query(False)):
+    try:
+        from ipo_tracker import report_data
+        return report_data(min_days=min_days, include_sme=include_sme)
+    except Exception as e:
+        return {"error": f"IPO performance unavailable: {e}. "
+                         f"Run `python ipo_tracker.py run` first."}
 # ─────────────────────────────────────────────────────────────────────────────
 #  /commodities  — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
