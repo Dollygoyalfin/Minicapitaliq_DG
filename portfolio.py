@@ -1,10 +1,10 @@
 """
-MiniTradeIQ — Portfolio Monitor
+MiniTradeIQ - Portfolio Monitor
 =================================
 Watches YOUR holdings and messages you when something FACTUAL changes.
 
 Design principle, and the reason this is not a "buy/sell signal" bot:
-every alert here reports something that HAS HAPPENED — an auditor resigned,
+every alert here reports something that HAS HAPPENED - an auditor resigned,
 promoter encumbrance rose, a quality grade fell, a price crossed a level you
 set yourself. None of them predict anything.
 
@@ -36,12 +36,12 @@ import json
 from datetime import date, timedelta
 from data_store import _conn
 
-PORTFOLIO_BUILD = "2026-09-27 (digest + shortlist + calendar + paper book)"
+PORTFOLIO_BUILD = "2026-09-27c (stale-price banner, extreme-DCF flag, require_dcf support)"
 
 # Don't repeat the same alert for the same reason within this many days
 ALERT_COOLDOWN_DAYS = 7
 
-# How much to report. Every level reports FACTS — the difference is the
+# How much to report. Every level reports FACTS - the difference is the
 # threshold for what counts as worth your attention, not whether the app
 # starts predicting.
 #
@@ -175,7 +175,7 @@ def list_holdings():
     print()
 
 
-# ── Alert rules — all report facts, none predict ─────────────────────────────
+# ── Alert rules - all report facts, none predict ─────────────────────────────
 def _recent_alert(cur, ticker, rule):
     cur.execute("""SELECT 1 FROM alert_log
                    WHERE ticker=%s AND rule=%s
@@ -210,7 +210,7 @@ def evaluate_alerts():
                     if _recent_alert(cur, tkr, rule):
                         continue
                     alerts.append((tkr, rule,
-                        f"🔴 *{short}* — {cat.replace('_',' ')} "
+                        f"🔴 *{short}* - {cat.replace('_',' ')} "
                         f"({ev_date})\n{headline[:160]}"))
 
                 # 2. Promoter encumbrance increased
@@ -222,7 +222,7 @@ def evaluate_alerts():
                     rise = sh[0][1] - sh[1][1]
                     if rise >= 1.0 and not _recent_alert(cur, tkr, "encumbrance_up"):
                         alerts.append((tkr, "encumbrance_up",
-                            f"⚠️ *{short}* — promoter encumbrance rose to "
+                            f"⚠️ *{short}* - promoter encumbrance rose to "
                             f"{sh[0][1]:.1f}% (was {sh[1][1]:.1f}%) as of {sh[0][0]}"))
 
                 # 3. Quality grade fell
@@ -235,7 +235,7 @@ def evaluate_alerts():
                     if order.get(qg[0][1], 9) > order.get(qg[1][1], 9):
                         if not _recent_alert(cur, tkr, "quality_drop"):
                             alerts.append((tkr, "quality_drop",
-                                f"📉 *{short}* — quality grade fell from "
+                                f"📉 *{short}* - quality grade fell from "
                                 f"{qg[1][1]} to {qg[0][1]}"))
 
                 # 4. Any corporate filing at all (level: all)
@@ -251,7 +251,7 @@ def evaluate_alerts():
                             continue
                         icon = {"positive": "🟢", "watch": "🟡"}.get(sev, "📄")
                         alerts.append((tkr, rule,
-                            f"{icon} *{short}* — {cat.replace('_',' ')}\n"
+                            f"{icon} *{short}* - {cat.replace('_',' ')}\n"
                             f"{headline[:150]}"))
 
                 # 5. Large price moves (level: important and above)
@@ -280,7 +280,7 @@ def evaluate_alerts():
                                     f"{arrow} *{short}* is {chg5:+.1f}% over "
                                     f"the last few weeks"))
 
-                    # 52-week breaks — factual, and often what prompts a look
+                    # 52-week breaks - factual, and often what prompts a look
                     cur.execute("""SELECT rank_from_high, rank_from_low
                                    FROM stock_signatures WHERE ticker=%s
                                    ORDER BY date DESC LIMIT 1""", (tkr,))
@@ -303,12 +303,12 @@ def evaluate_alerts():
                     if not _recent_alert(cur, tkr, "above_target"):
                         pl = f" (cost {cur_sym}{cost:.0f})" if cost else ""
                         alerts.append((tkr, "above_target",
-                            f"🎯 *{short}* — {cur_sym}{px:,.0f} is above your "
+                            f"🎯 *{short}* - {cur_sym}{px:,.0f} is above your "
                             f"{cur_sym}{sell_above:,.0f} level{pl}"))
                 if px and buy_below and px <= buy_below:
                     if not _recent_alert(cur, tkr, "below_target"):
                         alerts.append((tkr, "below_target",
-                            f"🎯 *{short}* — {cur_sym}{px:,.0f} is below your "
+                            f"🎯 *{short}* - {cur_sym}{px:,.0f} is below your "
                             f"{cur_sym}{buy_below:,.0f} level"))
     finally:
         conn.close()
@@ -316,7 +316,7 @@ def evaluate_alerts():
 
 
 def market_summary(force: bool = False):
-    """Factual market state — breadth and index move. Not a forecast, and
+    """Factual market state - breadth and index move. Not a forecast, and
     deliberately not called 'sentiment': this is what the market DID, which
     is measurable, rather than what it 'feels', which is not.
 
@@ -333,7 +333,7 @@ def market_summary(force: bool = False):
             for mkt, label, sym in (("india", "India", "₹"), ("us", "US", "$")):
                 # DISTINCT matters: there is one row per ticker per date, so
                 # a bare LIMIT 2 returns two rows of the SAME date and the
-                # join below then compares every stock against itself — which
+                # join below then compares every stock against itself - which
                 # is exactly 0.0% every time.
                 cur.execute("""SELECT DISTINCT date FROM stock_signatures
                                WHERE market=%s ORDER BY date DESC LIMIT 2""",
@@ -398,8 +398,8 @@ def log_alerts(alerts):
 #
 # WhatsApp is deliberately LAST despite being the obvious choice, because it is
 # the least reliable for this job. Twilio's WhatsApp sandbox session expires
-# after 24 hours of inactivity — a nightly digest would work for a day and then
-# silently stop — and production WhatsApp needs a verified business account plus
+# after 24 hours of inactivity - a nightly digest would work for a day and then
+# silently stop - and production WhatsApp needs a verified business account plus
 # pre-approved message templates, which a scheduled digest is not. Telegram has
 # none of those constraints: free, no expiry, no verification, and it accepts
 # files, which matters later if these alerts ever carry a chart.
@@ -440,7 +440,7 @@ def _send_telegram(body: str) -> bool:
 
 
 def _send_ntfy(body: str) -> bool:
-    """NTFY_TOPIC — the simplest option available: no account at all.
+    """NTFY_TOPIC - the simplest option available: no account at all.
 
     Pick an unguessable topic name, install the ntfy app, subscribe to it.
     Anyone who knows the topic name can post to it, so treat it as a secret.
@@ -566,11 +566,11 @@ def check(dry_run: bool = False):
 
     if not alerts:
         print("No changes in your holdings today.")
-        print("(Silence is the normal state — these alerts fire on events, "
+        print("(Silence is the normal state - these alerts fire on events, "
               "not on a schedule.)")
         return
 
-    header = f"*MiniTradeIQ — {len(alerts)} update(s)*\n"
+    header = f"*MiniTradeIQ - {len(alerts)} update(s)*\n"
     body = header + "\n\n".join(m for _, _, m in alerts)
     if summary:
         body += "\n\n" + summary
@@ -579,7 +579,7 @@ def check(dry_run: bool = False):
 
     print("\n" + body + "\n")
     if dry_run:
-        print("(dry run — nothing sent, nothing logged)")
+        print("(dry run - nothing sent, nothing logged)")
         return
     if send_alert(body):
         log_alerts(alerts)
@@ -612,7 +612,7 @@ def _track_record(cur, min_n: int = 20):
                 f"whether they work. Treat the list as a shortlist to research, "
                 f"not as a verdict._")
     return (f"_{total:,} signals recorded, {mature:,} scoreable. Run "
-            f"`python signal_journal.py score` for the hit rate — it is the "
+            f"`python signal_journal.py score` for the hit rate - it is the "
             f"honest record and is not filtered to look good._")
 
 
@@ -658,7 +658,7 @@ def review_holdings(cur, holdings):
                 reasons.append(f"{(p[0]/cost-1)*100:.0f}% below your cost")
 
         if reasons:
-            out.append(f"• *{short}* — " + "; ".join(reasons))
+            out.append(f"• *{short}* - " + "; ".join(reasons))
     return out
 
 
@@ -666,19 +666,19 @@ def candidate_rows(cur, market: str, exclude=(), limit: int = 5,
                    min_quality: int = 65, min_dcf_upside: float = 0.0,
                    dcf_max_age_days: int = 45, require_dcf: bool = False):
     """The shortlist as data. Both the digest and the paper portfolio call
-    this, so the paper book trades exactly the list you are shown — testing
+    this, so the paper book trades exactly the list you are shown - testing
     anything else would prove nothing about the list you act on.
 
     Highest-scoring names not in `exclude`.
 
     The composite mirrors /ideas: quality 45%, 12-month momentum 30%, trend
-    15%, low volatility 10%. Weights are a judgement, not a discovery — they
+    15%, low volatility 10%. Weights are a judgement, not a discovery - they
     are shown so you can disagree with them.
 
     Valuation is a FILTER, not a score component, and that distinction is the
     whole point. Folded into a weighted score, a DCF saying "40% overvalued"
     could be cancelled out by strong momentum, and the list would happily
-    recommend expensive things that are going up — which is how momentum
+    recommend expensive things that are going up - which is how momentum
     screens hurt people. As a filter it cannot be outvoted.
 
     A stale DCF is treated as no DCF. A verdict from before the last set of
@@ -770,11 +770,11 @@ def find_candidates(cur, market: str, exclude, limit: int = 5,
             # Kept on the list by choice, but a quality company worth 2-3x
             # its price is more often a model error (recent IPO growth
             # extrapolated, cyclical peak margins) than a real bargain.
-            val = f"⚠ DCF {up:+.0f}% — implausibly high, check the model"
+            val = f"⚠ DCF {up:+.0f}% - implausibly high, check the model"
         else:
             val = f"DCF {up:+.0f}%"
         name = (c["name"] or "").strip()
-        label = f" — {name[:28]}" if name and name.upper() != short.upper() else ""
+        label = f" - {name[:28]}" if name and name.upper() != short.upper() else ""
         out.append(f"• *{short}*{label}  {sym}{c['price']:,.0f}\n"
                    f"   {', '.join(c['reasons'])}\n"
                    f"   {val}  ·  score {c['composite']:.0f}/100")
@@ -795,10 +795,10 @@ def upcoming_for_digest(cur, held_tickers, days: int = 14):
                        ORDER BY event_date""", (list(held_tickers), days))
         for t, d, kind, title, cert in cur.fetchall():
             est = " _(est.)_" if cert == "estimate" else ""
-            lines.append(f"• {d:%d %b} — *{t.replace('.NS','')}* "
+            lines.append(f"• {d:%d %b} - *{t.replace('.NS','')}* "
                          f"{KIND_LABELS.get(kind, kind)}{est}")
 
-    # Strongest candidates first, weakest members first — and capped per side,
+    # Strongest candidates first, weakest members first - and capped per side,
     # so a long list of additions cannot crowd the exclusions out of view.
     cur.execute("""SELECT ticker, event_date, kind FROM event_calendar
                    WHERE kind IN ('index_add_candidate','index_drop_risk')
@@ -830,7 +830,7 @@ def digest(dry_run: bool = False, market: str = "india"):
     The difference from `check` is deliberate. `check` is event-driven: it
     stays silent unless something actually happened, which is what makes it
     worth reading when it does fire. `digest` always sends, because you asked
-    for a standing report — so it must earn the interruption by being a
+    for a standing report - so it must earn the interruption by being a
     position summary rather than a list of prices you could see anywhere.
 
     Nothing here is a recommendation. It reports cost versus market, what
@@ -883,7 +883,7 @@ def digest(dry_run: bool = False, market: str = "india"):
                                    ORDER BY date DESC LIMIT 2""", (tkr,))
                     px_rows = cur.fetchall()
                 if not px_rows:
-                    lines.append(f"• *{short}* — no price on file")
+                    lines.append(f"• *{short}* - no price on file")
                     if qty and cost:
                         unpriced_with_cost.append((short, qty * cost))
                     continue
@@ -919,7 +919,7 @@ def digest(dry_run: bool = False, market: str = "india"):
                                  AND event_date >= CURRENT_DATE - INTERVAL '30 days'
                                ORDER BY event_date DESC LIMIT 2""", (tkr,))
                 for ev_date, cat in cur.fetchall():
-                    flags.append(f"🔴 {short} — {cat.replace('_',' ')} ({ev_date})")
+                    flags.append(f"🔴 {short} - {cat.replace('_',' ')} ({ev_date})")
 
             # Say how old the prices are. A P&L without a date is a claim
             # about now, and stale prices must never be passed off as current.
@@ -928,7 +928,7 @@ def digest(dry_run: bool = False, market: str = "india"):
                 age = (date.today() - as_of).days
                 head = f"*Holdings* _(closes as of {as_of:%d %b})_"
                 if age > 4:
-                    stale_banner = (f"⚠️ *Prices are {age} days old* — last close "
+                    stale_banner = (f"⚠️ *Prices are {age} days old* - last close "
                                     f"{as_of:%d %b}. The nightly price update is "
                                     f"failing, so every figure below is out of "
                                     f"date. Check the 'Refresh daily prices' step.")
@@ -967,14 +967,14 @@ def digest(dry_run: bool = False, market: str = "india"):
                 held = {h[0] for h in holdings}
                 review = review_holdings(cur, holdings)
                 if review:
-                    sections.append("*Worth a look — what you own*\n" +
+                    sections.append("*Worth a look - what you own*\n" +
                                     "\n".join(review))
 
                 cands = find_candidates(cur, mkt, held, limit=5,
                                         min_dcf_upside=MIN_DCF_UPSIDE)
                 if cands:
                     sections.append(
-                        "*Shortlist — what you don't own*\n" +
+                        "*Shortlist - what you don't own*\n" +
                         "\n".join(cands) +
                         f"\n_Filters: quality 65+, no red flag in 180d, "
                         f"DCF upside ≥ {MIN_DCF_UPSIDE:.0f}%._")
@@ -1021,14 +1021,14 @@ def digest(dry_run: bool = False, market: str = "india"):
     ist_today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
     if stale_banner:
         sections.insert(0, stale_banner)
-    body = (f"*MiniTradeIQ — {ist_today:%d %b %Y}*\n\n" +
+    body = (f"*MiniTradeIQ - {ist_today:%d %b %Y}*\n\n" +
             "\n\n".join(sections) +
             "\n\n_Shortlist = screening output, not advice. Every name still "
             "needs the DCF and the filings read before you act._")
 
     print("\n" + body + "\n")
     if dry_run:
-        print("(dry run — nothing sent)")
+        print("(dry run - nothing sent)")
         return
     send_alert(body)
 
