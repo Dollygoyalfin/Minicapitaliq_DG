@@ -1,8 +1,8 @@
 """
-MiniTradeIQ — Daily Price Refresh
+MiniTradeIQ - Daily Price Refresh
 ==================================
-Every number the app shows about "now" — P&L, the shortlist, the paper
-book's fills, market breadth — is only as fresh as price_history. This job
+Every number the app shows about "now" - P&L, the shortlist, the paper
+book's fills, market breadth - is only as fresh as price_history. This job
 keeps it fresh, and says so loudly when it cannot.
 
 Why it replaced the old top-up inside ingest.refresh_all():
@@ -16,15 +16,15 @@ Why it replaced the old top-up inside ingest.refresh_all():
   carried on computing from them.
 
 What this does instead:
-  India — NSE's daily bhavcopy: ONE file per trading day with the close of
+  India - NSE's daily bhavcopy: ONE file per trading day with the close of
           every listed security, ETFs included. One request per day rather
           than a thousand per-ticker calls, straight from the exchange.
           Falls back to yfinance only if NSE is unreachable.
-  US    — yfinance, batched, from the last stored date (not a fixed window),
+  US    - yfinance, batched, from the last stored date (not a fixed window),
           so any gap heals on the next successful run.
-  Both  — cover the valuation universe AND your holdings, so ETFs and new
+  Both  - cover the valuation universe AND your holdings, so ETFs and new
           listings you own get priced even though they have no financials.
-  Health — reports the latest date and coverage per market, and exits with
+  Health - reports the latest date and coverage per market, and exits with
            an error when prices are stale so the GitHub Action turns RED
            instead of quietly succeeding.
 
@@ -44,13 +44,13 @@ import csv
 from datetime import date, timedelta
 from data_store import _conn
 
-PRICE_BUILD = "2026-09-27b (gentler yfinance + retries; coverage gate)"
+PRICE_BUILD = "2026-10-06 (DB reconnect; no mid-session US closes)"
 
 MAX_BACKFILL_DAYS = 90      # never try to heal more than this in one run
 STALE_AFTER_DAYS = 5        # calendar days; covers a weekend plus a holiday
 MIN_COVERAGE_PCT = 90       # share of the universe that must have the latest
                             # close. A fresh date on 73% of stocks is not
-                            # "current" — it is a quarter of the market missing.
+                            # "current" - it is a quarter of the market missing.
 KEEP_SERIES = ("EQ", "BE", "BZ", "SM", "ST")   # equity incl. ETFs, T2T, SME
 
 
@@ -86,23 +86,38 @@ def last_stored_date(tickers):
 
 
 def _bulk_upsert(rows):
-    """rows: [(ticker, date, close, volume)] — one round trip per 1,000."""
+    """rows: [(ticker, date, close, volume)] - one round trip per 1,000."""
     if not rows:
         return 0
     from psycopg2.extras import execute_values
-    conn = _conn()
-    try:
-        with conn.cursor() as cur:
-            execute_values(cur, """
-                INSERT INTO price_history (ticker, date, close, volume)
-                VALUES %s
-                ON CONFLICT (ticker, date) DO UPDATE
-                SET close = EXCLUDED.close, volume = EXCLUDED.volume
-            """, rows, page_size=1000)
-        conn.commit()
-    finally:
-        conn.close()
-    return len(rows)
+    # Supabase's pooler drops idle or long connections now and then ("server
+    # closed the connection unexpectedly"). That once aborted the whole India
+    # refresh after six good days. A fresh connection and a retry fixes it;
+    # the upsert is idempotent, so retrying cannot duplicate anything.
+    last = None
+    for attempt in range(3):
+        conn = None
+        try:
+            conn = _conn()
+            with conn.cursor() as cur:
+                execute_values(cur, """
+                    INSERT INTO price_history (ticker, date, close, volume)
+                    VALUES %s
+                    ON CONFLICT (ticker, date) DO UPDATE
+                    SET close = EXCLUDED.close, volume = EXCLUDED.volume
+                """, rows, page_size=1000)
+            conn.commit()
+            return len(rows)
+        except Exception as e:
+            last = e
+            time.sleep(5 * (attempt + 1))
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    raise last
 
 
 def _weekdays(start: date, end: date):
@@ -209,15 +224,20 @@ def refresh_india():
                 print(f"  {d}: no file ({res['__error__']})")
             continue
         rows = [(wanted[s], d, c, v) for s, (c, v) in res.items() if s in wanted]
-        total += _bulk_upsert(rows)
+        try:
+            total += _bulk_upsert(rows)
+        except Exception as e:
+            # One day failing to save must not abandon the days after it
+            print(f"  {d}: fetched but NOT saved ({str(e)[:80]}) - next run retries")
+            continue
         got_days += 1
         print(f"  {d}: {len(rows)} closes stored "
               f"({len(rows)/len(wanted)*100:.0f}% of universe)")
         time.sleep(1.0)
 
-    # Every weekday failing is not a run of holidays — NSE is blocking us.
+    # Every weekday failing is not a run of holidays - NSE is blocking us.
     if days and got_days == 0 and len(days) >= 2:
-        print("  NSE bhavcopy unreachable for every day — falling back to yfinance.")
+        print("  NSE bhavcopy unreachable for every day - falling back to yfinance.")
         total += refresh_yfinance_with_retry(sorted(tickers),
                                              start - timedelta(days=3), "India")
     print(f"India: {total:,} rows written.")
@@ -226,11 +246,26 @@ def refresh_india():
 
 # ── yfinance (US, and India fallback) ────────────────────────────────────────
 def _quiet_yfinance():
-    """yfinance prints 'possibly delisted' for every throttled request — for
+    """yfinance prints 'possibly delisted' for every throttled request - for
     AMZN and MSFT as readily as for a real delisting. It is noise that hides
     the real summary, so it is silenced and replaced with one honest count."""
     import logging
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+
+def _unfinished_session_date():
+    """The first date whose bar may still be LIVE rather than a close.
+
+    Run during the US session (e.g. daytime in India), Yahoo returns today's
+    bar with the current price in the "Close" column. Stored, that becomes a
+    fake close until the next night overwrites it, and anything computed in
+    between uses it. US markets close by 21:00 UTC, so before then today's
+    UTC date is unfinished; after it, nothing is. (The nightly job runs at
+    22:30 UTC, so it always stores finished closes.)"""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    return today if now.hour < 21 else today + timedelta(days=1)
 
 
 def refresh_yfinance(tickers, start: date, batch: int = 25,
@@ -238,11 +273,12 @@ def refresh_yfinance(tickers, start: date, batch: int = 25,
     """Returns (rows_written, set_of_tickers_that_returned_data).
 
     Sequential by default. threads=True fires a whole batch at Yahoo at once,
-    which is exactly what trips its rate limit — the first run lost 27% of
+    which is exactly what trips its rate limit - the first run lost 27% of
     the US universe that way."""
     import yfinance as yf
     _quiet_yfinance()
     total, empty_batches, got = 0, 0, set()
+    open_session_date = _unfinished_session_date()
     nb = (len(tickers) - 1) // batch + 1 if tickers else 0
     for i in range(0, len(tickers), batch):
         chunk = tickers[i:i + batch]
@@ -262,6 +298,8 @@ def refresh_yfinance(tickers, start: date, batch: int = 25,
                 sub = sub.dropna(subset=["Close"])
                 n0 = len(rows)
                 for idx, r in sub.iterrows():
+                    if idx.date() >= open_session_date:
+                        continue        # today's bar while the market is open
                     v = r.get("Volume")
                     rows.append((t, idx.date(), float(r["Close"]),
                                  int(v) if v == v else None))
@@ -274,7 +312,7 @@ def refresh_yfinance(tickers, start: date, batch: int = 25,
         total += _bulk_upsert(rows)
         time.sleep(pause)
     if nb and empty_batches == nb and len(tickers) >= 20:
-        print("  ⚠ yfinance returned NOTHING for every batch — it is being "
+        print("  ⚠ yfinance returned NOTHING for every batch - it is being "
               "blocked or rate-limited, not 'up to date'.")
     return total, got
 
@@ -287,7 +325,7 @@ def refresh_yfinance_with_retry(tickers, start: date, label: str):
     for attempt, (b, p) in enumerate(((10, 4.0), (5, 8.0)), 1):
         if not missing:
             break
-        print(f"  {label}: {len(missing)} ticker(s) throttled — retry {attempt} "
+        print(f"  {label}: {len(missing)} ticker(s) throttled - retry {attempt} "
               f"(batches of {b}, {p:.0f}s apart)")
         time.sleep(15 * attempt)
         n, g = refresh_yfinance(missing, start, batch=b, pause=p)
@@ -320,7 +358,7 @@ def refresh_us():
 # Bhavcopy closes are the actual traded prices, not adjusted for splits and
 # bonuses. Stored history was adjusted when it was downloaded. So when a
 # company does a 1:1 bonus after that, the stored series shows a fake -50%
-# day — which would trip the paper book's stop rule and poison every
+# day - which would trip the paper book's stop rule and poison every
 # momentum rank. Such jumps are detected here and the ticker's history is
 # re-downloaded fully adjusted.
 def detect_splits(days_back: int = 10, threshold: float = 0.40):
@@ -361,7 +399,7 @@ def split_guard():
     jumps = detect_splits()
     if not jumps:
         return
-    print(f"\nPossible split/bonus on {len(jumps)} ticker(s) — re-adjusting history:")
+    print(f"\nPossible split/bonus on {len(jumps)} ticker(s) - re-adjusting history:")
     for t, d, prev, cls in jumps:
         try:
             n = repair_history(t)
@@ -451,7 +489,7 @@ if __name__ == "__main__":
     problems = health()
     if problems:
         print("\n❌ " + "\n❌ ".join(problems))
-        print("Everything downstream — P&L, shortlist, paper book — is using "
+        print("Everything downstream - P&L, shortlist, paper book - is using "
               "stale or missing prices. Failing this step on purpose so it "
               "shows red.")
         sys.exit(1)
