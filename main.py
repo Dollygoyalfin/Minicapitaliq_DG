@@ -4294,21 +4294,21 @@ def get_base_rates(
 # accounting sanity. This runs before any model computes.
 #
 # Philosophy: refuse loudly rather than output a confident wrong number.
-GATE_BUILD = "2026-09-27 (label + balance-sheet economics; detailed NSE industry)"
+GATE_BUILD = "2026-10-08 (India credit services = lender; operating labels valued)"
 
 # ── Financial-company classifier ─────────────────────────────────────────────
 # A cash-flow DCF cannot value a balance-sheet business (bank, NBFC, housing
 # finance, insurer) but values a fee business (exchange, depository, AMC,
 # registrar, broker, ratings, payments) perfectly well. Two kinds of evidence:
 #
-#  1. ECONOMICS — a lender funds itself with other people's money, and that
+#  1. ECONOMICS - a lender funds itself with other people's money, and that
 #     shows in two numbers no label can hide. Measured on this app's own
 #     store (FY2026): lenders pay 40-97% of revenue as interest, fee
 #     businesses 0.0-0.5%; debt/equity 0.2-4.6 vs 0.00-0.05. The gap is so
 #     wide the thresholds below are not sensitive. Economics OVERRIDES the
 #     label: Capital One is labelled "Credit Services" but is a lender.
 #
-#  2. LABEL — needed because insurers look exactly like fee businesses on
+#  2. LABEL - needed because insurers look exactly like fee businesses on
 #     those two numbers (HDFC Life: 0.2% interest, 0.17 debt/equity). Only
 #     the detailed industry ("Life Insurance") gives them away. A coarse
 #     label like "Financial Services" cannot, so it is treated as unknown.
@@ -4331,21 +4331,30 @@ _LENDER_WORDS = (
     "bank", "nbfc", "non banking", "housing finance", "microfinance",
     "financial institution", "finance company", "lending", "mortgage",
     "insurance", "insurer", "reinsurance", "asset reconstruction",
+    "financial conglomerate",      # lending + insurance under one roof
 )
 _GENERIC = ("financial services", "financials", "other financial services",
             "investment company", "holding company", "diversified financial",
             "unknown", "")
 
 
-def classify_financial(sector, industry, interest_pct=None, debt_equity=None):
+def classify_financial(sector, industry, interest_pct=None, debt_equity=None,
+                       market=None):
     """Pure function. Returns (verdict, why) where verdict is one of
     'not_financial' | 'fee' | 'lender' | 'unclear'."""
     sec = (sector or "").strip().lower()
     ind = (industry or "").strip().lower()
     fin_sector = sec in ("financial services", "financials", "banking",
                          "insurance")
-    fee_label = any(p in ind for p in _FEE_PHRASES)
-    lender_label = (not fee_label) and any(w in ind for w in _LENDER_WORDS)
+    # Yahoo's "Credit Services" means different things by market. In the US
+    # it covers Visa and Mastercard (fee networks) as well as card lenders.
+    # In India it is how Yahoo labels NBFCs - Bajaj Finance, Shriram, Muthoot,
+    # PFC, REC, SBI Card - every one a lender. SBI Card pays ~18% of revenue
+    # as interest, just under the economic threshold, so the label must do it.
+    india_credit = (market or "").lower() == "india" and "credit services" in ind
+    fee_label = (not india_credit) and any(p in ind for p in _FEE_PHRASES)
+    lender_label = india_credit or ((not fee_label)
+                                    and any(w in ind for w in _LENDER_WORDS))
     if not (fin_sector or fee_label or lender_label):
         return "not_financial", None
 
@@ -4374,6 +4383,14 @@ def classify_financial(sector, industry, interest_pct=None, debt_equity=None):
     if fee_label:
         return "fee", (f"classified as '{industry}'"
                        + (f" and {numtxt}" if numtxt else ""))
+    # A specific NON-financial label under a financial sector - CAMS and
+    # KFintech as IT services, Paytm and Pine Labs as software - describes
+    # an operating business with ordinary revenue and costs, which a DCF can
+    # value. The economics above have already ruled out a hidden lender.
+    if ind not in _GENERIC and not any(w in ind for w in ("financial", "invest",
+                                                          "holding", "capital")):
+        return "fee", (f"classified as '{industry}', an operating business"
+                       + (f", and {numtxt}" if numtxt else ""))
     return "unclear", (f"its industry is recorded only as '{industry or sector}', "
                        f"which cannot tell an insurer from a fee business"
                        + (f" ({numtxt})" if numtxt else ""))
@@ -4415,7 +4432,7 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
     # cycle. Professionals use dividend-discount or residual-income models
     # here. Refusing outright is more useful than a number produced by an
     # inapplicable framework.
-    # Which kind of financial company this is — see classify_financial()
+    # Which kind of financial company this is - see classify_financial()
     # at the top of this block for the evidence and thresholds.
     sector_raw = (info.get("sector") or "")
 
@@ -4432,11 +4449,11 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
                    else None)
 
     fin_verdict, fin_why = classify_financial(sector_raw, info.get("industry"),
-                                              interest_pct, debt_equity)
+                                              interest_pct, debt_equity, market)
 
     if fin_verdict in ("lender", "unclear"):
         head = ("A cash-flow DCF is not an appropriate framework for banks, "
-                "NBFCs and insurers — they have no working-capital or capex "
+                "NBFCs and insurers - they have no working-capital or capex "
                 "cycle for the model to work with, which is why professional "
                 "analysts use residual-income methods instead. Use the Residual "
                 "Income tab, or the Convergence and Quality tabs.")
@@ -4452,7 +4469,7 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
 
     years = sorted(revenue.keys(), reverse=True)
 
-    # The newest fiscal year is often partial — merged from a secondary source
+    # The newest fiscal year is often partial - merged from a secondary source
     # before the primary filing exists, so it may carry revenue but no expense
     # line. Refusing the whole company for that would discard three or four
     # perfectly good years. Instead, fall back to the newest year that has
@@ -4473,7 +4490,7 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
     # ── 1. Revenue must exist and be positive in the latest year ─────────────
     if not rev_l or rev_l <= 0:
         return False, (f"Latest fiscal year ({latest}) has no usable revenue "
-                       f"figure — valuation would be meaningless."), warnings
+                       f"figure - valuation would be meaningless."), warnings
 
     # ── 2. Operating margin must be economically possible ────────────────────
     exp_l = expenses.get(latest)
@@ -4481,10 +4498,10 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
         margin = (rev_l - exp_l) / rev_l
         if margin > 0.95:
             return False, (f"Extracted costs ({exp_l:,.0f}) imply a {margin*100:.0f}% "
-                           f"operating margin — the cost data is incomplete for this "
+                           f"operating margin - the cost data is incomplete for this "
                            f"filer, so a cash-flow valuation cannot be trusted."), warnings
         if margin < -2.0:
-            warnings.append(f"Operating margin of {margin*100:.0f}% is extreme — "
+            warnings.append(f"Operating margin of {margin*100:.0f}% is extreme - "
                             f"verify against the company's filings.")
     elif exp_l is None:
         return False, (f"No total-expense figure could be extracted for {latest}; "
@@ -4493,21 +4510,21 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
     # ── 3. Revenue must exceed depreciation and interest (scale sanity) ──────
     d_l = depr.get(latest)
     if d_l and d_l > rev_l:
-        return False, (f"Depreciation ({d_l:,.0f}) exceeds revenue ({rev_l:,.0f}) — "
+        return False, (f"Depreciation ({d_l:,.0f}) exceeds revenue ({rev_l:,.0f}) - "
                        f"revenue is understated for this filer; refusing to value."), warnings
 
     is_fin = (info.get("sector") or "") in ("Financial Services", "Financials")
     i_l = interest.get(latest)
     if not is_fin and i_l and i_l > rev_l:
-        return False, (f"Interest expense ({i_l:,.0f}) exceeds revenue ({rev_l:,.0f}) — "
+        return False, (f"Interest expense ({i_l:,.0f}) exceeds revenue ({rev_l:,.0f}) - "
                        f"inputs are inconsistent; refusing to value."), warnings
 
     # ── 4. Shares outstanding required for a per-share value ─────────────────
     shares = info.get("sharesOutstanding")
     if not shares or shares <= 0:
-        return False, "Shares outstanding unavailable — per-share value cannot be derived.", warnings
+        return False, "Shares outstanding unavailable - per-share value cannot be derived.", warnings
 
-    # ── 5. Cash-flow sanity (warn only — many businesses legitimately burn) ──
+    # ── 5. Cash-flow sanity (warn only - many businesses legitimately burn) ──
     o_l, n_l = ocf.get(latest), ni.get(latest)
     if o_l is not None and n_l and n_l > 0:
         base = n_l + (d_l or 0)
@@ -4515,10 +4532,10 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
             conv = o_l / base
             if conv < -3 or conv > 5:
                 warnings.append(
-                    f"Operating cash flow is {conv:.1f}x (net income + D&A) — "
+                    f"Operating cash flow is {conv:.1f}x (net income + D&A) - "
                     f"unusual; treat cash-based outputs with caution.")
 
-    # ── 6. Series continuity — a source flip fabricates growth rates ─────────
+    # ── 6. Series continuity - a source flip fabricates growth rates ─────────
     if len(years) >= 2:
         for a, b in zip(years, years[1:]):
             va, vb = revenue.get(a), revenue.get(b)
@@ -4526,12 +4543,12 @@ def validate_financials(info, income_df, balance_df, cashflow_df, market="us"):
                 yoy = va / vb - 1
                 if abs(yoy) > 3.0:
                     warnings.append(
-                        f"Revenue changed {yoy*100:+.0f}% between FY{b} and FY{a} — "
+                        f"Revenue changed {yoy*100:+.0f}% between FY{b} and FY{a} - "
                         f"if this is not a genuine merger/demerger, growth rates "
                         f"derived from it are unreliable.")
                     break
 
-    # (Banks and insurers never reach this point — they are refused above.
+    # (Banks and insurers never reach this point - they are refused above.
     # Fee businesses that do reach it carry an explanatory warning instead.)
 
     return True, None, warnings
