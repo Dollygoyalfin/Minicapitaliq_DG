@@ -333,7 +333,7 @@ def get_valuation(
         # ROE and D/E from the store's own statements
         net_income = info.get("netIncome") or _row(income_df, "net income")
         equity     = _row(balance_df, "stockholders equity") or _row(balance_df, "total equity")
-        total_debt = info.get("totalDebt") or _row(balance_df, "total debt") or 0.0
+        total_debt, _, _ = resolve_debt_and_cash(info, balance_df)
         roe        = info.get("returnOnEquity") or (
             net_income / equity if net_income and equity else None)
         de_ratio   = (total_debt / equity * 100) if equity else None
@@ -657,8 +657,7 @@ def get_convergence(
         shares_outstanding = info.get("sharesOutstanding")
         beta               = info.get("beta", 1.0) or 1.0
         market_cap         = info.get("marketCap")
-        total_debt         = info.get("totalDebt", 0) or 0
-        total_cash         = info.get("totalCash", 0) or 0
+        total_debt, total_cash, _debt_note = resolve_debt_and_cash(info, balance_df)
         eps                = info.get("trailingEps")
         pe_ratio           = info.get("trailingPE")
         book_value         = info.get("bookValue")
@@ -1072,6 +1071,7 @@ def get_convergence(
             "sector":       sector,
             "market":       market,
             "data_source":  data_source,
+            "debt_note":    _debt_note,
             "current_price": current_price,
  
             # Individual model results
@@ -1129,7 +1129,7 @@ def get_convergence(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Requires: from fmp_data_layer import get_company_data   (add this import to main.py)
-DCF_BUILD = "2026-10-06 (non-finite numbers reported, not crashed on)"
+DCF_BUILD = "2026-10-08 (missing latest-year debt: last filed year, flagged)"
 
  
 def _json_safe(fn):
@@ -1190,6 +1190,49 @@ def _json_safe(fn):
         return clean
     return wrapper
  
+def resolve_debt_and_cash(info, balance_df):
+    """Return (total_debt, total_cash, note).
+ 
+    total_debt: the latest debt figure; if the latest filing has none, the
+                most recent year that does; 0.0 only if no year has one.
+    total_cash: the latest cash figure, 0.0 if missing.
+    note:       a sentence explaining any substitution, or None.
+    Never returns NaN or infinity.
+    """
+    def _finite(v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return v if v == v and abs(v) != float("inf") else None
+ 
+    note = None
+    total_debt = _finite((info or {}).get("totalDebt"))
+    if total_debt is None:
+        hist = None
+        try:
+            if (balance_df is not None and not balance_df.empty
+                    and "Total Debt" in balance_df.index):
+                for col in balance_df.columns:              # newest first
+                    v = _finite(balance_df.loc["Total Debt", col])
+                    if v is not None:
+                        hist = (str(col)[:4], v)
+                        break
+        except Exception:
+            hist = None
+        if hist:
+            total_debt = hist[1]
+            note = (f"The latest filing has no total-debt figure this app can "
+                    f"read, so debt from FY{hist[0]} ({total_debt:,.0f}) is "
+                    f"used. If the company has borrowed or repaid since, the "
+                    f"equity value is off by that change.")
+        else:
+            total_debt = 0.0
+            note = ("No debt figure in any filing year, so debt is treated as "
+                    "zero. If the company does borrow, the equity value is "
+                    "overstated.")
+    total_cash = _finite((info or {}).get("totalCash")) or 0.0
+    return total_debt, total_cash, note
 
 @app.get("/dcf")
 @_json_safe
@@ -1315,8 +1358,10 @@ def get_dcf(
 
         beta = max(beta_floor, min(raw_beta, beta_ceiling))
         market_cap         = info.get("marketCap")
-        total_debt         = info.get("totalDebt", 0) or 0
-        total_cash         = info.get("totalCash", 0) or 0
+        total_debt, total_cash, _debt_note = resolve_debt_and_cash(info, balance_df)
+#         if _debt_note:
+#             _dq_warnings.append(_debt_note)
+
 
         # Derive shares if missing: (a) marketCap/price, (b) netIncome/EPS
         if not shares_outstanding or shares_outstanding == 0:
@@ -2448,8 +2493,7 @@ def get_reverse_dcf(
             shares_outstanding = info.get("sharesOutstanding")
             beta               = info.get("beta") or 1.0
             market_cap         = info.get("marketCap")
-            total_debt         = info.get("totalDebt") or 0
-            total_cash         = info.get("totalCash") or 0
+            total_debt, total_cash, _debt_note = resolve_debt_and_cash(info, balance_df)
 
             # Pull latest income + cashflow statements
             inc_list = get_fmp_income(resolved, 3)
@@ -2479,8 +2523,7 @@ def get_reverse_dcf(
             shares_outstanding = info.get("sharesOutstanding")
             beta               = info.get("beta", 1.0) or 1.0
             market_cap         = info.get("marketCap")
-            total_debt         = info.get("totalDebt", 0) or 0
-            total_cash         = info.get("totalCash", 0) or 0
+            total_debt, total_cash, _debt_note = resolve_debt_and_cash(info, balance_df)
 
             income_df   = stock.financials
             cashflow_df = stock.cashflow
@@ -2619,6 +2662,7 @@ def get_reverse_dcf(
             "ticker":               resolved,
             "market":               market,
             "data_source":          "FMP" if use_fmp else "yfinance",
+            "debt_note":            _debt_note,
             "current_price":        current_price,
             "implied_growth_rate":  round(implied_growth * 100, 2),
             "wacc_used":            round(wacc * 100, 2),
