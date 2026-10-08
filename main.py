@@ -1129,7 +1129,7 @@ def get_convergence(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Requires: from fmp_data_layer import get_company_data   (add this import to main.py)
-DCF_BUILD = "2026-10-08 (missing latest-year debt: last filed year, flagged)"
+DCF_BUILD = "2026-10-08 (shared debt/cash resolver: DCF, reverse DCF, convergence)"
 
  
 def _json_safe(fn):
